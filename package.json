@@ -1,13 +1,14 @@
 {
   "name": "binance-futures-relay",
   "version": "1.0.0",
-  "description": "Binance Futures WebSocket relay",
+  "description": "Binance Futures BTCUSDT liquidity relay",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "ws": "^8.18.0"
+    "axios": "^1.12.2",
+    "express": "^5.1.0",
+    "ws": "^8.18.3"
   }
 }
