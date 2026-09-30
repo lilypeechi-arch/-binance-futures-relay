@@ -1,72 +1,118 @@
+/*
+============================================================
+BINANCE BTCUSDT MAJOR LIQUIDITY RELAY
+============================================================
+
+ARCHITECTURE
+------------------------------------------------------------
+1. Binance SPOT REST
+   -> Historical BTCUSDT candles
+   -> Used ONLY to initialize market structure
+
+2. Binance FUTURES WEBSOCKET
+   -> Live order book
+   -> Live Futures candles
+   -> Current Futures price
+   -> Actual resting liquidity
+
+3. STRUCTURE ENGINE
+   -> Swing highs/lows
+   -> Equal highs/lows
+   -> BSL / SSL
+   -> Major support/resistance
+   -> Multi-timeframe scoring
+
+4. REST API
+   /health
+   /liquidity
+   /structure
+   /book
+============================================================
+*/
+
 const express = require("express");
 const WebSocket = require("ws");
-const https = require("https");
+const axios = require("axios");
 
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-
 const SYMBOL = "BTCUSDT";
-const SYMBOL_LOWER = SYMBOL.toLowerCase();
+const symbolLower = SYMBOL.toLowerCase();
 
-/* ============================================================
-   BINANCE FUTURES
-   ============================================================ */
+/* =========================================================
+   CONFIG
+========================================================= */
 
-const DEPTH_WS =
-  `wss://fstream.binance.com/ws/${SYMBOL_LOWER}@depth@100ms`;
+const SPOT_REST =
+  "https://data-api.binance.vision/api/v3/klines";
 
-const KLINE_WS =
-  `wss://fstream.binance.com/stream?streams=` +
-  `${SYMBOL_LOWER}@kline_15m/` +
-  `${SYMBOL_LOWER}@kline_1h/` +
-  `${SYMBOL_LOWER}@kline_4h/` +
-  `${SYMBOL_LOWER}@kline_1d`;
+const FUTURES_WS =
+  "wss://fstream.binance.com/ws";
 
-const WS_API =
-  "wss://ws-fapi.binance.com/ws-fapi/v1";
+const FUTURES_DEPTH_STREAM =
+  `${FUTURES_WS}/${symbolLower}@depth@100ms`;
 
-const BINANCE_FUTURES_REST =
-  "https://fapi.binance.com";
+const FUTURES_KLINE_STREAMS = [
+  `${symbolLower}@kline_15m`,
+  `${symbolLower}@kline_1h`,
+  `${symbolLower}@kline_4h`,
+  `${symbolLower}@kline_1d`
+];
 
-/* ============================================================
-   BYBIT HISTORICAL FUTURES
-   ============================================================ */
-
-const BYBIT_REST =
-  "https://api.bybit.com";
+const FUTURES_COMBINED_KLINE_WS =
+  `${FUTURES_WS}/stream?streams=${FUTURES_KLINE_STREAMS.join("/")}`;
 
 /*
-   Bybit linear Futures interval mapping
+Historical candles.
 
-   Binance:
-   15m
-   1h
-   4h
-   1d
+Spot is intentionally used only for initialization.
 
-   Bybit:
-   15
-   60
-   240
-   D
+The live Futures kline stream will replace/update
+the latest candles afterward.
 */
 
-const BYBIT_INTERVALS = {
-  "15m": "15",
-  "1h": "60",
-  "4h": "240",
-  "1d": "D"
+const STRUCTURE = {
+  "15m": {
+    interval: "15m",
+    weight: 1,
+    candles: 300,
+    pivotLeft: 3,
+    pivotRight: 3,
+    equalTolerancePct: 0.0015
+  },
+
+  "1h": {
+    interval: "1h",
+    weight: 2,
+    candles: 300,
+    pivotLeft: 4,
+    pivotRight: 4,
+    equalTolerancePct: 0.0015
+  },
+
+  "4h": {
+    interval: "4h",
+    weight: 3,
+    candles: 250,
+    pivotLeft: 5,
+    pivotRight: 5,
+    equalTolerancePct: 0.002
+  },
+
+  "1d": {
+    interval: "1d",
+    weight: 4,
+    candles: 180,
+    pivotLeft: 5,
+    pivotRight: 5,
+    equalTolerancePct: 0.0025
+  }
 };
 
-/* ============================================================
-   GENERAL SETTINGS
-   ============================================================ */
-
-const MAX_PENDING_EVENTS = 2500;
-
-const SNAPSHOT_MIN_INTERVAL_MS = 65000;
-const SNAPSHOT_TIMEOUT_MS = 15000;
+/*
+Order book / structural confirmation.
+*/
 
 const RAW_BOOK_MIN_USD = 50000;
 
@@ -84,3609 +130,2143 @@ const MIN_MAJOR_LEVEL_SCORE = 40;
 
 const MAX_MAJOR_LEVELS = 8;
 
-/* ============================================================
-   MARKET STRUCTURE SETTINGS
-   ============================================================ */
+/*
+Snapshot protection.
+*/
 
-const STRUCTURE = {
+const SNAPSHOT_MIN_INTERVAL_MS = 65000;
 
-  "15m": {
+const MAX_PENDING_EVENTS = 20000;
 
-    interval:
-      "15m",
 
-    weight:
-      1,
+/* =========================================================
+   STATE
+========================================================= */
 
-    candles:
-      300,
+let currentPrice = null;
 
-    pivotLeft:
-      3,
+let futuresDepthWs = null;
+let futuresKlineWs = null;
 
-    pivotRight:
-      3,
+let depthReconnectTimer = null;
+let klineReconnectTimer = null;
 
-    equalTolerancePct:
-      0.0015
-  },
+let snapshotWs = null;
+let snapshotPending = false;
 
-  "1h": {
+let lastSnapshotRequest = 0;
+let snapshotRequests = 0;
+let snapshot429s = 0;
+let snapshotId = 0;
 
-    interval:
-      "1h",
+let snapshotLastError = null;
+let snapshotLastStatus = null;
 
-    weight:
-      2,
+let lastSnapshotResponse = null;
 
-    candles:
-      300,
+let initialized = false;
 
-    pivotLeft:
-      4,
+let gapRecovery = false;
+let gapDetected = false;
+let gapCount = 0;
+let lastGapLocal = null;
+let lastGapIncoming = null;
 
-    pivotRight:
-      4,
 
-    equalTolerancePct:
-      0.0015
-  },
-
-  "4h": {
-
-    interval:
-      "4h",
-
-    weight:
-      3,
-
-    candles:
-      250,
-
-    pivotLeft:
-      5,
-
-    pivotRight:
-      5,
-
-    equalTolerancePct:
-      0.002
-  },
-
-  "1d": {
-
-    interval:
-      "1d",
-
-    weight:
-      4,
-
-    candles:
-      180,
-
-    pivotLeft:
-      5,
-
-    pivotRight:
-      5,
-
-    equalTolerancePct:
-      0.0025
-  }
-};
-
-/* ============================================================
+/* =========================================================
    ORDER BOOK
-   ============================================================ */
+========================================================= */
 
 const bids = new Map();
 const asks = new Map();
 
-let currentPrice = null;
-
-let depthWs = null;
-let snapshotWs = null;
-let klineWs = null;
-
-/* ============================================================
-   ORDER BOOK SYNC STATE
-   ============================================================ */
-
-let initialized = false;
-
-let waitingForBridge = false;
-
-let snapshotPending = false;
-
-let gapRecovery = false;
-
-let gapDetected = false;
+let depthLastUpdateId = 0;
 
 let pendingDepthEvents = [];
 
-let lastUpdateId = 0;
+let depthConnected = false;
+let snapshotConnected = false;
 
-let snapshotRequests = 0;
 
-let snapshot429s = 0;
+/* =========================================================
+   CANDLE STORAGE
+========================================================= */
 
-let bridgeAttempts = 0;
-
-let bridgeFound = 0;
-
-let gapCount = 0;
-
-let lastGapLocal = null;
-
-let lastGapIncoming = null;
-
-let lastSnapshotRequest = null;
-
-let lastSnapshotResponse = null;
-
-let lastSnapshotError = null;
-
-let lastSnapshotId = null;
-
-let snapshotTimer = null;
-
-let snapshotTimeout = null;
-
-let snapshotRequestId = 0;
-
-/* ============================================================
-   HISTORICAL CANDLES
-   ============================================================ */
-
-const candles = {
-
+const candleHistory = {
   "15m": [],
-
   "1h": [],
-
   "4h": [],
-
   "1d": []
 };
 
-let candleRequests = 0;
+const candleSource = {
+  "15m": "none",
+  "1h": "none",
+  "4h": "none",
+  "1d": "none"
+};
 
-let candleSuccess = 0;
+const candleRequests = {
+  "15m": 0,
+  "1h": 0,
+  "4h": 0,
+  "1d": 0
+};
 
-let candleErrors = 0;
+const candleSuccess = {
+  "15m": 0,
+  "1h": 0,
+  "4h": 0,
+  "1d": 0
+};
 
-let candleLastError = null;
+const candleErrors = {
+  "15m": 0,
+  "1h": 0,
+  "4h": 0,
+  "1d": 0
+};
 
 let candleLastStatus = null;
+let candleLastError = null;
 
-let candleLastSource = null;
 
-let candleUpdatedAt = null;
-
-/* ============================================================
+/* =========================================================
    STRUCTURE
-   ============================================================ */
+========================================================= */
 
-let swingHighs = [];
+const structure = {
+  swingHighs: [],
+  swingLows: [],
+  equalHighs: [],
+  equalLows: [],
+  levels: [],
+  majorBSL: [],
+  majorSSL: [],
+  majorResistance: [],
+  majorSupport: [],
+  updatedAt: null
+};
 
-let swingLows = [];
 
-let lastStructureUpdate = null;
+/* =========================================================
+   UTILITIES
+========================================================= */
 
-/* ============================================================
-   UTILITY
-   ============================================================ */
-
-function nowIso() {
-
+function now() {
   return new Date().toISOString();
-
 }
 
-function safeNumber(value) {
-
-  const n =
-    Number(value);
-
-  return Number.isFinite(n)
-    ? n
-    : null;
-
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function round(
-  value,
-  decimals = 2
-) {
-
-  const p =
-    Math.pow(
-      10,
-      decimals
-    );
-
-  return Math.round(
-    value * p
-  ) / p;
-
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
-function pctDistance(
-  price,
-  reference
-) {
+function pctDistance(a, b) {
+  if (!a || !b) return 999;
 
-  if (
-    reference === null ||
-    reference === undefined ||
-    reference === 0
-  ) {
+  return Math.abs(a - b) / b;
+}
 
-    return 0;
+function priceDistancePct(a, b) {
+  if (!a || !b) return 999;
 
+  return ((a - b) / b) * 100;
+}
+
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+
+/* =========================================================
+   CANDLE NORMALIZATION
+========================================================= */
+
+function normalizeSpotKline(k) {
+  if (!Array.isArray(k) || k.length < 6) {
+    return null;
   }
 
-  return (
-    (
-      (price - reference) /
-      reference
-    ) *
-    100
-  );
-
+  return {
+    openTime: Number(k[0]),
+    open: Number(k[1]),
+    high: Number(k[2]),
+    low: Number(k[3]),
+    close: Number(k[4]),
+    volume: Number(k[5]),
+    closeTime: Number(k[6] || 0),
+    source: "spot"
+  };
 }
 
-function usdValue(
-  price,
-  quantity
-) {
+function normalizeFuturesKline(k) {
+  if (!k) return null;
 
-  return (
-    price *
-    quantity
-  );
-
+  return {
+    openTime: Number(k.t),
+    open: Number(k.o),
+    high: Number(k.h),
+    low: Number(k.l),
+    close: Number(k.c),
+    volume: Number(k.v),
+    closeTime: Number(k.T || 0),
+    source: "futures"
+  };
 }
 
-/* ============================================================
-   HTTPS JSON GET
-   ============================================================ */
 
-function httpsGetJson(
-  url,
-  timeoutMs = 20000
-) {
+/* =========================================================
+   HISTORICAL SPOT CANDLES
+========================================================= */
 
-  return new Promise(
-    (
-      resolve,
-      reject
-    ) => {
+async function loadHistoricalCandles(tf) {
+  const cfg = STRUCTURE[tf];
 
-      const request =
-        https.get(
-          url,
-          {
-            headers: {
-              "User-Agent":
-                "Mozilla/5.0 Binance-Futures-Relay"
-            }
-          },
-          response => {
+  if (!cfg) return;
 
-            let body =
-              "";
-
-            response.on(
-              "data",
-              chunk => {
-
-                body +=
-                  chunk;
-
-              }
-            );
-
-            response.on(
-              "end",
-              () => {
-
-                const status =
-                  response.statusCode;
-
-                if (
-                  status < 200 ||
-                  status >= 300
-                ) {
-
-                  const error =
-                    new Error(
-                      `HTTP ${status}: ${body.slice(
-                        0,
-                        500
-                      )}`
-                    );
-
-                  error.statusCode =
-                    status;
-
-                  reject(
-                    error
-                  );
-
-                  return;
-                }
-
-                try {
-
-                  const json =
-                    JSON.parse(
-                      body
-                    );
-
-                  resolve(
-                    json
-                  );
-
-                } catch (error) {
-
-                  const parseError =
-                    new Error(
-                      `Invalid JSON: ${body.slice(
-                        0,
-                        500
-                      )}`
-                    );
-
-                  parseError.statusCode =
-                    status;
-
-                  reject(
-                    parseError
-                  );
-
-                }
-
-              }
-            );
-
-          }
-        );
-
-      request.setTimeout(
-        timeoutMs,
-        () => {
-
-          request.destroy();
-
-          reject(
-            new Error(
-              "HTTP request timeout"
-            )
-          );
-
-        }
-      );
-
-      request.on(
-        "error",
-        error => {
-
-          reject(
-            error
-          );
-
-        }
-      );
-
-    }
-  );
-
-}
-
-/* ============================================================
-   BYBIT HISTORICAL KLINES
-   ============================================================ */
-
-async function loadBybitHistoricalKlines(
-  interval
-) {
-
-  const config =
-    STRUCTURE[interval];
-
-  if (!config) {
-
-    throw new Error(
-      `Unknown structure interval: ${interval}`
-    );
-
-  }
-
-  const bybitInterval =
-    BYBIT_INTERVALS[interval];
-
-  const limit =
-    config.candles;
-
-  const url =
-    `${BYBIT_REST}/v5/market/kline` +
-    `?category=linear` +
-    `&symbol=${SYMBOL}` +
-    `&interval=${bybitInterval}` +
-    `&limit=${limit}`;
-
-  console.log(
-    `Loading Bybit ${interval} historical candles...`
-  );
-
-  const result =
-    await httpsGetJson(
-      url,
-      20000
-    );
-
-  if (
-    !result ||
-    result.retCode !== 0
-  ) {
-
-    throw new Error(
-      `Bybit error: ${
-        result?.retMsg ||
-        "Unknown error"
-      }`
-    );
-
-  }
-
-  if (
-    !result.result ||
-    !Array.isArray(
-      result.result.list
-    )
-  ) {
-
-    throw new Error(
-      "Bybit returned no kline list"
-    );
-
-  }
-
-  /*
-     Bybit returns newest first.
-
-     We reverse it so the rest of
-     the structure engine receives
-     oldest -> newest.
-  */
-
-  const rows =
-    [
-      ...result.result.list
-    ].reverse();
-
-  const parsed =
-    rows
-      .map(
-        row => {
-
-          /*
-             Bybit format:
-
-             [
-               startTime,
-               openPrice,
-               highPrice,
-               lowPrice,
-               closePrice,
-               volume,
-               turnover
-             ]
-          */
-
-          const openTime =
-            Number(
-              row[0]
-            );
-
-          const open =
-            Number(
-              row[1]
-            );
-
-          const high =
-            Number(
-              row[2]
-            );
-
-          const low =
-            Number(
-              row[3]
-            );
-
-          const close =
-            Number(
-              row[4]
-            );
-
-          const volume =
-            Number(
-              row[5]
-            );
-
-          if (
-            !Number.isFinite(
-              openTime
-            ) ||
-            !Number.isFinite(
-              open
-            ) ||
-            !Number.isFinite(
-              high
-            ) ||
-            !Number.isFinite(
-              low
-            ) ||
-            !Number.isFinite(
-              close
-            )
-          ) {
-
-            return null;
-
-          }
-
-          return {
-
-            openTime,
-
-            open,
-
-            high,
-
-            low,
-
-            close,
-
-            volume:
-              Number.isFinite(
-                volume
-              )
-                ? volume
-                : 0,
-
-            closeTime:
-              null,
-
-            closed:
-              true,
-
-            source:
-              "Bybit"
-          };
-
-        }
-      )
-      .filter(
-        Boolean
-      );
-
-  if (
-    !parsed.length
-  ) {
-
-    throw new Error(
-      "Bybit returned zero valid candles"
-    );
-
-  }
-
-  candles[interval] =
-    parsed;
-
-  candleSuccess++;
-
-  candleLastStatus =
-    200;
-
-  candleLastSource =
-    "Bybit";
-
-  candleLastError =
-    null;
-
-  candleUpdatedAt =
-    nowIso();
-
-  console.log(
-    `Loaded ${parsed.length} Bybit ${interval} candles`
-  );
-
-  return true;
-
-}
-
-/* ============================================================
-   BINANCE HISTORICAL FALLBACK
-   ============================================================ */
-
-async function loadBinanceHistoricalKlines(
-  interval
-) {
-
-  const config =
-    STRUCTURE[interval];
-
-  const url =
-    `${BINANCE_FUTURES_REST}/fapi/v1/klines` +
-    `?symbol=${SYMBOL}` +
-    `&interval=${interval}` +
-    `&limit=${config.candles}`;
-
-  console.log(
-    `Trying Binance ${interval} historical candles...`
-  );
-
-  const result =
-    await httpsGetJson(
-      url,
-      20000
-    );
-
-  if (
-    !Array.isArray(
-      result
-    )
-  ) {
-
-    throw new Error(
-      "Binance returned invalid kline response"
-    );
-
-  }
-
-  const parsed =
-    result
-      .map(
-        row => ({
-
-          openTime:
-            Number(
-              row[0]
-            ),
-
-          open:
-            Number(
-              row[1]
-            ),
-
-          high:
-            Number(
-              row[2]
-            ),
-
-          low:
-            Number(
-              row[3]
-            ),
-
-          close:
-            Number(
-              row[4]
-            ),
-
-          volume:
-            Number(
-              row[5]
-            ),
-
-          closeTime:
-            Number(
-              row[6]
-            ),
-
-          closed:
-            true,
-
-          source:
-            "Binance"
-        })
-      )
-      .filter(
-        candle =>
-          Number.isFinite(
-            candle.openTime
-          ) &&
-          Number.isFinite(
-            candle.high
-          ) &&
-          Number.isFinite(
-            candle.low
-          ) &&
-          Number.isFinite(
-            candle.close
-          )
-      );
-
-  if (
-    !parsed.length
-  ) {
-
-    throw new Error(
-      "Binance returned zero valid candles"
-    );
-
-  }
-
-  candles[interval] =
-    parsed;
-
-  candleSuccess++;
-
-  candleLastStatus =
-    200;
-
-  candleLastSource =
-    "Binance";
-
-  candleLastError =
-    null;
-
-  candleUpdatedAt =
-    nowIso();
-
-  console.log(
-    `Loaded ${parsed.length} Binance ${interval} candles`
-  );
-
-  return true;
-
-}
-
-/* ============================================================
-   LOAD HISTORICAL CANDLES
-   ============================================================ */
-
-async function loadHistoricalKlines(
-  interval
-) {
-
-  candleRequests++;
-
-  /*
-     IMPORTANT:
-
-     Bybit is tried first because
-     Binance Futures REST is blocked
-     from the current Render location.
-  */
+  candleRequests[tf]++;
 
   try {
+    const response = await axios.get(SPOT_REST, {
+      params: {
+        symbol: SYMBOL,
+        interval: cfg.interval,
+        limit: cfg.candles
+      },
 
-    await loadBybitHistoricalKlines(
-      interval
+      timeout: 15000,
+
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 Binance-Major-Liquidity-Relay"
+      }
+    });
+
+    const rows = safeArray(response.data);
+
+    const candles = rows
+      .map(normalizeSpotKline)
+      .filter(Boolean)
+      .sort((a, b) => a.openTime - b.openTime);
+
+    if (!candles.length) {
+      throw new Error("No historical candles returned");
+    }
+
+    candleHistory[tf] = candles;
+
+    candleSource[tf] = "binance_spot";
+
+    candleSuccess[tf]++;
+
+    candleLastStatus = response.status;
+    candleLastError = null;
+
+    console.log(
+      `[CANDLE] ${tf} loaded ${candles.length} Spot candles`
     );
-
-    rebuildStructure();
 
     return true;
 
-  } catch (bybitError) {
+  } catch (err) {
 
-    console.error(
-      `Bybit ${interval} error:`,
-      bybitError.message
+    candleErrors[tf]++;
+
+    candleLastStatus =
+      err.response?.status ||
+      err.code ||
+      null;
+
+    candleLastError =
+      err.response?.data
+        ? JSON.stringify(err.response.data)
+        : String(err.message || err);
+
+    console.log(
+      `[CANDLE ERROR] ${tf}`,
+      candleLastStatus,
+      candleLastError
     );
 
-    /*
-       Binance fallback is retained
-       in case Binance REST becomes
-       available later.
-    */
-
-    try {
-
-      await loadBinanceHistoricalKlines(
-        interval
-      );
-
-      rebuildStructure();
-
-      return true;
-
-    } catch (binanceError) {
-
-      candleErrors++;
-
-      candleLastStatus =
-        binanceError.statusCode ||
-        bybitError.statusCode ||
-        null;
-
-      candleLastError =
-        `Bybit: ${bybitError.message} | ` +
-        `Binance: ${binanceError.message}`;
-
-      console.error(
-        `Historical ${interval} failed:`,
-        candleLastError
-      );
-
-      return false;
-
-    }
-
+    return false;
   }
-
 }
 
-/* ============================================================
+
+/* =========================================================
    LOAD ALL HISTORICAL STRUCTURE
-   ============================================================ */
+========================================================= */
 
-async function loadAllHistoricalKlines() {
-
-  console.log(
-    "================================================"
-  );
+async function loadAllHistoricalCandles() {
 
   console.log(
-    "LOADING HISTORICAL STRUCTURE DATA"
+    "[STRUCTURE] Loading historical Spot candles..."
   );
 
-  console.log(
-    "================================================"
-  );
+  for (const tf of Object.keys(STRUCTURE)) {
 
-  /*
-     Sequential requests.
+    await loadHistoricalCandles(tf);
 
-     This prevents unnecessary
-     rate-limit pressure.
-  */
+    /*
+    Small pause between requests.
+    */
 
-  await loadHistoricalKlines(
-    "15m"
-  );
-
-  await loadHistoricalKlines(
-    "1h"
-  );
-
-  await loadHistoricalKlines(
-    "4h"
-  );
-
-  await loadHistoricalKlines(
-    "1d"
-  );
+    await new Promise(resolve =>
+      setTimeout(resolve, 300)
+    );
+  }
 
   rebuildStructure();
 
   console.log(
-    "================================================"
+    "[STRUCTURE] Historical structure initialized"
   );
+}
+
+
+/* =========================================================
+   FUTURES LIVE KLINES
+========================================================= */
+
+function connectFuturesKlines() {
+
+  if (futuresKlineWs) {
+
+    try {
+      futuresKlineWs.close();
+    } catch (_) {}
+  }
 
   console.log(
-    "HISTORICAL STRUCTURE LOADING COMPLETE"
+    "[KLINE] Connecting Binance Futures kline stream..."
   );
 
-  console.log(
-    `15m candles: ${candles["15m"].length}`
-  );
+  futuresKlineWs =
+    new WebSocket(FUTURES_COMBINED_KLINE_WS);
 
-  console.log(
-    `1h candles: ${candles["1h"].length}`
-  );
+  futuresKlineWs.on("open", () => {
 
-  console.log(
-    `4h candles: ${candles["4h"].length}`
-  );
-
-  console.log(
-    `1d candles: ${candles["1d"].length}`
-  );
-
-  console.log(
-    `Swing highs: ${swingHighs.length}`
-  );
-
-  console.log(
-    `Swing lows: ${swingLows.length}`
-  );
-
-  console.log(
-    "================================================"
-  );
-
-}
-
-/* ============================================================
-   ORDER BOOK FUNCTIONS
-   ============================================================ */
-
-function applyBookSide(
-  map,
-  updates
-) {
-
-  if (
-    !Array.isArray(
-      updates
-    )
-  ) {
-
-    return;
-
-  }
-
-  for (
-    const item of updates
-  ) {
-
-    if (
-      !Array.isArray(item) ||
-      item.length < 2
-    ) {
-
-      continue;
-
-    }
-
-    const price =
-      safeNumber(
-        item[0]
-      );
-
-    const quantity =
-      safeNumber(
-        item[1]
-      );
-
-    if (
-      price === null ||
-      quantity === null
-    ) {
-
-      continue;
-
-    }
-
-    if (
-      quantity === 0
-    ) {
-
-      map.delete(
-        price
-      );
-
-    } else {
-
-      map.set(
-        price,
-        quantity
-      );
-
-    }
-
-  }
-
-}
-
-function applyDepthEvent(
-  event
-) {
-
-  if (!event) {
-
-    return;
-
-  }
-
-  applyBookSide(
-    bids,
-    event.b
-  );
-
-  applyBookSide(
-    asks,
-    event.a
-  );
-
-  if (
-    event.u !== undefined
-  ) {
-
-    lastUpdateId =
-      Number(
-        event.u
-      );
-
-  }
-
-}
-
-function getBestBid() {
-
-  let best =
-    null;
-
-  for (
-    const [
-      price,
-      quantity
-    ] of bids
-  ) {
-
-    if (
-      quantity <= 0
-    ) {
-
-      continue;
-
-    }
-
-    if (
-      best === null ||
-      price > best.price
-    ) {
-
-      best = {
-        price,
-        quantity
-      };
-
-    }
-
-  }
-
-  return best;
-
-}
-
-function getBestAsk() {
-
-  let best =
-    null;
-
-  for (
-    const [
-      price,
-      quantity
-    ] of asks
-  ) {
-
-    if (
-      quantity <= 0
-    ) {
-
-      continue;
-
-    }
-
-    if (
-      best === null ||
-      price < best.price
-    ) {
-
-      best = {
-        price,
-        quantity
-      };
-
-    }
-
-  }
-
-  return best;
-
-}
-
-function getBookMid() {
-
-  const bid =
-    getBestBid();
-
-  const ask =
-    getBestAsk();
-
-  if (
-    bid &&
-    ask
-  ) {
-
-    return (
-      bid.price +
-      ask.price
-    ) / 2;
-
-  }
-
-  if (bid) {
-
-    return bid.price;
-
-  }
-
-  if (ask) {
-
-    return ask.price;
-
-  }
-
-  return currentPrice;
-
-}
-
-/* ============================================================
-   DEPTH BUFFER
-   ============================================================ */
-
-function bufferDepthEvent(
-  event
-) {
-
-  pendingDepthEvents.push(
-    event
-  );
-
-  if (
-    pendingDepthEvents.length >
-    MAX_PENDING_EVENTS
-  ) {
-
-    pendingDepthEvents.splice(
-      0,
-      pendingDepthEvents.length -
-        MAX_PENDING_EVENTS
+    console.log(
+      "[KLINE] Binance Futures connected"
     );
+  });
 
-  }
+  futuresKlineWs.on("message", raw => {
 
-}
+    try {
 
-/* ============================================================
-   FIND SNAPSHOT BRIDGE
-   ============================================================ */
+      const message =
+        JSON.parse(raw.toString());
 
-function findBridgeEvent(
-  snapshotId
-) {
+      /*
+      Combined stream:
+      {
+        stream: "...",
+        data: {...}
+      }
+      */
 
-  const target =
-    Number(
-      snapshotId
-    ) + 1;
+      const data =
+        message.data || message;
 
-  for (
-    const event of
-    pendingDepthEvents
-  ) {
+      if (data.e !== "kline") {
+        return;
+      }
 
-    const U =
-      Number(
-        event.U
-      );
+      const k = data.k;
 
-    const u =
-      Number(
-        event.u
-      );
+      if (!k) return;
 
-    if (
-      !Number.isFinite(U) ||
-      !Number.isFinite(u)
-    ) {
+      const interval = k.i;
 
-      continue;
+      let tf = null;
 
-    }
+      if (interval === "15m") tf = "15m";
+      if (interval === "1h") tf = "1h";
+      if (interval === "4h") tf = "4h";
+      if (interval === "1d") tf = "1d";
 
-    if (
-      U <= target &&
-      u >= target
-    ) {
+      if (!tf) return;
 
-      return event;
+      const candle =
+        normalizeFuturesKline(k);
 
-    }
+      if (!candle) return;
 
-  }
+      /*
+      Replace the current candle if it exists.
+      Otherwise append it.
+      */
 
-  return null;
+      const history =
+        candleHistory[tf];
 
-}
+      const existingIndex =
+        history.findIndex(
+          x => x.openTime === candle.openTime
+        );
 
-/* ============================================================
-   COMPLETE SNAPSHOT BRIDGE
-   ============================================================ */
+      if (existingIndex >= 0) {
 
-function tryCompleteBridge() {
-
-  if (
-    !waitingForBridge ||
-    !lastSnapshotId
-  ) {
-
-    return false;
-
-  }
-
-  bridgeAttempts++;
-
-  const bridge =
-    findBridgeEvent(
-      lastSnapshotId
-    );
-
-  if (!bridge) {
-
-    return false;
-
-  }
-
-  bridgeFound++;
-
-  applyDepthEvent(
-    bridge
-  );
-
-  initialized =
-    true;
-
-  waitingForBridge =
-    false;
-
-  snapshotPending =
-    false;
-
-  gapRecovery =
-    false;
-
-  gapDetected =
-    false;
-
-  const bridgeIndex =
-    pendingDepthEvents.indexOf(
-      bridge
-    );
-
-  if (
-    bridgeIndex >= 0
-  ) {
-
-    pendingDepthEvents =
-      pendingDepthEvents.slice(
-        bridgeIndex + 1
-      );
-
-  } else {
-
-    pendingDepthEvents =
-      [];
-
-  }
-
-  return true;
-
-}
-
-/* ============================================================
-   SNAPSHOT REQUEST CONTROL
-   ============================================================ */
-
-function canRequestSnapshot() {
-
-  if (
-    snapshotPending
-  ) {
-
-    return false;
-
-  }
-
-  if (
-    !lastSnapshotRequest
-  ) {
-
-    return true;
-
-  }
-
-  const elapsed =
-    Date.now() -
-    new Date(
-      lastSnapshotRequest
-    ).getTime();
-
-  return (
-    elapsed >=
-    SNAPSHOT_MIN_INTERVAL_MS
-  );
-
-}
-
-function requestSnapshot() {
-
-  if (
-    !canRequestSnapshot()
-  ) {
-
-    return;
-
-  }
-
-  if (
-    !snapshotWs ||
-    snapshotWs.readyState !==
-      WebSocket.OPEN
-  ) {
-
-    return;
-
-  }
-
-  snapshotPending =
-    true;
-
-  snapshotRequests++;
-
-  lastSnapshotRequest =
-    nowIso();
-
-  const id =
-    String(
-      ++snapshotRequestId
-    );
-
-  const request = {
-
-    id,
-
-    method:
-      "depth",
-
-    params: {
-
-      symbol:
-        SYMBOL,
-
-      limit:
-        1000
-
-    }
-
-  };
-
-  try {
-
-    snapshotWs.send(
-      JSON.stringify(
-        request
-      )
-    );
-
-  } catch (error) {
-
-    snapshotPending =
-      false;
-
-    lastSnapshotError =
-      error.message;
-
-    return;
-
-  }
-
-  if (
-    snapshotTimeout
-  ) {
-
-    clearTimeout(
-      snapshotTimeout
-    );
-
-  }
-
-  snapshotTimeout =
-    setTimeout(
-      () => {
-
-        if (
-          !snapshotPending
-        ) {
-
-          return;
-
-        }
-
-        snapshotPending =
-          false;
-
-        lastSnapshotError =
-          "Snapshot timeout";
-
-        scheduleSnapshotRecovery();
-
-      },
-      SNAPSHOT_TIMEOUT_MS
-    );
-
-}
-
-/* ============================================================
-   INSTALL SNAPSHOT
-   ============================================================ */
-
-function installSnapshot(
-  result
-) {
-
-  if (!result) {
-
-    return false;
-
-  }
-
-  const snapshotId =
-    Number(
-      result.lastUpdateId
-    );
-
-  if (
-    !Number.isFinite(
-      snapshotId
-    )
-  ) {
-
-    lastSnapshotError =
-      "Invalid snapshot ID";
-
-    return false;
-
-  }
-
-  bids.clear();
-
-  asks.clear();
-
-  const snapshotBids =
-    Array.isArray(
-      result.bids
-    )
-      ? result.bids
-      : [];
-
-  const snapshotAsks =
-    Array.isArray(
-      result.asks
-    )
-      ? result.asks
-      : [];
-
-  for (
-    const item of
-    snapshotBids
-  ) {
-
-    if (
-      !Array.isArray(item)
-    ) {
-
-      continue;
-
-    }
-
-    const price =
-      safeNumber(
-        item[0]
-      );
-
-    const quantity =
-      safeNumber(
-        item[1]
-      );
-
-    if (
-      price !== null &&
-      quantity !== null &&
-      quantity > 0
-    ) {
-
-      bids.set(
-        price,
-        quantity
-      );
-
-    }
-
-  }
-
-  for (
-    const item of
-    snapshotAsks
-  ) {
-
-    if (
-      !Array.isArray(item)
-    ) {
-
-      continue;
-
-    }
-
-    const price =
-      safeNumber(
-        item[0]
-      );
-
-    const quantity =
-      safeNumber(
-        item[1]
-      );
-
-    if (
-      price !== null &&
-      quantity !== null &&
-      quantity > 0
-    ) {
-
-      asks.set(
-        price,
-        quantity
-      );
-
-    }
-
-  }
-
-  lastSnapshotId =
-    snapshotId;
-
-  lastUpdateId =
-    snapshotId;
-
-  initialized =
-    false;
-
-  waitingForBridge =
-    true;
-
-  gapRecovery =
-    false;
-
-  gapDetected =
-    false;
-
-  lastSnapshotResponse =
-    nowIso();
-
-  lastSnapshotError =
-    null;
-
-  if (
-    snapshotTimeout
-  ) {
-
-    clearTimeout(
-      snapshotTimeout
-    );
-
-    snapshotTimeout =
-      null;
-
-  }
-
-  tryCompleteBridge();
-
-  return true;
-
-}
-
-/* ============================================================
-   HANDLE DEPTH
-   ============================================================ */
-
-function handleDepthEvent(
-  event
-) {
-
-  if (
-    !event ||
-    event.e !==
-      "depthUpdate"
-  ) {
-
-    return;
-
-  }
-
-  const firstBid =
-    event.b &&
-    event.b.length
-      ? safeNumber(
-          event.b[0][0]
-        )
-      : null;
-
-  const firstAsk =
-    event.a &&
-    event.a.length
-      ? safeNumber(
-          event.a[0][0]
-        )
-      : null;
-
-  if (
-    firstBid !== null &&
-    firstAsk !== null
-  ) {
-
-    currentPrice =
-      (
-        firstBid +
-        firstAsk
-      ) / 2;
-
-  }
-
-  bufferDepthEvent(
-    event
-  );
-
-  if (
-    !initialized
-  ) {
-
-    tryCompleteBridge();
-
-    return;
-
-  }
-
-  const U =
-    Number(
-      event.U
-    );
-
-  const u =
-    Number(
-      event.u
-    );
-
-  if (
-    !Number.isFinite(U) ||
-    !Number.isFinite(u)
-  ) {
-
-    return;
-
-  }
-
-  if (
-    U <=
-      lastUpdateId + 1 &&
-    u >=
-      lastUpdateId + 1
-  ) {
-
-    applyDepthEvent(
-      event
-    );
-
-    if (
-      gapRecovery
-    ) {
-
-      gapRecovery =
-        false;
-
-      gapDetected =
-        false;
-
-    }
-
-    while (
-      pendingDepthEvents.length >
-      0
-    ) {
-
-      const first =
-        pendingDepthEvents[0];
-
-      if (
-        Number(
-          first.u
-        ) <=
-        lastUpdateId
-      ) {
-
-        pendingDepthEvents.shift();
+        history[existingIndex] =
+          candle;
 
       } else {
 
-        break;
+        history.push(candle);
 
+        history.sort(
+          (a, b) =>
+            a.openTime - b.openTime
+        );
       }
 
-    }
+      /*
+      Keep memory bounded.
+      */
 
-    return;
+      const max =
+        STRUCTURE[tf].candles + 50;
 
-  }
+      if (history.length > max) {
 
-  if (
-    u <=
-    lastUpdateId
-  ) {
-
-    return;
-
-  }
-
-  if (
-    gapRecovery
-  ) {
-
-    return;
-
-  }
-
-  gapRecovery =
-    true;
-
-  gapDetected =
-    true;
-
-  gapCount++;
-
-  lastGapLocal =
-    lastUpdateId;
-
-  lastGapIncoming =
-    U;
-
-  scheduleSnapshotRecovery();
-
-}
-
-/* ============================================================
-   SNAPSHOT RECOVERY
-   ============================================================ */
-
-function scheduleSnapshotRecovery() {
-
-  if (
-    snapshotTimer
-  ) {
-
-    return;
-
-  }
-
-  let delay =
-    1000;
-
-  if (
-    !canRequestSnapshot() &&
-    lastSnapshotRequest
-  ) {
-
-    const elapsed =
-      Date.now() -
-      new Date(
-        lastSnapshotRequest
-      ).getTime();
-
-    delay =
-      Math.max(
-        1000,
-        SNAPSHOT_MIN_INTERVAL_MS -
-          elapsed
-      );
-
-  }
-
-  snapshotTimer =
-    setTimeout(
-      () => {
-
-        snapshotTimer =
-          null;
-
-        requestSnapshot();
-
-      },
-      delay
-    );
-
-}
-
-/* ============================================================
-   BINANCE DEPTH WEBSOCKET
-   ============================================================ */
-
-function connectDepthWebSocket() {
-
-  if (
-    depthWs
-  ) {
-
-    try {
-
-      depthWs.close();
-
-    } catch (e) {}
-
-  }
-
-  depthWs =
-    new WebSocket(
-      DEPTH_WS
-    );
-
-  depthWs.on(
-    "open",
-    () => {
-
-      console.log(
-        "Depth WebSocket connected"
-      );
-
-      if (
-        !initialized
-      ) {
-
-        scheduleSnapshotRecovery();
-
-      }
-
-    }
-  );
-
-  depthWs.on(
-    "message",
-    raw => {
-
-      try {
-
-        const event =
-          JSON.parse(
-            raw.toString()
+        candleHistory[tf] =
+          history.slice(
+            history.length - max
           );
-
-        handleDepthEvent(
-          event
-        );
-
-      } catch (error) {
-
-        console.error(
-          "Depth parse error:",
-          error.message
-        );
-
       }
 
-    }
-  );
+      candleSource[tf] =
+        "binance_futures_live";
 
-  depthWs.on(
-    "close",
-    () => {
+      /*
+      Current Futures price.
+      */
+
+      currentPrice =
+        candle.close;
+
+      /*
+      Recalculate structure on candle close.
+      */
+
+      if (k.x === true) {
+
+        rebuildStructure();
+      }
+
+    } catch (err) {
 
       console.log(
-        "Depth WebSocket closed"
+        "[KLINE MESSAGE ERROR]",
+        err.message
       );
+    }
+  });
 
+  futuresKlineWs.on("error", err => {
+
+    console.log(
+      "[KLINE ERROR]",
+      err.message
+    );
+  });
+
+  futuresKlineWs.on("close", () => {
+
+    console.log(
+      "[KLINE] Disconnected"
+    );
+
+    if (klineReconnectTimer) {
+      clearTimeout(klineReconnectTimer);
+    }
+
+    klineReconnectTimer =
       setTimeout(
-        () => {
-
-          connectDepthWebSocket();
-
-        },
-        3000
+        connectFuturesKlines,
+        5000
       );
-
-    }
-  );
-
-  depthWs.on(
-    "error",
-    error => {
-
-      console.error(
-        "Depth WebSocket error:",
-        error.message
-      );
-
-    }
-  );
-
+  });
 }
 
-/* ============================================================
-   BINANCE SNAPSHOT WEBSOCKET
-   ============================================================ */
 
-function connectSnapshotWebSocket() {
-
-  if (
-    snapshotWs
-  ) {
-
-    try {
-
-      snapshotWs.close();
-
-    } catch (e) {}
-
-  }
-
-  snapshotWs =
-    new WebSocket(
-      WS_API
-    );
-
-  snapshotWs.on(
-    "open",
-    () => {
-
-      console.log(
-        "Binance Futures API WebSocket connected"
-      );
-
-      requestSnapshot();
-
-    }
-  );
-
-  snapshotWs.on(
-    "message",
-    raw => {
-
-      try {
-
-        const message =
-          JSON.parse(
-            raw.toString()
-          );
-
-        if (
-          message.status ===
-            429 ||
-          (
-            message.error &&
-            (
-              message.error.code ===
-                -1003 ||
-              message.error.code ===
-                429
-            )
-          )
-        ) {
-
-          snapshot429s++;
-
-          snapshotPending =
-            false;
-
-          lastSnapshotError =
-            message.error?.msg ||
-            "Snapshot rate limit";
-
-          scheduleSnapshotRecovery();
-
-          return;
-
-        }
-
-        if (
-          message.status ===
-            200 &&
-          message.result &&
-          message.result.lastUpdateId !==
-            undefined
-        ) {
-
-          installSnapshot(
-            message.result
-          );
-
-          return;
-
-        }
-
-        if (
-          message.error
-        ) {
-
-          snapshotPending =
-            false;
-
-          lastSnapshotError =
-            message.error.msg ||
-            "Snapshot API error";
-
-          scheduleSnapshotRecovery();
-
-        }
-
-      } catch (error) {
-
-        lastSnapshotError =
-          error.message;
-
-      }
-
-    }
-  );
-
-  snapshotWs.on(
-    "close",
-    () => {
-
-      console.log(
-        "Snapshot WebSocket closed"
-      );
-
-      setTimeout(
-        () => {
-
-          connectSnapshotWebSocket();
-
-        },
-        3000
-      );
-
-    }
-  );
-
-  snapshotWs.on(
-    "error",
-    error => {
-
-      console.error(
-        "Snapshot WebSocket error:",
-        error.message
-      );
-
-    }
-  );
-
-}
-
-/* ============================================================
-   BINANCE LIVE KLINE WEBSOCKET
-   ============================================================ */
-
-function connectKlineWebSocket() {
-
-  if (
-    klineWs
-  ) {
-
-    try {
-
-      klineWs.close();
-
-    } catch (e) {}
-
-  }
-
-  klineWs =
-    new WebSocket(
-      KLINE_WS
-    );
-
-  klineWs.on(
-    "open",
-    () => {
-
-      console.log(
-        "Kline WebSocket connected"
-      );
-
-    }
-  );
-
-  klineWs.on(
-    "message",
-    raw => {
-
-      try {
-
-        const wrapper =
-          JSON.parse(
-            raw.toString()
-          );
-
-        const data =
-          wrapper.data;
-
-        if (
-          !data ||
-          data.e !==
-            "kline"
-        ) {
-
-          return;
-
-        }
-
-        const k =
-          data.k;
-
-        if (!k) {
-
-          return;
-
-        }
-
-        const interval =
-          k.i;
-
-        if (
-          !candles[interval]
-        ) {
-
-          return;
-
-        }
-
-        const candle = {
-
-          openTime:
-            Number(k.t),
-
-          closeTime:
-            Number(k.T),
-
-          open:
-            Number(k.o),
-
-          high:
-            Number(k.h),
-
-          low:
-            Number(k.l),
-
-          close:
-            Number(k.c),
-
-          volume:
-            Number(k.v),
-
-          closed:
-            Boolean(k.x),
-
-          source:
-            "Binance"
-        };
-
-        upsertCandle(
-          interval,
-          candle
-        );
-
-      } catch (error) {
-
-        console.error(
-          "Kline parse error:",
-          error.message
-        );
-
-      }
-
-    }
-  );
-
-  klineWs.on(
-    "close",
-    () => {
-
-      console.log(
-        "Kline WebSocket closed"
-      );
-
-      setTimeout(
-        () => {
-
-          connectKlineWebSocket();
-
-        },
-        3000
-      );
-
-    }
-  );
-
-  klineWs.on(
-    "error",
-    error => {
-
-      console.error(
-        "Kline WebSocket error:",
-        error.message
-      );
-
-    }
-  );
-
-}
-
-/* ============================================================
-   LIVE CANDLE UPDATE
-   ============================================================ */
-
-function upsertCandle(
-  interval,
-  candle
+/* =========================================================
+   PIVOT DETECTION
+========================================================= */
+
+function isPivotHigh(
+  candles,
+  index,
+  left,
+  right
 ) {
 
   if (
-    !candles[interval]
+    index - left < 0 ||
+    index + right >= candles.length
   ) {
-
-    candles[interval] =
-      [];
-
+    return false;
   }
 
-  const list =
-    candles[interval];
-
-  const index =
-    list.findIndex(
-      x =>
-        x.openTime ===
-        candle.openTime
-    );
-
-  if (
-    index >= 0
-  ) {
-
-    list[index] =
-      candle;
-
-  } else {
-
-    list.push(
-      candle
-    );
-
-  }
-
-  list.sort(
-    (a, b) =>
-      a.openTime -
-      b.openTime
-  );
-
-  const max =
-    STRUCTURE[interval]?.candles ||
-    300;
-
-  if (
-    list.length >
-    max
-  ) {
-
-    list.splice(
-      0,
-      list.length - max
-    );
-
-  }
-
-  /*
-     Rebuild only when candle closes.
-  */
-
-  if (
-    candle.closed
-  ) {
-
-    rebuildStructure();
-
-  }
-
-}
-
-/* ============================================================
-   SWING DETECTION
-   ============================================================ */
-
-function detectSwings(
-  interval,
-  list
-) {
-
-  const config =
-    STRUCTURE[interval];
-
-  const highs =
-    [];
-
-  const lows =
-    [];
-
-  if (
-    !config ||
-    !list ||
-    list.length <
-      config.pivotLeft +
-      config.pivotRight +
-      5
-  ) {
-
-    return {
-      highs,
-      lows
-    };
-
-  }
-
-  const left =
-    config.pivotLeft;
-
-  const right =
-    config.pivotRight;
+  const value =
+    candles[index].high;
 
   for (
-    let i = left;
-    i <
-      list.length -
-      right;
+    let i = index - left;
+    i <= index + right;
     i++
   ) {
 
-    const candle =
-      list[i];
-
-    let isHigh =
-      true;
-
-    let isLow =
-      true;
-
-    for (
-      let j =
-        i - left;
-      j <=
-        i + right;
-      j++
-    ) {
-
-      if (
-        j === i
-      ) {
-
-        continue;
-
-      }
-
-      if (
-        list[j].high >=
-        candle.high
-      ) {
-
-        isHigh =
-          false;
-
-        break;
-
-      }
-
-    }
-
-    for (
-      let j =
-        i - left;
-      j <=
-        i + right;
-      j++
-    ) {
-
-      if (
-        j === i
-      ) {
-
-        continue;
-
-      }
-
-      if (
-        list[j].low <=
-        candle.low
-      ) {
-
-        isLow =
-          false;
-
-        break;
-
-      }
-
-    }
-
-    let highReaction =
-      0;
-
-    let lowReaction =
-      0;
-
-    const future =
-      list.slice(
-        i +
-          right +
-          1,
-        Math.min(
-          list.length,
-          i +
-            right +
-            40
-        )
-      );
+    if (i === index) continue;
 
     if (
-      isHigh
+      candles[i].high >= value
     ) {
+      return false;
+    }
+  }
 
-      for (
-        const futureCandle of
-        future
-      ) {
+  return true;
+}
 
-        if (
-          futureCandle.low <=
-          candle.high *
-            (
-              1 -
-              REACTION_MOVE_PCT
-            )
-        ) {
 
-          highReaction =
-            1;
+function isPivotLow(
+  candles,
+  index,
+  left,
+  right
+) {
 
-          break;
+  if (
+    index - left < 0 ||
+    index + right >= candles.length
+  ) {
+    return false;
+  }
 
-        }
+  const value =
+    candles[index].low;
 
-      }
+  for (
+    let i = index - left;
+    i <= index + right;
+    i++
+  ) {
+
+    if (i === index) continue;
+
+    if (
+      candles[i].low <= value
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+/* =========================================================
+   STRUCTURE EXTRACTION
+========================================================= */
+
+function extractStructure(tf) {
+
+  const cfg =
+    STRUCTURE[tf];
+
+  const candles =
+    candleHistory[tf] || [];
+
+  if (
+    candles.length <
+    cfg.pivotLeft +
+    cfg.pivotRight +
+    10
+  ) {
+
+    return {
+      highs: [],
+      lows: []
+    };
+  }
+
+  const highs = [];
+  const lows = [];
+
+  for (
+    let i = cfg.pivotLeft;
+    i <
+    candles.length - cfg.pivotRight;
+    i++
+  ) {
+
+    if (
+      isPivotHigh(
+        candles,
+        i,
+        cfg.pivotLeft,
+        cfg.pivotRight
+      )
+    ) {
 
       highs.push({
-
-        type:
-          "swing_high",
-
-        side:
-          "buy_side",
-
-        interval,
-
-        price:
-          candle.high,
-
-        time:
-          candle.openTime,
-
-        reactionCount:
-          highReaction,
-
-        timeframeWeight:
-          config.weight
+        timeframe: tf,
+        price: candles[i].high,
+        time: candles[i].openTime,
+        type: "swing_high"
       });
-
     }
 
     if (
-      isLow
+      isPivotLow(
+        candles,
+        i,
+        cfg.pivotLeft,
+        cfg.pivotRight
+      )
     ) {
 
-      for (
-        const futureCandle of
-        future
-      ) {
-
-        if (
-          futureCandle.high >=
-          candle.low *
-            (
-              1 +
-              REACTION_MOVE_PCT
-            )
-        ) {
-
-          lowReaction =
-            1;
-
-          break;
-
-        }
-
-      }
-
       lows.push({
-
-        type:
-          "swing_low",
-
-        side:
-          "sell_side",
-
-        interval,
-
-        price:
-          candle.low,
-
-        time:
-          candle.openTime,
-
-        reactionCount:
-          lowReaction,
-
-        timeframeWeight:
-          config.weight
+        timeframe: tf,
+        price: candles[i].low,
+        time: candles[i].openTime,
+        type: "swing_low"
       });
-
     }
-
   }
 
   return {
     highs,
     lows
   };
-
 }
 
-/* ============================================================
-   EQUAL HIGHS / LOWS
-   ============================================================ */
 
-function addEqualLiquidity(
-  swingList,
-  tolerancePct
-) {
+/* =========================================================
+   EQUAL LEVEL DETECTION
+========================================================= */
 
-  const result =
-    [];
+function findEqualLevels(levels, tolerancePct) {
 
-  for (
-    let i = 0;
-    i <
-      swingList.length;
-    i++
-  ) {
+  const groups = [];
 
-    const base =
-      swingList[i];
+  for (const level of levels) {
 
-    let equalCount =
-      1;
+    let group = null;
 
-    for (
-      let j = 0;
-      j <
-        swingList.length;
-      j++
-    ) {
+    for (const existing of groups) {
+
+      const distance =
+        pctDistance(
+          level.price,
+          existing.price
+        );
 
       if (
-        i === j
+        distance <= tolerancePct
       ) {
 
-        continue;
-
-      }
-
-      const other =
-        swingList[j];
-
-      const difference =
-        Math.abs(
-          other.price -
-          base.price
-        ) /
-        base.price;
-
-      if (
-        difference <=
-        tolerancePct
-      ) {
-
-        equalCount++;
-
-      }
-
-    }
-
-    result.push({
-
-      ...base,
-
-      equalCount
-
-    });
-
-  }
-
-  return result;
-
-}
-
-/* ============================================================
-   MERGE STRUCTURAL LEVELS
-   ============================================================ */
-
-function mergeLevels(
-  levels
-) {
-
-  if (
-    !levels.length
-  ) {
-
-    return [];
-
-  }
-
-  const sorted =
-    [...levels].sort(
-      (a, b) =>
-        a.price -
-        b.price
-    );
-
-  const groups =
-    [];
-
-  for (
-    const level of
-    sorted
-  ) {
-
-    let group =
-      null;
-
-    for (
-      const candidate of
-      groups
-    ) {
-
-      if (
-        Math.abs(
-          level.price -
-          candidate.price
-        ) <=
-        MERGE_LEVEL_DISTANCE_USD
-      ) {
-
-        group =
-          candidate;
-
+        group = existing;
         break;
-
       }
-
     }
 
     if (!group) {
 
       group = {
-
-        price:
-          level.price,
-
-        levels:
-          []
-
+        price: level.price,
+        members: []
       };
 
-      groups.push(
-        group
-      );
-
+      groups.push(group);
     }
 
-    group.levels.push(
-      level
-    );
+    group.members.push(level);
+
+    /*
+    Keep group price centered.
+    */
 
     group.price =
-      group.levels.reduce(
-        (
-          sum,
-          x
-        ) =>
-          sum +
-          x.price,
+      group.members.reduce(
+        (sum, x) =>
+          sum + x.price,
         0
       ) /
-      group.levels.length;
-
+      group.members.length;
   }
 
-  return groups;
-
+  return groups
+    .filter(
+      x => x.members.length >= 2
+    );
 }
 
-/* ============================================================
-   STRUCTURAL SCORE
-   ============================================================ */
 
-function scoreStructuralGroup(
-  group
+/* =========================================================
+   REACTION COUNT
+========================================================= */
+
+function calculateReactionCount(
+  levelPrice,
+  candles
 ) {
 
-  const levels =
-    group.levels;
+  let reactions = 0;
 
-  let timeframeScore =
-    0;
+  if (!candles.length) {
+    return 0;
+  }
 
-  let reactions =
-    0;
+  const zone =
+    levelPrice *
+    LEVEL_ZONE_PCT;
 
-  let equalCount =
-    1;
+  for (let i = 0; i < candles.length - 3; i++) {
 
-  const intervals =
-    new Set();
+    const candle =
+      candles[i];
 
-  for (
-    const level of
-    levels
-  ) {
+    const touched =
+      candle.high >=
+        levelPrice - zone &&
+      candle.low <=
+        levelPrice + zone;
 
-    timeframeScore +=
-      level.timeframeWeight ||
-      1;
+    if (!touched) continue;
 
-    reactions +=
-      level.reactionCount ||
-      0;
-
-    equalCount =
-      Math.max(
-        equalCount,
-        level.equalCount ||
-          1
+    const futureEnd =
+      Math.min(
+        i + 4,
+        candles.length - 1
       );
 
-    intervals.add(
-      level.interval
-    );
+    let maxHigh =
+      candle.high;
 
+    let minLow =
+      candle.low;
+
+    for (
+      let j = i + 1;
+      j <= futureEnd;
+      j++
+    ) {
+
+      maxHigh =
+        Math.max(
+          maxHigh,
+          candles[j].high
+        );
+
+      minLow =
+        Math.min(
+          minLow,
+          candles[j].low
+        );
+    }
+
+    const upwardMove =
+      (maxHigh - levelPrice) /
+      levelPrice;
+
+    const downwardMove =
+      (levelPrice - minLow) /
+      levelPrice;
+
+    if (
+      upwardMove >=
+        REACTION_MOVE_PCT ||
+      downwardMove >=
+        REACTION_MOVE_PCT
+    ) {
+
+      reactions++;
+    }
   }
 
-  const timeframeCount =
-    intervals.size;
-
-  let score =
-    0;
-
-  /*
-     Higher timeframe
-     = higher weight.
-  */
-
-  score +=
-    timeframeScore *
-    10;
-
-  /*
-     Reactions
-     = evidence that price
-     respected the level.
-  */
-
-  score +=
-    reactions *
-    10;
-
-  /*
-     Equal highs/lows
-     = additional liquidity.
-  */
-
-  score +=
-    Math.max(
-      0,
-      equalCount - 1
-    ) *
-    20;
-
-  /*
-     Multi-timeframe agreement
-     = stronger structure.
-  */
-
-  score +=
-    Math.max(
-      0,
-      timeframeCount - 1
-    ) *
-    25;
-
-  let importance =
-    "MODERATE";
-
-  if (
-    score >= 110
-  ) {
-
-    importance =
-      "VERY HIGH";
-
-  } else if (
-    score >= 80
-  ) {
-
-    importance =
-      "HIGH";
-
-  } else if (
-    score >= 55
-  ) {
-
-    importance =
-      "MEDIUM";
-
-  }
-
-  return {
-
-    score,
-
-    importance,
-
-    timeframeCount,
-
-    intervals:
-      [...intervals],
-
-    reactions,
-
-    equalCount
-
-  };
-
+  return reactions;
 }
 
-/* ============================================================
-   REBUILD STRUCTURE
-   ============================================================ */
+
+/* =========================================================
+   BUILD STRUCTURAL LEVELS
+========================================================= */
 
 function rebuildStructure() {
 
-  const allHighs =
-    [];
+  const allHighs = [];
+  const allLows = [];
 
-  const allLows =
-    [];
+  const equalHighs = [];
+  const equalLows = [];
 
-  for (
-    const interval of
-    Object.keys(
-      STRUCTURE
-    )
-  ) {
+  for (const tf of Object.keys(STRUCTURE)) {
 
-    const list =
-      candles[interval];
-
-    if (
-      !list ||
-      !list.length
-    ) {
-
-      continue;
-
-    }
-
-    const result =
-      detectSwings(
-        interval,
-        list
-      );
-
-    const highs =
-      addEqualLiquidity(
-        result.highs,
-        STRUCTURE[
-          interval
-        ].equalTolerancePct
-      );
-
-    const lows =
-      addEqualLiquidity(
-        result.lows,
-        STRUCTURE[
-          interval
-        ].equalTolerancePct
-      );
+    const extracted =
+      extractStructure(tf);
 
     allHighs.push(
-      ...highs
+      ...extracted.highs
     );
 
     allLows.push(
-      ...lows
+      ...extracted.lows
     );
 
+    const equalH =
+      findEqualLevels(
+        extracted.highs,
+        STRUCTURE[tf]
+          .equalTolerancePct
+      );
+
+    const equalL =
+      findEqualLevels(
+        extracted.lows,
+        STRUCTURE[tf]
+          .equalTolerancePct
+      );
+
+    for (const group of equalH) {
+
+      equalHighs.push({
+        timeframe: tf,
+        price: group.price,
+        count: group.members.length,
+        members: group.members
+      });
+    }
+
+    for (const group of equalL) {
+
+      equalLows.push({
+        timeframe: tf,
+        price: group.price,
+        count: group.members.length,
+        members: group.members
+      });
+    }
   }
 
-  swingHighs =
+  structure.swingHighs =
     allHighs;
 
-  swingLows =
+  structure.swingLows =
     allLows;
 
-  lastStructureUpdate =
-    nowIso();
+  structure.equalHighs =
+    equalHighs;
 
+  structure.equalLows =
+    equalLows;
+
+  /*
+  Merge nearby highs.
+  */
+
+  const highGroups =
+    mergeStructuralLevels(
+      allHighs,
+      "BSL"
+    );
+
+  /*
+  Merge nearby lows.
+  */
+
+  const lowGroups =
+    mergeStructuralLevels(
+      allLows,
+      "SSL"
+    );
+
+  /*
+  Score.
+  */
+
+  const scoredHighs =
+    highGroups.map(
+      level =>
+        scoreStructuralLevel(
+          level,
+          "BSL"
+        )
+    );
+
+  const scoredLows =
+    lowGroups.map(
+      level =>
+        scoreStructuralLevel(
+          level,
+          "SSL"
+        )
+    );
+
+  structure.majorBSL =
+    scoredHighs
+      .filter(
+        x =>
+          x.score >=
+          MIN_MAJOR_LEVEL_SCORE
+      )
+      .sort(
+        (a, b) =>
+          b.score - a.score
+      )
+      .slice(
+        0,
+        MAX_MAJOR_LEVELS
+      );
+
+  structure.majorSSL =
+    scoredLows
+      .filter(
+        x =>
+          x.score >=
+          MIN_MAJOR_LEVEL_SCORE
+      )
+      .sort(
+        (a, b) =>
+          b.score - a.score
+      )
+      .slice(
+        0,
+        MAX_MAJOR_LEVELS
+      );
+
+  structure.majorResistance =
+    structure.majorBSL
+      .slice()
+      .sort(
+        (a, b) =>
+          Math.abs(
+            a.price -
+            (currentPrice || a.price)
+          ) -
+          Math.abs(
+            b.price -
+            (currentPrice || b.price)
+          )
+      )
+      .slice(
+        0,
+        3
+      );
+
+  structure.majorSupport =
+    structure.majorSSL
+      .slice()
+      .sort(
+        (a, b) =>
+          Math.abs(
+            a.price -
+            (currentPrice || a.price)
+          ) -
+          Math.abs(
+            b.price -
+            (currentPrice || b.price)
+          )
+      )
+      .slice(
+        0,
+        3
+      );
+
+  structure.updatedAt =
+    now();
 }
 
-/* ============================================================
-   RESTING LIQUIDITY AROUND STRUCTURAL LEVEL
-   ============================================================ */
 
-function restingLiquidityAround(
+/* =========================================================
+   MERGE STRUCTURAL LEVELS
+========================================================= */
+
+function mergeStructuralLevels(
+  levels,
+  side
+) {
+
+  if (!levels.length) {
+    return [];
+  }
+
+  const sorted =
+    levels
+      .slice()
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      );
+
+  const groups = [];
+
+  for (const level of sorted) {
+
+    let group = null;
+
+    for (const existing of groups) {
+
+      if (
+        Math.abs(
+          level.price -
+          existing.price
+        ) <=
+        MERGE_LEVEL_DISTANCE_USD
+      ) {
+
+        group = existing;
+        break;
+      }
+    }
+
+    if (!group) {
+
+      group = {
+        side,
+        priceLow: level.price,
+        priceHigh: level.price,
+        members: [],
+        timeframes: new Set()
+      };
+
+      groups.push(group);
+    }
+
+    group.members.push(level);
+
+    group.priceLow =
+      Math.min(
+        group.priceLow,
+        level.price
+      );
+
+    group.priceHigh =
+      Math.max(
+        group.priceHigh,
+        level.price
+      );
+
+    group.timeframes.add(
+      level.timeframe
+    );
+  }
+
+  return groups.map(group => {
+
+    const avgPrice =
+      group.members.reduce(
+        (sum, x) =>
+          sum + x.price,
+        0
+      ) /
+      group.members.length;
+
+    return {
+      side: group.side,
+      price: avgPrice,
+      priceLow: group.priceLow,
+      priceHigh: group.priceHigh,
+      members: group.members,
+      timeframes:
+        Array.from(
+          group.timeframes
+        )
+    };
+  });
+}
+
+
+/* =========================================================
+   STRUCTURAL SCORE
+========================================================= */
+
+function scoreStructuralLevel(
+  level,
+  side
+) {
+
+  let score = 0;
+
+  /*
+  Timeframe importance.
+  */
+
+  const timeframeScore =
+    level.timeframes.reduce(
+      (sum, tf) =>
+        sum +
+        (STRUCTURE[tf]?.weight || 0) *
+        10,
+      0
+    );
+
+  score +=
+    timeframeScore;
+
+  /*
+  Multi-timeframe agreement.
+  */
+
+  if (
+    level.timeframes.length >= 2
+  ) {
+
+    score +=
+      level.timeframes.length *
+      8;
+  }
+
+  if (
+    level.timeframes.length >= 3
+  ) {
+
+    score += 10;
+  }
+
+  /*
+  Number of structural touches.
+  */
+
+  score +=
+    Math.min(
+      level.members.length * 3,
+      15
+    );
+
+  /*
+  Reaction history.
+  */
+
+  let reactions = 0;
+
+  for (
+    const tf of level.timeframes
+  ) {
+
+    reactions +=
+      calculateReactionCount(
+        level.price,
+        candleHistory[tf] || []
+      );
+  }
+
+  score +=
+    Math.min(
+      reactions * 2,
+      15
+    );
+
+  /*
+  Equal highs/lows.
+  */
+
+  let equalCount = 0;
+
+  if (side === "BSL") {
+
+    for (
+      const eq of structure.equalHighs
+    ) {
+
+      if (
+        pctDistance(
+          eq.price,
+          level.price
+        ) <= LEVEL_ZONE_PCT
+      ) {
+
+        equalCount +=
+          eq.count;
+      }
+    }
+
+  } else {
+
+    for (
+      const eq of structure.equalLows
+    ) {
+
+      if (
+        pctDistance(
+          eq.price,
+          level.price
+        ) <= LEVEL_ZONE_PCT
+      ) {
+
+        equalCount +=
+          eq.count;
+      }
+    }
+  }
+
+  score +=
+    Math.min(
+      equalCount * 6,
+      18
+    );
+
+  /*
+  Futures resting liquidity confirmation.
+  */
+
+  const resting =
+    getRestingLiquidityNearLevel(
+      level.price,
+      side
+    );
+
+  const restingUsd =
+    resting.totalUsd;
+
+  if (
+    restingUsd >=
+    MIN_STRUCTURAL_RESTING_USD
+  ) {
+
+    score += 15;
+
+  } else if (
+    restingUsd >= 100000
+  ) {
+
+    score += 7;
+  }
+
+  return {
+    ...level,
+
+    score: Math.round(score),
+
+    reactions,
+
+    equalCount,
+
+    restingUsd,
+
+    restingLevels:
+      resting.levels,
+
+    source:
+      "spot_structure+futures_liquidity"
+  };
+}
+
+
+/* =========================================================
+   RESTING LIQUIDITY NEAR STRUCTURAL LEVEL
+========================================================= */
+
+function getRestingLiquidityNearLevel(
   price,
   side
 ) {
 
-  /*
-     SELL = Binance asks
-     BUY  = Binance bids
-  */
-
-  const map =
-    side === "sell"
+  const source =
+    side === "BSL"
       ? asks
       : bids;
 
-  let totalUsd =
-    0;
+  let totalUsd = 0;
 
-  let strongestUsd =
-    0;
-
-  let strongestPrice =
-    null;
-
-  let levelCount =
-    0;
+  const levels = [];
 
   for (
     const [
-      levelPrice,
-      levelQuantity
-    ] of map
+      priceString,
+      quantity
+    ] of source.entries()
   ) {
+
+    const p =
+      Number(priceString);
+
+    const q =
+      Number(quantity);
+
+    if (
+      !Number.isFinite(p) ||
+      !Number.isFinite(q)
+    ) {
+      continue;
+    }
 
     if (
       Math.abs(
-        levelPrice -
-        price
+        p - price
       ) >
       RESTING_LIQUIDITY_RADIUS_USD
     ) {
-
       continue;
-
     }
 
     const usd =
-      usdValue(
-        levelPrice,
-        levelQuantity
-      );
+      p * q;
 
     if (
       usd <
       RAW_BOOK_MIN_USD
     ) {
-
       continue;
-
     }
 
-    totalUsd +=
-      usd;
+    totalUsd += usd;
 
-    levelCount++;
-
-    if (
-      usd >
-      strongestUsd
-    ) {
-
-      strongestUsd =
-        usd;
-
-      strongestPrice =
-        levelPrice;
-
-    }
-
+    levels.push({
+      price: p,
+      quantity: q,
+      usd
+    });
   }
 
-  return {
+  levels.sort(
+    (a, b) =>
+      b.usd - a.usd
+  );
 
+  return {
     totalUsd,
-
-    strongestUsd,
-
-    strongestPrice,
-
-    levelCount
-
+    levels:
+      levels.slice(
+        0,
+        10
+      )
   };
-
 }
 
-/* ============================================================
-   BUILD MAJOR STRUCTURAL LEVELS
-   ============================================================ */
 
-function buildMajorLevels() {
+/* =========================================================
+   FUTURES ORDER BOOK
+========================================================= */
+
+function applyDepthUpdate(data) {
+
+  if (!data) return;
+
+  const U = Number(data.U);
+  const u = Number(data.u);
 
   if (
-    !currentPrice
+    !Number.isFinite(U) ||
+    !Number.isFinite(u)
   ) {
-
-    return {
-
-      bsl: [],
-
-      ssl: [],
-
-      resistance: [],
-
-      support: []
-
-    };
-
+    return;
   }
 
   /*
-     BSL must be ABOVE current price.
+  First update.
   */
 
-  const highCandidates =
-    swingHighs.filter(
-      level =>
-        level.price >
-        currentPrice
-    );
-
-  /*
-     SSL must be BELOW current price.
-  */
-
-  const lowCandidates =
-    swingLows.filter(
-      level =>
-        level.price <
-        currentPrice
-    );
-
-  const highGroups =
-    mergeLevels(
-      highCandidates
-    );
-
-  const lowGroups =
-    mergeLevels(
-      lowCandidates
-    );
-
-  const bsl =
-    [];
-
-  for (
-    const group of
-    highGroups
+  if (
+    !initialized
   ) {
 
-    const score =
-      scoreStructuralGroup(
-        group
-      );
+    pendingDepthEvents.push(data);
 
-    const resting =
-      restingLiquidityAround(
-        group.price,
-        "sell"
-      );
+    if (
+      pendingDepthEvents.length >
+      MAX_PENDING_EVENTS
+    ) {
 
-    let finalScore =
-      score.score;
+      pendingDepthEvents =
+        pendingDepthEvents.slice(
+          -MAX_PENDING_EVENTS
+        );
+    }
+
+    return;
+  }
+
+  /*
+  Gap detection.
+  */
+
+  const expected =
+    depthLastUpdateId + 1;
+
+  if (
+    U > expected
+  ) {
+
+    lastGapLocal =
+      depthLastUpdateId;
+
+    lastGapIncoming =
+      U;
+
+    gapDetected = true;
+
+    if (!gapRecovery) {
+
+      gapRecovery = true;
+
+      gapCount++;
+
+      console.log(
+        "[DEPTH] GAP DETECTED",
+        {
+          expected,
+          U,
+          u
+        }
+      );
+    }
 
     /*
-       Resting Binance asks
-       confirm the structural
-       BSL level.
+    Do not destroy the existing book.
+    Wait for snapshot recovery.
     */
 
-    if (
-      resting.totalUsd >=
-      MIN_STRUCTURAL_RESTING_USD
-    ) {
-
-      finalScore +=
-        25;
-
-    }
-
-    if (
-      finalScore <
-      MIN_MAJOR_LEVEL_SCORE
-    ) {
-
-      continue;
-
-    }
-
-    let classification =
-      "MAJOR SWING HIGH";
-
-    if (
-      score.equalCount >= 2
-    ) {
-
-      classification =
-        "EQUAL HIGH / BSL";
-
-    }
-
-    bsl.push({
-
-      type:
-        "BSL",
-
-      price:
-        round(
-          group.price,
-          2
-        ),
-
-      priceLow:
-        round(
-          group.price *
-            (
-              1 -
-              LEVEL_ZONE_PCT
-            ),
-          2
-        ),
-
-      priceHigh:
-        round(
-          group.price *
-            (
-              1 +
-              LEVEL_ZONE_PCT
-            ),
-          2
-        ),
-
-      distancePct:
-        round(
-          pctDistance(
-            group.price,
-            currentPrice
-          ),
-          3
-        ),
-
-      classification,
-
-      importance:
-        score.importance,
-
-      score:
-        finalScore,
-
-      intervals:
-        score.intervals,
-
-      timeframeCount:
-        score.timeframeCount,
-
-      equalCount:
-        score.equalCount,
-
-      reactionCount:
-        score.reactions,
-
-      restingSellUsd:
-        round(
-          resting.totalUsd,
-          2
-        ),
-
-      strongestRestingSellUsd:
-        round(
-          resting.strongestUsd,
-          2
-        ),
-
-      strongestRestingSellPrice:
-        resting.strongestPrice
-
-    });
-
+    return;
   }
 
-  const ssl =
-    [];
+  /*
+  Ignore stale update.
+  */
+
+  if (
+    u <= depthLastUpdateId
+  ) {
+    return;
+  }
+
+  /*
+  Apply bids.
+  */
 
   for (
-    const group of
-    lowGroups
+    const item of safeArray(data.b)
   ) {
 
-    const score =
-      scoreStructuralGroup(
-        group
-      );
+    const price =
+      Number(item[0]);
 
-    const resting =
-      restingLiquidityAround(
-        group.price,
-        "buy"
-      );
-
-    let finalScore =
-      score.score;
-
-    /*
-       Resting Binance bids
-       confirm the structural
-       SSL level.
-    */
+    const qty =
+      Number(item[1]);
 
     if (
-      resting.totalUsd >=
-      MIN_STRUCTURAL_RESTING_USD
+      !Number.isFinite(price) ||
+      !Number.isFinite(qty)
     ) {
-
-      finalScore +=
-        25;
-
-    }
-
-    if (
-      finalScore <
-      MIN_MAJOR_LEVEL_SCORE
-    ) {
-
       continue;
-
     }
 
-    let classification =
-      "MAJOR SWING LOW";
+    if (qty === 0) {
 
-    if (
-      score.equalCount >= 2
-    ) {
+      bids.delete(
+        item[0]
+      );
 
-      classification =
-        "EQUAL LOW / SSL";
+    } else {
 
+      bids.set(
+        item[0],
+        qty
+      );
     }
-
-    ssl.push({
-
-      type:
-        "SSL",
-
-      price:
-        round(
-          group.price,
-          2
-        ),
-
-      priceLow:
-        round(
-          group.price *
-            (
-              1 -
-              LEVEL_ZONE_PCT
-            ),
-          2
-        ),
-
-      priceHigh:
-        round(
-          group.price *
-            (
-              1 +
-              LEVEL_ZONE_PCT
-            ),
-          2
-        ),
-
-      distancePct:
-        round(
-          pctDistance(
-            group.price,
-            currentPrice
-          ),
-          3
-        ),
-
-      classification,
-
-      importance:
-        score.importance,
-
-      score:
-        finalScore,
-
-      intervals:
-        score.intervals,
-
-      timeframeCount:
-        score.timeframeCount,
-
-      equalCount:
-        score.equalCount,
-
-      reactionCount:
-        score.reactions,
-
-      restingBuyUsd:
-        round(
-          resting.totalUsd,
-          2
-        ),
-
-      strongestRestingBuyUsd:
-        round(
-          resting.strongestUsd,
-          2
-        ),
-
-      strongestRestingBuyPrice:
-        resting.strongestPrice
-
-    });
-
   }
 
-  const importantBSL =
-    bsl
-      .sort(
-        (a, b) =>
-          b.score -
-          a.score
-      )
-      .slice(
-        0,
-        MAX_MAJOR_LEVELS
-      );
-
-  const importantSSL =
-    ssl
-      .sort(
-        (a, b) =>
-          b.score -
-          a.score
-      )
-      .slice(
-        0,
-        MAX_MAJOR_LEVELS
-      );
-
   /*
-     Resistance:
-     nearest BSL levels first.
+  Apply asks.
   */
 
-  const resistance =
-    [...importantBSL]
-      .sort(
-        (a, b) =>
-          a.price -
-          b.price
+  for (
+    const item of safeArray(data.a)
+  ) {
+
+    const price =
+      Number(item[0]);
+
+    const qty =
+      Number(item[1]);
+
+    if (
+      !Number.isFinite(price) ||
+      !Number.isFinite(qty)
+    ) {
+      continue;
+    }
+
+    if (qty === 0) {
+
+      asks.delete(
+        item[0]
       );
 
-  /*
-     Support:
-     nearest SSL levels first.
-  */
+    } else {
 
-  const support =
-    [...importantSSL]
-      .sort(
-        (a, b) =>
-          b.price -
-          a.price
+      asks.set(
+        item[0],
+        qty
       );
+    }
+  }
 
-  return {
+  depthLastUpdateId =
+    u;
 
-    bsl:
-      importantBSL,
-
-    ssl:
-      importantSSL,
-
-    resistance,
-
-    support
-
-  };
-
+  updateCurrentPrice();
 }
 
-/* ============================================================
-   RAW BINANCE ORDER BOOK
-   ============================================================ */
 
-function buildRawBookLiquidity() {
+/* =========================================================
+   CURRENT PRICE
+========================================================= */
 
-  if (
-    !currentPrice
-  ) {
+function updateCurrentPrice() {
 
-    return {
-
-      largeBids: [],
-
-      largeAsks: []
-
-    };
-
-  }
-
-  const lower =
-    currentPrice *
-    0.95;
-
-  const upper =
-    currentPrice *
-    1.05;
-
-  const largeBids =
-    [];
-
-  const largeAsks =
-    [];
+  let bestBid = null;
+  let bestAsk = null;
 
   for (
     const [
-      price,
-      quantity
-    ] of bids
+      priceString
+    ] of bids.entries()
   ) {
 
-    if (
-      price <
-        lower ||
-      price >
-        currentPrice
-    ) {
-
-      continue;
-
-    }
-
-    const usd =
-      usdValue(
-        price,
-        quantity
-      );
+    const p =
+      Number(priceString);
 
     if (
-      usd <
-      RAW_BOOK_MIN_USD
+      bestBid === null ||
+      p > bestBid
     ) {
 
-      continue;
-
+      bestBid = p;
     }
-
-    largeBids.push({
-
-      price:
-        round(
-          price,
-          2
-        ),
-
-      quantity:
-        round(
-          quantity,
-          6
-        ),
-
-      usd:
-        round(
-          usd,
-          2
-        )
-
-    });
-
   }
 
   for (
     const [
-      price,
-      quantity
-    ] of asks
+      priceString
+    ] of asks.entries()
   ) {
 
+    const p =
+      Number(priceString);
+
     if (
-      price >
-        upper ||
-      price <
-        currentPrice
+      bestAsk === null ||
+      p < bestAsk
     ) {
 
-      continue;
-
+      bestAsk = p;
     }
+  }
 
-    const usd =
-      usdValue(
-        price,
-        quantity
+  if (
+    bestBid !== null &&
+    bestAsk !== null
+  ) {
+
+    currentPrice =
+      (bestBid + bestAsk) / 2;
+  }
+}
+
+
+/* =========================================================
+   INSTALL SNAPSHOT
+========================================================= */
+
+function installSnapshot(
+  snapshot
+) {
+
+  if (!snapshot) {
+    return false;
+  }
+
+  const lastUpdateId =
+    Number(
+      snapshot.lastUpdateId
+    );
+
+  if (
+    !Number.isFinite(lastUpdateId)
+  ) {
+
+    return false;
+  }
+
+  bids.clear();
+  asks.clear();
+
+  for (
+    const item of safeArray(
+      snapshot.bids
+    )
+  ) {
+
+    const price =
+      Number(item[0]);
+
+    const qty =
+      Number(item[1]);
+
+    if (
+      Number.isFinite(price) &&
+      Number.isFinite(qty) &&
+      qty > 0
+    ) {
+
+      bids.set(
+        item[0],
+        qty
+      );
+    }
+  }
+
+  for (
+    const item of safeArray(
+      snapshot.asks
+    )
+  ) {
+
+    const price =
+      Number(item[0]);
+
+    const qty =
+      Number(item[1]);
+
+    if (
+      Number.isFinite(price) &&
+      Number.isFinite(qty) &&
+      qty > 0
+    ) {
+
+      asks.set(
+        item[0],
+        qty
+      );
+    }
+  }
+
+  depthLastUpdateId =
+    lastUpdateId;
+
+  initialized = true;
+
+  snapshotId =
+    lastUpdateId;
+
+  /*
+  Try to bridge buffered events.
+  */
+
+  const buffered =
+    pendingDepthEvents
+      .slice()
+      .sort(
+        (a, b) =>
+          Number(a.U) -
+          Number(b.U)
+      );
+
+  pendingDepthEvents = [];
+
+  /*
+  Find first event that bridges
+  snapshot + 1.
+  */
+
+  const target =
+    lastUpdateId + 1;
+
+  let bridgeIndex = -1;
+
+  for (
+    let i = 0;
+    i < buffered.length;
+    i++
+  ) {
+
+    const U =
+      Number(
+        buffered[i].U
+      );
+
+    const u =
+      Number(
+        buffered[i].u
       );
 
     if (
-      usd <
+      U <= target &&
+      u >= target
+    ) {
+
+      bridgeIndex = i;
+
+      break;
+    }
+  }
+
+  if (
+    bridgeIndex >= 0
+  ) {
+
+    for (
+      let i = bridgeIndex;
+      i < buffered.length;
+      i++
+    ) {
+
+      applyDepthUpdate(
+        buffered[i]
+      );
+    }
+
+    gapRecovery = false;
+    gapDetected = false;
+
+  } else {
+
+    /*
+    No bridge.
+
+    Keep snapshot alive but mark recovery.
+    */
+
+    gapRecovery = true;
+    gapDetected = true;
+  }
+
+  updateCurrentPrice();
+
+  return true;
+}
+
+
+/* =========================================================
+   SNAPSHOT WEBSOCKET
+========================================================= */
+
+function requestSnapshot() {
+
+  const nowMs =
+    Date.now();
+
+  if (
+    snapshotPending
+  ) {
+
+    return;
+  }
+
+  if (
+    nowMs -
+      lastSnapshotRequest <
+    SNAPSHOT_MIN_INTERVAL_MS
+  ) {
+
+    return;
+  }
+
+  lastSnapshotRequest =
+    nowMs;
+
+  snapshotPending = true;
+
+  snapshotRequests++;
+
+  console.log(
+    "[SNAPSHOT] Requesting Futures depth snapshot..."
+  );
+
+  try {
+
+    if (snapshotWs) {
+
+      try {
+        snapshotWs.close();
+      } catch (_) {}
+    }
+
+    snapshotWs =
+      new WebSocket(
+        "wss://ws-fapi.binance.com/ws-fapi/v1"
+      );
+
+    snapshotWs.on(
+      "open",
+      () => {
+
+        snapshotConnected =
+          true;
+
+        const requestId =
+          String(
+            Date.now()
+          );
+
+        snapshotWs.send(
+          JSON.stringify({
+            id: requestId,
+            method: "depth",
+            params: {
+              symbol: SYMBOL,
+              limit: 1000
+            }
+          })
+        );
+      }
+    );
+
+    snapshotWs.on(
+      "message",
+      raw => {
+
+        try {
+
+          const response =
+            JSON.parse(
+              raw.toString()
+            );
+
+          if (
+            response.status &&
+            response.status !== 200
+          ) {
+
+            snapshotLastStatus =
+              response.status;
+
+            snapshotLastError =
+              JSON.stringify(
+                response.error ||
+                response
+              );
+
+            if (
+              response.status === 429
+            ) {
+
+              snapshot429s++;
+            }
+
+            snapshotPending =
+              false;
+
+            return;
+          }
+
+          if (
+            response.result &&
+            response.result.lastUpdateId
+          ) {
+
+            lastSnapshotResponse =
+              now();
+
+            snapshotLastStatus =
+              200;
+
+            snapshotLastError =
+              null;
+
+            installSnapshot(
+              response.result
+            );
+
+            snapshotPending =
+              false;
+
+            console.log(
+              "[SNAPSHOT] Installed",
+              response.result.lastUpdateId,
+              "bids:",
+              response.result.bids?.length,
+              "asks:",
+              response.result.asks?.length
+            );
+          }
+
+        } catch (err) {
+
+          snapshotLastError =
+            err.message;
+
+          snapshotPending =
+            false;
+        }
+      }
+    );
+
+    snapshotWs.on(
+      "error",
+      err => {
+
+        snapshotLastError =
+          err.message;
+
+        snapshotPending =
+          false;
+
+        console.log(
+          "[SNAPSHOT ERROR]",
+          err.message
+        );
+      }
+    );
+
+    snapshotWs.on(
+      "close",
+      () => {
+
+        snapshotConnected =
+          false;
+      }
+    );
+
+  } catch (err) {
+
+    snapshotLastError =
+      err.message;
+
+    snapshotPending =
+      false;
+  }
+}
+
+
+/* =========================================================
+   DEPTH CONNECTION
+========================================================= */
+
+function connectDepth() {
+
+  if (futuresDepthWs) {
+
+    try {
+      futuresDepthWs.close();
+    } catch (_) {}
+  }
+
+  console.log(
+    "[DEPTH] Connecting Binance Futures..."
+  );
+
+  futuresDepthWs =
+    new WebSocket(
+      FUTURES_DEPTH_STREAM
+    );
+
+  futuresDepthWs.on(
+    "open",
+    () => {
+
+      depthConnected =
+        true;
+
+      console.log(
+        "[DEPTH] Connected"
+      );
+
+      /*
+      Initial snapshot.
+      */
+
+      requestSnapshot();
+    }
+  );
+
+  futuresDepthWs.on(
+    "message",
+    raw => {
+
+      try {
+
+        const data =
+          JSON.parse(
+            raw.toString()
+          );
+
+        /*
+        Futures depth event.
+        */
+
+        if (
+          data.e === "depthUpdate"
+        ) {
+
+          applyDepthUpdate(
+            data
+          );
+        }
+
+      } catch (err) {
+
+        console.log(
+          "[DEPTH MESSAGE ERROR]",
+          err.message
+        );
+      }
+    }
+  );
+
+  futuresDepthWs.on(
+    "error",
+    err => {
+
+      console.log(
+        "[DEPTH ERROR]",
+        err.message
+      );
+    }
+  );
+
+  futuresDepthWs.on(
+    "close",
+    () => {
+
+      depthConnected =
+        false;
+
+      console.log(
+        "[DEPTH] Disconnected"
+      );
+
+      if (
+        depthReconnectTimer
+      ) {
+
+        clearTimeout(
+          depthReconnectTimer
+        );
+      }
+
+      depthReconnectTimer =
+        setTimeout(
+          connectDepth,
+          5000
+        );
+    }
+  );
+}
+
+
+/* =========================================================
+   RESYNC LOOP
+========================================================= */
+
+setInterval(
+  () => {
+
+    /*
+    If there was a genuine gap,
+    request a new snapshot,
+    respecting the 65-second cooldown.
+    */
+
+    if (
+      gapRecovery
+    ) {
+
+      requestSnapshot();
+    }
+
+  },
+  5000
+);
+
+
+/* =========================================================
+   PERIODIC STRUCTURE REFRESH
+========================================================= */
+
+setInterval(
+  () => {
+
+    rebuildStructure();
+
+  },
+  30000
+);
+
+
+/* =========================================================
+   RAW ORDER BOOK SUMMARY
+========================================================= */
+
+function getRawRestingLiquidity() {
+
+  const largeBids = [];
+  const largeAsks = [];
+
+  for (
+    const [
+      priceString,
+      quantity
+    ] of bids.entries()
+  ) {
+
+    const price =
+      Number(priceString);
+
+    const qty =
+      Number(quantity);
+
+    const usd =
+      price * qty;
+
+    if (
+      usd >=
       RAW_BOOK_MIN_USD
     ) {
 
-      continue;
-
+      largeBids.push({
+        price,
+        quantity: qty,
+        usd
+      });
     }
+  }
 
-    largeAsks.push({
+  for (
+    const [
+      priceString,
+      quantity
+    ] of asks.entries()
+  ) {
 
-      price:
-        round(
-          price,
-          2
-        ),
+    const price =
+      Number(priceString);
 
-      quantity:
-        round(
-          quantity,
-          6
-        ),
+    const qty =
+      Number(quantity);
 
-      usd:
-        round(
-          usd,
-          2
-        )
+    const usd =
+      price * qty;
 
-    });
+    if (
+      usd >=
+      RAW_BOOK_MIN_USD
+    ) {
 
+      largeAsks.push({
+        price,
+        quantity: qty,
+        usd
+      });
+    }
   }
 
   largeBids.sort(
     (a, b) =>
-      b.usd -
-      a.usd
+      b.usd - a.usd
   );
 
   largeAsks.sort(
     (a, b) =>
-      b.usd -
-      a.usd
+      b.usd - a.usd
   );
 
   return {
@@ -3694,59 +2274,76 @@ function buildRawBookLiquidity() {
     largeBids:
       largeBids.slice(
         0,
-        50
+        25
       ),
 
     largeAsks:
       largeAsks.slice(
         0,
-        50
+        25
       )
-
   };
-
 }
 
-/* ============================================================
-   COMPLETE LIQUIDITY MAP
-   ============================================================ */
 
-function buildLiquidityMap() {
+/* =========================================================
+   MAJOR LIQUIDITY MAP
+========================================================= */
 
-  const mid =
-    getBookMid();
+function getLiquidityMap() {
 
-  if (mid) {
-
-    currentPrice =
-      mid;
-
-  }
-
-  const structure =
-    buildMajorLevels();
-
-  const raw =
-    buildRawBookLiquidity();
-
-  const nearestBSL =
-    [...structure.bsl]
+  const bsl =
+    structure.majorBSL
+      .slice()
       .sort(
         (a, b) =>
-          a.price -
-          b.price
+          a.price - b.price
+      );
+
+  const ssl =
+    structure.majorSSL
+      .slice()
+      .sort(
+        (a, b) =>
+          b.price - a.price
+      );
+
+  /*
+  Nearest major resistance above price.
+  */
+
+  const resistance =
+    bsl
+      .filter(
+        x =>
+          !currentPrice ||
+          x.price >
+          currentPrice
+      )
+      .sort(
+        (a, b) =>
+          a.price - b.price
       )
       .slice(
         0,
         3
       );
 
-  const nearestSSL =
-    [...structure.ssl]
+  /*
+  Nearest major support below price.
+  */
+
+  const support =
+    ssl
+      .filter(
+        x =>
+          !currentPrice ||
+          x.price <
+          currentPrice
+      )
       .sort(
         (a, b) =>
-          b.price -
-          a.price
+          b.price - a.price
       )
       .slice(
         0,
@@ -3755,202 +2352,101 @@ function buildLiquidityMap() {
 
   return {
 
-    symbol:
-      SYMBOL,
+    buySideLiquidity:
+      bsl,
 
-    currentPrice:
-      currentPrice
-        ? round(
-            currentPrice,
-            2
-          )
-        : null,
+    sellSideLiquidity:
+      ssl,
 
-    marketStructure: {
+    majorResistance:
+      resistance,
 
-      buySideLiquidity:
-        structure.bsl,
+    majorSupport:
+      support,
 
-      sellSideLiquidity:
-        structure.ssl,
+    nearestBSL:
+      resistance[0]
+        ? [resistance[0]]
+        : [],
 
-      majorResistance:
-        structure.resistance,
-
-      majorSupport:
-        structure.support,
-
-      nearestBSL,
-
-      nearestSSL
-
-    },
-
-    rawRestingLiquidity: {
-
-      largeBids:
-        raw.largeBids,
-
-      largeAsks:
-        raw.largeAsks
-
-    },
-
-    settings: {
-
-      structureTimeframes:
-        Object.keys(
-          STRUCTURE
-        ),
-
-      historicalStructureSource:
-        candleLastSource ||
-        "none",
-
-      minMajorLevelScore:
-        MIN_MAJOR_LEVEL_SCORE,
-
-      mergeLevelDistanceUsd:
-        MERGE_LEVEL_DISTANCE_USD,
-
-      restingLiquidityRadiusUsd:
-        RESTING_LIQUIDITY_RADIUS_USD,
-
-      minStructuralRestingUsd:
-        MIN_STRUCTURAL_RESTING_USD
-
-    },
-
-    structureStats: {
-
-      candles15m:
-        candles["15m"].length,
-
-      candles1h:
-        candles["1h"].length,
-
-      candles4h:
-        candles["4h"].length,
-
-      candles1d:
-        candles["1d"].length,
-
-      swingHighs:
-        swingHighs.length,
-
-      swingLows:
-        swingLows.length,
-
-      updatedAt:
-        lastStructureUpdate
-
-    },
-
-    candleHistory: {
-
-      requests:
-        candleRequests,
-
-      successful:
-        candleSuccess,
-
-      errors:
-        candleErrors,
-
-      lastStatus:
-        candleLastStatus,
-
-      lastSource:
-        candleLastSource,
-
-      lastError:
-        candleLastError,
-
-      updatedAt:
-        candleUpdatedAt
-
-    },
-
-    book: {
-
-      initialized,
-
-      bidLevels:
-        bids.size,
-
-      askLevels:
-        asks.size,
-
-      lastUpdateId
-
-    },
-
-    sync: {
-
-      status:
-        initialized
-          ? (
-              gapRecovery
-                ? "gap_recovery"
-                : "live"
-            )
-          : "syncing",
-
-      gapRecovery,
-
-      gapDetected,
-
-      gapCount,
-
-      lastGapLocal,
-
-      lastGapIncoming,
-
-      pendingEvents:
-        pendingDepthEvents.length,
-
-      snapshotPending,
-
-      snapshotId:
-        lastSnapshotId
-
-    },
-
-    connections: {
-
-      depthWebSocket:
-        Boolean(
-          depthWs &&
-          depthWs.readyState ===
-            WebSocket.OPEN
-        ),
-
-      snapshotWebSocket:
-        Boolean(
-          snapshotWs &&
-          snapshotWs.readyState ===
-            WebSocket.OPEN
-        ),
-
-      klineWebSocket:
-        Boolean(
-          klineWs &&
-          klineWs.readyState ===
-            WebSocket.OPEN
-        )
-
-    },
-
-    updatedAt:
-      nowIso()
-
+    nearestSSL:
+      support[0]
+        ? [support[0]]
+        : []
   };
-
 }
 
-/* ============================================================
+
+/* =========================================================
+   FORMAT LEVEL
+========================================================= */
+
+function formatLevel(level) {
+
+  return {
+
+    side:
+      level.side,
+
+    price:
+      Number(
+        level.price.toFixed(2)
+      ),
+
+    priceLow:
+      Number(
+        level.priceLow.toFixed(2)
+      ),
+
+    priceHigh:
+      Number(
+        level.priceHigh.toFixed(2)
+      ),
+
+    score:
+      level.score,
+
+    timeframes:
+      level.timeframes,
+
+    equalCount:
+      level.equalCount,
+
+    reactions:
+      level.reactions,
+
+    restingUsd:
+      Number(
+        level.restingUsd.toFixed(2)
+      ),
+
+    restingLevels:
+      level.restingLevels,
+
+    distancePct:
+      currentPrice
+        ? Number(
+            (
+              (
+                level.price -
+                currentPrice
+              ) /
+              currentPrice
+            ) *
+            100
+          ).toFixed(3)
+        )
+        : null,
+
+    source:
+      level.source
+  };
+}
+
+
+/* =========================================================
    HEALTH
-   ============================================================ */
+========================================================= */
 
 app.get(
   "/health",
@@ -3958,220 +2454,72 @@ app.get(
 
     res.json({
 
-      ok:
-        true,
-
-      symbol:
-        SYMBOL,
-
-      status:
-        initialized
-          ? (
-              gapRecovery
-                ? "gap_recovery"
-                : "live"
-            )
-          : "syncing",
-
-      initialized,
-
-      currentPrice,
-
-      bidLevels:
-        bids.size,
-
-      askLevels:
-        asks.size,
-
-      depthConnected:
-        Boolean(
-          depthWs &&
-          depthWs.readyState ===
-            WebSocket.OPEN
-        ),
-
-      snapshotConnected:
-        Boolean(
-          snapshotWs &&
-          snapshotWs.readyState ===
-            WebSocket.OPEN
-        ),
-
-      klineConnected:
-        Boolean(
-          klineWs &&
-          klineWs.readyState ===
-            WebSocket.OPEN
-        ),
-
-      pendingEvents:
-        pendingDepthEvents.length,
-
-      lastUpdateId,
-
-      snapshotRequests,
-
-      snapshot429s,
-
-      bridgeAttempts,
-
-      bridgeFound,
-
-      gapCount,
-
-      lastGapLocal,
-
-      lastGapIncoming,
-
-      lastSnapshotRequest,
-
-      lastSnapshotResponse,
-
-      lastSnapshotError,
-
-      lastSnapshotId,
-
-      candles: {
-
-        "15m":
-          candles["15m"].length,
-
-        "1h":
-          candles["1h"].length,
-
-        "4h":
-          candles["4h"].length,
-
-        "1d":
-          candles["1d"].length
-
-      },
-
-      candleHistory: {
-
-        requests:
-          candleRequests,
-
-        successful:
-          candleSuccess,
-
-        errors:
-          candleErrors,
-
-        source:
-          candleLastSource,
-
-        lastStatus:
-          candleLastStatus,
-
-        lastError:
-          candleLastError,
-
-        updatedAt:
-          candleUpdatedAt
-
-      },
-
-      structure: {
-
-        swingHighs:
-          swingHighs.length,
-
-        swingLows:
-          swingLows.length,
-
-        updatedAt:
-          lastStructureUpdate
-
-      },
-
-      updatedAt:
-        nowIso()
-
-    });
-
-  }
-);
-
-/* ============================================================
-   DIAGNOSTIC
-   ============================================================ */
-
-app.get(
-  "/diagnostic",
-  (req, res) => {
-
-    res.json({
+      ok: true,
 
       service:
-        "Binance Futures Major Liquidity Relay",
+        "Binance BTCUSDT Major Liquidity Relay",
 
       symbol:
         SYMBOL,
 
       historicalStructureSource:
-        "Bybit Linear Futures",
+        "Binance Spot",
 
-      bybitRest:
-        BYBIT_REST,
+      liveStructureSource:
+        "Binance Futures WebSocket",
 
-      bybitKlines:
-        `${BYBIT_REST}/v5/market/kline`,
+      liquiditySource:
+        "Binance Futures Order Book",
 
-      binanceFuturesRest:
-        BINANCE_FUTURES_REST,
-
-      binanceFuturesKlines:
-        `${BINANCE_FUTURES_REST}/fapi/v1/klines`,
+      currentPrice,
 
       candleHistory: {
-
         "15m":
-          candles["15m"].length,
+          candleHistory["15m"].length,
 
         "1h":
-          candles["1h"].length,
+          candleHistory["1h"].length,
 
         "4h":
-          candles["4h"].length,
+          candleHistory["4h"].length,
 
         "1d":
-          candles["1d"].length
-
+          candleHistory["1d"].length
       },
 
-      candleRequests:
-        candleRequests,
+      candleSource,
 
-      candleSuccess:
-        candleSuccess,
+      candleRequests,
 
-      candleErrors:
-        candleErrors,
+      candleSuccess,
 
-      candleLastSource:
-        candleLastSource,
+      candleErrors,
 
-      candleLastStatus:
-        candleLastStatus,
+      candleLastStatus,
 
-      candleLastError:
-        candleLastError,
-
-      candleUpdatedAt:
-        candleUpdatedAt,
+      candleLastError,
 
       structure: {
-
         swingHighs:
-          swingHighs.length,
+          structure.swingHighs.length,
 
         swingLows:
-          swingLows.length,
+          structure.swingLows.length,
+
+        equalHighs:
+          structure.equalHighs.length,
+
+        equalLows:
+          structure.equalLows.length,
+
+        majorBSL:
+          structure.majorBSL.length,
+
+        majorSSL:
+          structure.majorSSL.length,
 
         updatedAt:
-          lastStructureUpdate
-
+          structure.updatedAt
       },
 
       orderBook: {
@@ -4182,164 +2530,312 @@ app.get(
           bids.size,
 
         asks:
-          asks.size
+          asks.size,
 
+        lastUpdateId:
+          depthLastUpdateId
       },
 
       connections: {
 
         depth:
-          Boolean(
-            depthWs &&
-            depthWs.readyState ===
-              WebSocket.OPEN
-          ),
+          depthConnected,
 
         snapshot:
-          Boolean(
-            snapshotWs &&
-            snapshotWs.readyState ===
-              WebSocket.OPEN
-          ),
+          snapshotConnected,
 
         klines:
-          Boolean(
-            klineWs &&
-            klineWs.readyState ===
-              WebSocket.OPEN
+          !!(
+            futuresKlineWs &&
+            futuresKlineWs.readyState ===
+            WebSocket.OPEN
           )
+      },
 
+      sync: {
+
+        gapRecovery,
+
+        gapDetected,
+
+        gapCount,
+
+        lastGapLocal,
+
+        lastGapIncoming,
+
+        pendingEvents:
+          pendingDepthEvents.length,
+
+        snapshotPending,
+
+        snapshotId,
+
+        snapshotRequests,
+
+        snapshot429s,
+
+        lastSnapshotRequest:
+          lastSnapshotRequest
+            ? new Date(
+                lastSnapshotRequest
+              ).toISOString()
+            : null,
+
+        lastSnapshotResponse,
+
+        snapshotLastStatus,
+
+        snapshotLastError
       },
 
       updatedAt:
-        nowIso()
-
+        now()
     });
-
   }
 );
 
-/* ============================================================
+
+/* =========================================================
+   STRUCTURE ENDPOINT
+========================================================= */
+
+app.get(
+  "/structure",
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice,
+
+      historicalSource:
+        "Binance Spot",
+
+      liveSource:
+        "Binance Futures",
+
+      swingHighs:
+        structure.swingHighs,
+
+      swingLows:
+        structure.swingLows,
+
+      equalHighs:
+        structure.equalHighs,
+
+      equalLows:
+        structure.equalLows,
+
+      majorBSL:
+        structure.majorBSL.map(
+          formatLevel
+        ),
+
+      majorSSL:
+        structure.majorSSL.map(
+          formatLevel
+        ),
+
+      majorResistance:
+        structure.majorResistance.map(
+          formatLevel
+        ),
+
+      majorSupport:
+        structure.majorSupport.map(
+          formatLevel
+        ),
+
+      updatedAt:
+        structure.updatedAt
+    });
+  }
+);
+
+
+/* =========================================================
    LIQUIDITY ENDPOINT
-   ============================================================ */
+========================================================= */
 
 app.get(
   "/liquidity",
   (req, res) => {
 
-    res.json(
-      buildLiquidityMap()
-    );
+    const map =
+      getLiquidityMap();
 
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice,
+
+      marketStructure: {
+
+        buySideLiquidity:
+          map.buySideLiquidity
+            .map(formatLevel),
+
+        sellSideLiquidity:
+          map.sellSideLiquidity
+            .map(formatLevel),
+
+        majorResistance:
+          map.majorResistance
+            .map(formatLevel),
+
+        majorSupport:
+          map.majorSupport
+            .map(formatLevel),
+
+        nearestBSL:
+          map.nearestBSL
+            .map(formatLevel),
+
+        nearestSSL:
+          map.nearestSSL
+            .map(formatLevel)
+      },
+
+      rawRestingLiquidity:
+        getRawRestingLiquidity(),
+
+      structureStats: {
+
+        candleSource,
+
+        candleHistory: {
+          "15m":
+            candleHistory["15m"].length,
+
+          "1h":
+            candleHistory["1h"].length,
+
+          "4h":
+            candleHistory["4h"].length,
+
+          "1d":
+            candleHistory["1d"].length
+        },
+
+        swingHighs:
+          structure.swingHighs.length,
+
+        swingLows:
+          structure.swingLows.length,
+
+        equalHighs:
+          structure.equalHighs.length,
+
+        equalLows:
+          structure.equalLows.length
+      },
+
+      updatedAt:
+        now()
+    });
   }
 );
 
-/* ============================================================
-   RAW BOOK ENDPOINT
-   ============================================================ */
+
+/* =========================================================
+   BOOK ENDPOINT
+========================================================= */
 
 app.get(
   "/book",
   (req, res) => {
 
-    const bidLevels =
-      [...bids.entries()]
-        .sort(
-          (a, b) =>
-            b[0] -
-            a[0]
-        )
-        .slice(
-          0,
-          100
-        );
+    const bidArray =
+      Array.from(
+        bids.entries()
+      )
+      .map(
+        ([price, quantity]) => ({
+          price:
+            Number(price),
 
-    const askLevels =
-      [...asks.entries()]
-        .sort(
-          (a, b) =>
-            a[0] -
-            b[0]
-        )
-        .slice(
-          0,
-          100
-        );
+          quantity:
+            Number(quantity),
+
+          usd:
+            Number(price) *
+            Number(quantity)
+        })
+      )
+      .sort(
+        (a, b) =>
+          b.price - a.price
+      )
+      .slice(
+        0,
+        1000
+      );
+
+    const askArray =
+      Array.from(
+        asks.entries()
+      )
+      .map(
+        ([price, quantity]) => ({
+          price:
+            Number(price),
+
+          quantity:
+            Number(quantity),
+
+          usd:
+            Number(price) *
+            Number(quantity)
+        })
+      )
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      )
+      .slice(
+        0,
+        1000
+      );
 
     res.json({
+
+      ok: true,
 
       symbol:
         SYMBOL,
 
-      currentPrice:
-        currentPrice
-          ? round(
-              currentPrice,
-              2
-            )
-          : null,
-
-      bids:
-        bidLevels.map(
-          ([
-            price,
-            quantity
-          ]) => ({
-
-            price,
-
-            quantity,
-
-            usd:
-              round(
-                usdValue(
-                  price,
-                  quantity
-                ),
-                2
-              )
-
-          })
-        ),
-
-      asks:
-        askLevels.map(
-          ([
-            price,
-            quantity
-          ]) => ({
-
-            price,
-
-            quantity,
-
-            usd:
-              round(
-                usdValue(
-                  price,
-                  quantity
-                ),
-                2
-              )
-
-          })
-        ),
+      currentPrice,
 
       initialized,
 
-      lastUpdateId,
+      lastUpdateId:
+        depthLastUpdateId,
+
+      bids:
+        bidArray,
+
+      asks:
+        askArray,
 
       updatedAt:
-        nowIso()
-
+        now()
     });
-
   }
 );
 
-/* ============================================================
+
+/* =========================================================
    ROOT
-   ============================================================ */
+========================================================= */
 
 app.get(
   "/",
@@ -4347,141 +2843,76 @@ app.get(
 
     res.json({
 
-      ok:
-        true,
+      ok: true,
 
       service:
-        "Binance Futures Major Liquidity Relay",
-
-      symbol:
-        SYMBOL,
+        "Binance BTCUSDT Major Liquidity Relay",
 
       endpoints: [
 
         "/health",
 
-        "/diagnostic",
+        "/structure",
 
         "/liquidity",
 
         "/book"
-
       ],
 
       architecture: {
 
-        liveOrderBook:
+        historical:
+          "Binance Spot",
+
+        liveStructure:
           "Binance Futures WebSocket",
-
-        liveCandles:
-          "Binance Futures WebSocket",
-
-        historicalCandles:
-          "Bybit Linear Futures REST",
-
-        structure:
-          "15m / 1h / 4h / 1D",
 
         liquidity:
           "Binance Futures Order Book"
-
       },
 
-      primary:
-        "Market Structure BSL/SSL",
+      symbol:
+        SYMBOL,
 
-      secondary:
-        "Binance Resting Order Book Liquidity"
-
+      updatedAt:
+        now()
     });
-
   }
 );
 
-/* ============================================================
-   SERVER START
-   ============================================================ */
+
+/* =========================================================
+   START
+========================================================= */
 
 app.listen(
   PORT,
-  () => {
+  async () => {
 
     console.log(
-      "================================================"
-    );
-
-    console.log(
-      "BINANCE FUTURES MAJOR LIQUIDITY RELAY"
+      `Server listening on port ${PORT}`
     );
 
     console.log(
-      "================================================"
+      `[START] Symbol: ${SYMBOL}`
     );
 
     console.log(
-      `Symbol: ${SYMBOL}`
+      "[START] Loading historical Spot candles..."
     );
+
+    await loadAllHistoricalCandles();
 
     console.log(
-      `Port: ${PORT}`
+      "[START] Connecting Futures depth..."
     );
+
+    connectDepth();
 
     console.log(
-      "Live order book: Binance Futures"
+      "[START] Connecting Futures klines..."
     );
 
-    console.log(
-      "Live candles: Binance Futures"
-    );
-
-    console.log(
-      "Historical candles: Bybit Linear Futures"
-    );
-
-    console.log(
-      "Structure: 15m / 1h / 4h / 1D"
-    );
-
-    console.log(
-      "BSL / SSL: Structural"
-    );
-
-    console.log(
-      "Resting liquidity: Binance only"
-    );
-
-    console.log(
-      "================================================"
-    );
-
-    setTimeout(
-      () => {
-
-        loadAllHistoricalKlines()
-          .catch(
-            error => {
-
-              console.error(
-                "Historical structure loader:",
-                error.message
-              );
-
-            }
-          );
-
-      },
-      2000
-    );
-
+    connectFuturesKlines();
   }
 );
-
-/* ============================================================
-   START CONNECTIONS
-   ============================================================ */
-
-connectDepthWebSocket();
-
-connectSnapshotWebSocket();
-
-connectKlineWebSocket();
