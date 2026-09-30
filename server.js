@@ -31,19 +31,32 @@ const WS_API =
 const RANGE_PCT = 0.05;
 
 /*
-   We deliberately do NOT use the old "dense cluster = major
-   liquidity" logic as the primary signal anymore.
+   Keep the depth event buffer bounded.
 */
+const MAX_PENDING_EVENTS = 2500;
 
-const RAW_BOOK_MIN_USD = 50000;
-
-const MAX_PENDING_EVENTS = 2000;
-
+/*
+   Binance snapshot protection.
+   We do NOT repeatedly request snapshots.
+*/
 const SNAPSHOT_MIN_INTERVAL_MS = 65000;
 const SNAPSHOT_TIMEOUT_MS = 15000;
 
 /* ============================================================
-   STRUCTURE SETTINGS
+   RAW ORDER BOOK SETTINGS
+   ============================================================ */
+
+const RAW_BOOK_MIN_USD = 50000;
+
+/*
+   We use the order book only to confirm structural levels.
+*/
+const RESTING_LIQUIDITY_RADIUS_USD = 35;
+
+const MIN_STRUCTURAL_RESTING_USD = 250000;
+
+/* ============================================================
+   MARKET STRUCTURE SETTINGS
    ============================================================ */
 
 const STRUCTURE = {
@@ -85,44 +98,30 @@ const STRUCTURE = {
 };
 
 /*
-   A structural level is allowed a price zone around the exact
-   swing. This prevents tiny price differences from producing
-   dozens of separate levels.
+   Structural levels within this distance are merged.
+*/
+const MERGE_LEVEL_DISTANCE_USD = 35;
+
+/*
+   Price zone around a structural level.
 */
 const LEVEL_ZONE_PCT = 0.0015;
 
 /*
-   Price must come reasonably close to a level for a reaction/
-   touch to count.
+   Price must come near a level to count as a touch.
 */
 const TOUCH_TOLERANCE_PCT = 0.0015;
 
 /*
-   Distance from a swing required before counting a meaningful
-   reaction.
+   Used when measuring meaningful reaction after a swing.
 */
 const REACTION_MOVE_PCT = 0.003;
 
 /*
-   How much current resting liquidity must exist around a
-   structural level before it is considered meaningful.
+   Minimum score required for a major level.
 */
-const MIN_STRUCTURAL_RESTING_USD = 250000;
+const MIN_MAJOR_LEVEL_SCORE = 40;
 
-/*
-   Maximum distance from a structural price to inspect the
-   current order book.
-*/
-const RESTING_LIQUIDITY_RADIUS_USD = 25;
-
-/*
-   Merge nearby swing prices into one structural zone.
-*/
-const MERGE_LEVEL_DISTANCE_USD = 25;
-
-/*
-   Maximum number of major levels returned per side.
-*/
 const MAX_MAJOR_LEVELS = 8;
 
 /* ============================================================
@@ -135,16 +134,29 @@ const asks = new Map();
 let currentPrice = null;
 
 /* ============================================================
-   DEPTH SYNCHRONIZATION
+   DEPTH WEBSOCKET
    ============================================================ */
 
 let depthWs = null;
+
+/* ============================================================
+   SNAPSHOT WEBSOCKET API
+   ============================================================ */
+
 let snapshotWs = null;
 
+/* ============================================================
+   DEPTH SYNCHRONIZATION STATE
+   ============================================================ */
+
 let initialized = false;
+
 let waitingForBridge = false;
+
 let snapshotPending = false;
+
 let gapRecovery = false;
+
 let gapDetected = false;
 
 let pendingDepthEvents = [];
@@ -152,23 +164,39 @@ let pendingDepthEvents = [];
 let lastUpdateId = 0;
 
 let snapshotRequests = 0;
+
 let snapshot429s = 0;
+
 let bridgeAttempts = 0;
+
 let bridgeFound = 0;
+
 let gapCount = 0;
 
 let lastGapLocal = null;
+
 let lastGapIncoming = null;
 
 let lastSnapshotRequest = null;
+
 let lastSnapshotResponse = null;
+
 let lastSnapshotError = null;
+
 let lastSnapshotId = null;
 
 let snapshotTimer = null;
+
 let snapshotTimeout = null;
 
 let snapshotRequestId = 0;
+
+/*
+   Important:
+   Once we enter gap recovery, do not count every
+   incoming event as another gap.
+*/
+let gapRecoveryEventLogged = false;
 
 /* ============================================================
    CANDLE DATA
@@ -183,17 +211,25 @@ const candles = {
 
 let klineWs = null;
 
+/*
+   Historical kline requests.
+*/
+const historicalKlineRequests = new Map();
+
+let historicalKlineRequestId = 50000;
+
 /* ============================================================
-   STRUCTURAL LEVELS
+   STRUCTURE STATE
    ============================================================ */
 
 let swingHighs = [];
+
 let swingLows = [];
 
 let lastStructureUpdate = null;
 
 /* ============================================================
-   HELPERS
+   UTILITY FUNCTIONS
    ============================================================ */
 
 function nowIso() {
@@ -202,76 +238,130 @@ function nowIso() {
 
 function safeNumber(value) {
   const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+
+  return Number.isFinite(n)
+    ? n
+    : null;
 }
 
 function round(value, decimals = 2) {
   const p = Math.pow(10, decimals);
+
   return Math.round(value * p) / p;
 }
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
 function pctDistance(price, reference) {
-  if (!reference) return 0;
-  return ((price - reference) / reference) * 100;
+  if (
+    reference === null ||
+    reference === undefined ||
+    reference === 0
+  ) {
+    return 0;
+  }
+
+  return (
+    ((price - reference) / reference) *
+    100
+  );
 }
 
 function absolutePctDistance(price, reference) {
-  return Math.abs(pctDistance(price, reference));
+  return Math.abs(
+    pctDistance(
+      price,
+      reference
+    )
+  );
 }
 
 function usdValue(price, quantity) {
   return price * quantity;
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 /* ============================================================
-   ORDER BOOK HELPERS
+   ORDER BOOK
    ============================================================ */
 
 function applyBookSide(map, updates) {
-  if (!Array.isArray(updates)) return;
+  if (!Array.isArray(updates)) {
+    return;
+  }
 
   for (const item of updates) {
-    if (!Array.isArray(item) || item.length < 2) continue;
+    if (
+      !Array.isArray(item) ||
+      item.length < 2
+    ) {
+      continue;
+    }
 
-    const price = safeNumber(item[0]);
-    const quantity = safeNumber(item[1]);
+    const price =
+      safeNumber(item[0]);
 
-    if (price === null || quantity === null) continue;
+    const quantity =
+      safeNumber(item[1]);
+
+    if (
+      price === null ||
+      quantity === null
+    ) {
+      continue;
+    }
 
     if (quantity === 0) {
       map.delete(price);
     } else {
-      map.set(price, quantity);
+      map.set(
+        price,
+        quantity
+      );
     }
   }
 }
 
 function applyDepthEvent(event) {
-  if (!event) return;
+  if (!event) {
+    return;
+  }
 
-  applyBookSide(bids, event.b);
-  applyBookSide(asks, event.a);
+  applyBookSide(
+    bids,
+    event.b
+  );
 
-  if (event.u !== undefined) {
-    lastUpdateId = Number(event.u);
+  applyBookSide(
+    asks,
+    event.a
+  );
+
+  if (
+    event.u !== undefined
+  ) {
+    lastUpdateId =
+      Number(event.u);
   }
 }
+
+/* ============================================================
+   BEST BID / ASK
+   ============================================================ */
 
 function getBestBid() {
   let best = null;
 
-  for (const [price, quantity] of bids) {
-    if (quantity <= 0) continue;
+  for (const [
+    price,
+    quantity
+  ] of bids) {
 
-    if (best === null || price > best.price) {
+    if (quantity <= 0) {
+      continue;
+    }
+
+    if (
+      best === null ||
+      price > best.price
+    ) {
       best = {
         price,
         quantity
@@ -285,10 +375,19 @@ function getBestBid() {
 function getBestAsk() {
   let best = null;
 
-  for (const [price, quantity] of asks) {
-    if (quantity <= 0) continue;
+  for (const [
+    price,
+    quantity
+  ] of asks) {
 
-    if (best === null || price < best.price) {
+    if (quantity <= 0) {
+      continue;
+    }
+
+    if (
+      best === null ||
+      price < best.price
+    ) {
       best = {
         price,
         quantity
@@ -300,50 +399,85 @@ function getBestAsk() {
 }
 
 function getBookMid() {
-  const bid = getBestBid();
-  const ask = getBestAsk();
+  const bid =
+    getBestBid();
 
-  if (bid && ask) {
-    return (bid.price + ask.price) / 2;
+  const ask =
+    getBestAsk();
+
+  if (
+    bid &&
+    ask
+  ) {
+    return (
+      bid.price +
+      ask.price
+    ) / 2;
   }
 
-  if (bid) return bid.price;
-  if (ask) return ask.price;
+  if (bid) {
+    return bid.price;
+  }
+
+  if (ask) {
+    return ask.price;
+  }
 
   return currentPrice;
 }
 
 /* ============================================================
-   DEPTH EVENT BUFFER
+   DEPTH BUFFER
    ============================================================ */
 
 function bufferDepthEvent(event) {
-  pendingDepthEvents.push(event);
+  pendingDepthEvents.push(
+    event
+  );
 
-  if (pendingDepthEvents.length > MAX_PENDING_EVENTS) {
+  if (
+    pendingDepthEvents.length >
+    MAX_PENDING_EVENTS
+  ) {
     pendingDepthEvents.splice(
       0,
-      pendingDepthEvents.length - MAX_PENDING_EVENTS
+      pendingDepthEvents.length -
+        MAX_PENDING_EVENTS
     );
   }
 }
 
 /* ============================================================
-   SNAPSHOT BRIDGE
+   FIND SNAPSHOT BRIDGE
    ============================================================ */
 
-function findBridgeEvent(snapshotId) {
-  const target = Number(snapshotId) + 1;
+function findBridgeEvent(
+  snapshotId
+) {
+  const target =
+    Number(snapshotId) + 1;
 
-  for (const event of pendingDepthEvents) {
-    const U = Number(event.U);
-    const u = Number(event.u);
+  for (
+    const event of
+    pendingDepthEvents
+  ) {
+    const U =
+      Number(event.U);
 
-    if (!Number.isFinite(U) || !Number.isFinite(u)) {
+    const u =
+      Number(event.u);
+
+    if (
+      !Number.isFinite(U) ||
+      !Number.isFinite(u)
+    ) {
       continue;
     }
 
-    if (U <= target && u >= target) {
+    if (
+      U <= target &&
+      u >= target
+    ) {
       return event;
     }
   }
@@ -351,13 +485,24 @@ function findBridgeEvent(snapshotId) {
   return null;
 }
 
+/* ============================================================
+   COMPLETE SNAPSHOT BRIDGE
+   ============================================================ */
+
 function tryCompleteBridge() {
-  if (!waitingForBridge) return false;
-  if (!lastSnapshotId) return false;
+  if (
+    !waitingForBridge ||
+    !lastSnapshotId
+  ) {
+    return false;
+  }
 
   bridgeAttempts++;
 
-  const bridge = findBridgeEvent(lastSnapshotId);
+  const bridge =
+    findBridgeEvent(
+      lastSnapshotId
+    );
 
   if (!bridge) {
     return false;
@@ -365,19 +510,41 @@ function tryCompleteBridge() {
 
   bridgeFound++;
 
-  applyDepthEvent(bridge);
+  /*
+     Apply the event that bridges the
+     snapshot to the live stream.
+  */
+  applyDepthEvent(
+    bridge
+  );
 
   initialized = true;
+
   waitingForBridge = false;
+
   snapshotPending = false;
+
   gapRecovery = false;
+
   gapDetected = false;
 
-  const bridgeIndex = pendingDepthEvents.indexOf(bridge);
+  gapRecoveryEventLogged = false;
 
-  if (bridgeIndex >= 0) {
+  /*
+     Everything before the bridge is obsolete.
+  */
+  const bridgeIndex =
+    pendingDepthEvents.indexOf(
+      bridge
+    );
+
+  if (
+    bridgeIndex >= 0
+  ) {
     pendingDepthEvents =
-      pendingDepthEvents.slice(bridgeIndex + 1);
+      pendingDepthEvents.slice(
+        bridgeIndex + 1
+      );
   } else {
     pendingDepthEvents = [];
   }
@@ -386,37 +553,64 @@ function tryCompleteBridge() {
 }
 
 /* ============================================================
-   SNAPSHOT REQUEST
+   SNAPSHOT RATE LIMIT
    ============================================================ */
 
 function canRequestSnapshot() {
-  if (snapshotPending) return false;
+  if (snapshotPending) {
+    return false;
+  }
 
-  if (!lastSnapshotRequest) return true;
+  if (!lastSnapshotRequest) {
+    return true;
+  }
 
   const elapsed =
-    Date.now() - new Date(lastSnapshotRequest).getTime();
+    Date.now() -
+    new Date(
+      lastSnapshotRequest
+    ).getTime();
 
-  return elapsed >= SNAPSHOT_MIN_INTERVAL_MS;
+  return (
+    elapsed >=
+    SNAPSHOT_MIN_INTERVAL_MS
+  );
 }
 
-function requestSnapshot(reason = "startup") {
-  if (!canRequestSnapshot()) {
+/* ============================================================
+   REQUEST ORDER BOOK SNAPSHOT
+   ============================================================ */
+
+function requestSnapshot(
+  reason = "startup"
+) {
+  if (
+    !canRequestSnapshot()
+  ) {
     return;
   }
 
-  if (!snapshotWs || snapshotWs.readyState !== WebSocket.OPEN) {
+  if (
+    !snapshotWs ||
+    snapshotWs.readyState !==
+      WebSocket.OPEN
+  ) {
     return;
   }
 
   snapshotPending = true;
+
   waitingForBridge = false;
 
   snapshotRequests++;
 
-  lastSnapshotRequest = nowIso();
+  lastSnapshotRequest =
+    nowIso();
 
-  const id = String(++snapshotRequestId);
+  const id =
+    String(
+      ++snapshotRequestId
+    );
 
   const request = {
     id,
@@ -428,91 +622,186 @@ function requestSnapshot(reason = "startup") {
   };
 
   try {
-    snapshotWs.send(JSON.stringify(request));
+    snapshotWs.send(
+      JSON.stringify(
+        request
+      )
+    );
   } catch (error) {
+
     snapshotPending = false;
-    lastSnapshotError = error.message;
+
+    lastSnapshotError =
+      error.message;
+
     return;
   }
 
   if (snapshotTimeout) {
-    clearTimeout(snapshotTimeout);
+    clearTimeout(
+      snapshotTimeout
+    );
   }
 
-  snapshotTimeout = setTimeout(() => {
-    if (!snapshotPending) return;
+  snapshotTimeout =
+    setTimeout(
+      () => {
 
-    snapshotPending = false;
-    lastSnapshotError = "Snapshot request timeout";
+        if (
+          !snapshotPending
+        ) {
+          return;
+        }
 
-    scheduleSnapshotRecovery();
-  }, SNAPSHOT_TIMEOUT_MS);
+        snapshotPending =
+          false;
+
+        lastSnapshotError =
+          "Snapshot timeout";
+
+        scheduleSnapshotRecovery();
+
+      },
+      SNAPSHOT_TIMEOUT_MS
+    );
 }
 
-function installSnapshot(result) {
-  if (!result) return false;
+/* ============================================================
+   INSTALL ORDER BOOK SNAPSHOT
+   ============================================================ */
 
-  const snapshotId = Number(result.lastUpdateId);
-
-  if (!Number.isFinite(snapshotId)) {
-    lastSnapshotError = "Invalid snapshot lastUpdateId";
+function installSnapshot(
+  result
+) {
+  if (!result) {
     return false;
   }
 
-  const snapshotBids = Array.isArray(result.bids)
-    ? result.bids
-    : [];
+  const snapshotId =
+    Number(
+      result.lastUpdateId
+    );
 
-  const snapshotAsks = Array.isArray(result.asks)
-    ? result.asks
-    : [];
+  if (
+    !Number.isFinite(
+      snapshotId
+    )
+  ) {
+    lastSnapshotError =
+      "Invalid snapshot ID";
+
+    return false;
+  }
+
+  const snapshotBids =
+    Array.isArray(
+      result.bids
+    )
+      ? result.bids
+      : [];
+
+  const snapshotAsks =
+    Array.isArray(
+      result.asks
+    )
+      ? result.asks
+      : [];
 
   bids.clear();
+
   asks.clear();
 
-  for (const item of snapshotBids) {
-    if (!Array.isArray(item)) continue;
+  for (
+    const item of
+    snapshotBids
+  ) {
 
-    const price = safeNumber(item[0]);
-    const quantity = safeNumber(item[1]);
+    if (
+      !Array.isArray(item)
+    ) {
+      continue;
+    }
+
+    const price =
+      safeNumber(
+        item[0]
+      );
+
+    const quantity =
+      safeNumber(
+        item[1]
+      );
 
     if (
       price !== null &&
       quantity !== null &&
       quantity > 0
     ) {
-      bids.set(price, quantity);
+      bids.set(
+        price,
+        quantity
+      );
     }
   }
 
-  for (const item of snapshotAsks) {
-    if (!Array.isArray(item)) continue;
+  for (
+    const item of
+    snapshotAsks
+  ) {
 
-    const price = safeNumber(item[0]);
-    const quantity = safeNumber(item[1]);
+    if (
+      !Array.isArray(item)
+    ) {
+      continue;
+    }
+
+    const price =
+      safeNumber(
+        item[0]
+      );
+
+    const quantity =
+      safeNumber(
+        item[1]
+      );
 
     if (
       price !== null &&
       quantity !== null &&
       quantity > 0
     ) {
-      asks.set(price, quantity);
+      asks.set(
+        price,
+        quantity
+      );
     }
   }
 
-  lastSnapshotId = snapshotId;
-  lastUpdateId = snapshotId;
+  lastSnapshotId =
+    snapshotId;
+
+  lastUpdateId =
+    snapshotId;
 
   initialized = false;
+
   waitingForBridge = true;
+
   gapRecovery = false;
 
-  lastSnapshotResponse = nowIso();
-  lastSnapshotError = null;
+  lastSnapshotResponse =
+    nowIso();
+
+  lastSnapshotError =
+    null;
 
   if (snapshotTimeout) {
-    clearTimeout(snapshotTimeout);
-    snapshotTimeout = null;
+    clearTimeout(
+      snapshotTimeout
+    );
+
+    snapshotTimeout =
+      null;
   }
 
   tryCompleteBridge();
@@ -521,72 +810,123 @@ function installSnapshot(result) {
 }
 
 /* ============================================================
-   DEPTH EVENT PROCESSING
+   DEPTH EVENT HANDLER
    ============================================================ */
 
-function handleDepthEvent(event) {
-  if (!event || event.e !== "depthUpdate") {
+function handleDepthEvent(
+  event
+) {
+  if (
+    !event ||
+    event.e !==
+      "depthUpdate"
+  ) {
     return;
   }
 
-  if (!currentPrice) {
-    const bid = safeNumber(
-      event.b && event.b[0] ? event.b[0][0] : null
-    );
+  /*
+     Update current price from stream.
+  */
+  const firstBid =
+    event.b &&
+    event.b.length
+      ? safeNumber(
+          event.b[0][0]
+        )
+      : null;
 
-    const ask = safeNumber(
-      event.a && event.a[0] ? event.a[0][0] : null
-    );
+  const firstAsk =
+    event.a &&
+    event.a.length
+      ? safeNumber(
+          event.a[0][0]
+        )
+      : null;
 
-    if (bid !== null && ask !== null) {
-      currentPrice = (bid + ask) / 2;
-    }
+  if (
+    firstBid !== null &&
+    firstAsk !== null
+  ) {
+    currentPrice =
+      (
+        firstBid +
+        firstAsk
+      ) / 2;
   }
 
   /*
-     Always keep a bounded recent buffer.
-     This is important for snapshot bridging.
+     Always retain recent events.
   */
-  bufferDepthEvent(event);
+  bufferDepthEvent(
+    event
+  );
 
   /*
-     If we don't have a valid book yet, wait for snapshot bridge.
+     Snapshot bridge not complete.
   */
   if (!initialized) {
+
     tryCompleteBridge();
+
     return;
   }
 
-  const U = Number(event.U);
-  const u = Number(event.u);
+  const U =
+    Number(event.U);
 
-  if (!Number.isFinite(U) || !Number.isFinite(u)) {
+  const u =
+    Number(event.u);
+
+  if (
+    !Number.isFinite(U) ||
+    !Number.isFinite(u)
+  ) {
     return;
   }
 
   /*
-     Normal expected sequence:
-     U <= lastUpdateId + 1
-     u >= lastUpdateId + 1
+     Normal sequence.
   */
   if (
-    U <= lastUpdateId + 1 &&
-    u >= lastUpdateId + 1
+    U <=
+      lastUpdateId + 1 &&
+    u >=
+      lastUpdateId + 1
   ) {
-    applyDepthEvent(event);
 
-    if (gapRecovery) {
+    applyDepthEvent(
+      event
+    );
+
+    /*
+       Successful recovery.
+    */
+    if (
+      gapRecovery
+    ) {
       gapRecovery = false;
+
       gapDetected = false;
+
+      gapRecoveryEventLogged =
+        false;
     }
 
     /*
-       Once applied, old events are no longer needed.
+       Remove events already applied.
     */
-    while (pendingDepthEvents.length > 0) {
-      const first = pendingDepthEvents[0];
+    while (
+      pendingDepthEvents.length >
+      0
+    ) {
 
-      if (Number(first.u) <= lastUpdateId) {
+      const first =
+        pendingDepthEvents[0];
+
+      if (
+        Number(first.u) <=
+        lastUpdateId
+      ) {
         pendingDepthEvents.shift();
       } else {
         break;
@@ -597,28 +937,47 @@ function handleDepthEvent(event) {
   }
 
   /*
-     Event is completely behind our current update.
+     Event is already behind us.
   */
-  if (u <= lastUpdateId) {
+  if (
+    u <= lastUpdateId
+  ) {
     return;
   }
 
   /*
-     Genuine forward gap.
+     IMPORTANT:
+     If already recovering, don't count every
+     incoming packet as another gap.
   */
-  gapCount++;
+  if (
+    gapRecovery
+  ) {
 
-  gapDetected = true;
-  gapRecovery = true;
-
-  lastGapLocal = lastUpdateId;
-  lastGapIncoming = U;
+    /*
+       Keep buffering until snapshot
+       bridge/recovery.
+    */
+    return;
+  }
 
   /*
-     IMPORTANT:
-     Do NOT destroy the current book.
-     We retain it until a valid snapshot bridge arrives.
+     First genuine gap.
   */
+  gapRecovery = true;
+
+  gapDetected = true;
+
+  gapCount++;
+
+  gapRecoveryEventLogged =
+    true;
+
+  lastGapLocal =
+    lastUpdateId;
+
+  lastGapIncoming =
+    U;
 
   scheduleSnapshotRecovery();
 }
@@ -628,26 +987,46 @@ function handleDepthEvent(event) {
    ============================================================ */
 
 function scheduleSnapshotRecovery() {
+
   if (snapshotTimer) {
     return;
   }
 
-  const delay = canRequestSnapshot()
-    ? 1000
-    : Math.max(
+  let delay = 1000;
+
+  if (
+    !canRequestSnapshot() &&
+    lastSnapshotRequest
+  ) {
+
+    const elapsed =
+      Date.now() -
+      new Date(
+        lastSnapshotRequest
+      ).getTime();
+
+    delay =
+      Math.max(
         1000,
         SNAPSHOT_MIN_INTERVAL_MS -
-        (
-          Date.now() -
-          new Date(lastSnapshotRequest).getTime()
-        )
+          elapsed
       );
+  }
 
-  snapshotTimer = setTimeout(() => {
-    snapshotTimer = null;
+  snapshotTimer =
+    setTimeout(
+      () => {
 
-    requestSnapshot("gap-recovery");
-  }, delay);
+        snapshotTimer =
+          null;
+
+        requestSnapshot(
+          "gap-recovery"
+        );
+
+      },
+      delay
+    );
 }
 
 /* ============================================================
@@ -655,287 +1034,154 @@ function scheduleSnapshotRecovery() {
    ============================================================ */
 
 function connectDepthWebSocket() {
+
   if (depthWs) {
     try {
       depthWs.close();
     } catch (e) {}
   }
 
-  depthWs = new WebSocket(DEPTH_WS);
-
-  depthWs.on("open", () => {
-    /*
-       Snapshot WebSocket handles synchronization.
-       Market depth stream only supplies updates.
-    */
-
-    if (!initialized) {
-      requestSnapshot("depth-connected");
-    }
-  });
-
-  depthWs.on("message", raw => {
-    try {
-      const event = JSON.parse(raw.toString());
-
-      handleDepthEvent(event);
-    } catch (error) {
-      console.error(
-        "Depth parse error:",
-        error.message
-      );
-    }
-  });
-
-  depthWs.on("close", () => {
-    setTimeout(() => {
-      connectDepthWebSocket();
-    }, 3000);
-  });
-
-  depthWs.on("error", error => {
-    console.error(
-      "Depth WebSocket error:",
-      error.message
+  depthWs =
+    new WebSocket(
+      DEPTH_WS
     );
-  });
-}
 
-/* ============================================================
-   SNAPSHOT WEBSOCKET
-   ============================================================ */
+  depthWs.on(
+    "open",
+    () => {
 
-function connectSnapshotWebSocket() {
-  if (snapshotWs) {
-    try {
-      snapshotWs.close();
-    } catch (e) {}
-  }
+      console.log(
+        "Depth WebSocket connected"
+      );
 
-  snapshotWs = new WebSocket(WS_API);
-
-  snapshotWs.on("open", () => {
-    /*
-       Depth stream may already be receiving events.
-       Request snapshot after the stream is active.
-    */
-
-    requestSnapshot("snapshot-connected");
-  });
-
-  snapshotWs.on("message", raw => {
-    try {
-      const message = JSON.parse(raw.toString());
+      /*
+         Snapshot connection is responsible
+         for obtaining the initial book.
+      */
 
       if (
-        message.status === 429 ||
-        (
-          message.error &&
-          (
-            message.error.code === -1003 ||
-            message.error.code === 429
-          )
-        )
+        !initialized
       ) {
-        snapshot429s++;
-        snapshotPending = false;
-
-        lastSnapshotError =
-          message.error?.msg ||
-          "Snapshot rate limit";
-
-        scheduleSnapshotRecovery();
-
-        return;
-      }
-
-      if (
-        message.status === 200 &&
-        message.result
-      ) {
-        installSnapshot(message.result);
-        return;
-      }
-
-      if (message.error) {
-        snapshotPending = false;
-
-        lastSnapshotError =
-          message.error.msg ||
-          "Snapshot API error";
-
         scheduleSnapshotRecovery();
       }
-
-    } catch (error) {
-      lastSnapshotError = error.message;
     }
-  });
+  );
 
-  snapshotWs.on("close", () => {
-    setTimeout(() => {
-      connectSnapshotWebSocket();
-    }, 3000);
-  });
+  depthWs.on(
+    "message",
+    raw => {
 
-  snapshotWs.on("error", error => {
-    console.error(
-      "Snapshot WebSocket error:",
-      error.message
-    );
-  });
-}
+      try {
 
-/* ============================================================
-   KLINE WEBSOCKET
-   ============================================================ */
+        const event =
+          JSON.parse(
+            raw.toString()
+          );
 
-function connectKlineWebSocket() {
-  if (klineWs) {
-    try {
-      klineWs.close();
-    } catch (e) {}
-  }
+        handleDepthEvent(
+          event
+        );
 
-  klineWs = new WebSocket(KLINE_WS);
+      } catch (error) {
 
-  klineWs.on("open", () => {
-    console.log("Kline WebSocket connected");
-  });
+        console.error(
+          "Depth parse error:",
+          error.message
+        );
 
-  klineWs.on("message", raw => {
-    try {
-      const wrapper = JSON.parse(raw.toString());
-
-      const data = wrapper.data;
-
-      if (
-        !data ||
-        data.e !== "kline"
-      ) {
-        return;
       }
+    }
+  );
 
-      const k = data.k;
+  depthWs.on(
+    "close",
+    () => {
 
-      if (!k) return;
+      console.log(
+        "Depth WebSocket closed"
+      );
 
-      const interval = k.i;
-
-      if (!candles[interval]) {
-        return;
-      }
-
-      const candle = {
-        openTime: Number(k.t),
-        closeTime: Number(k.T),
-        open: Number(k.o),
-        high: Number(k.h),
-        low: Number(k.l),
-        close: Number(k.c),
-        volume: Number(k.v),
-        closed: Boolean(k.x)
-      };
-
-      upsertCandle(interval, candle);
-
-    } catch (error) {
-      console.error(
-        "Kline parse error:",
-        error.message
+      setTimeout(
+        () => {
+          connectDepthWebSocket();
+        },
+        3000
       );
     }
-  });
+  );
 
-  klineWs.on("close", () => {
-    setTimeout(() => {
-      connectKlineWebSocket();
-    }, 3000);
-  });
+  depthWs.on(
+    "error",
+    error => {
 
-  klineWs.on("error", error => {
-    console.error(
-      "Kline WebSocket error:",
-      error.message
-    );
-  });
+      console.error(
+        "Depth WebSocket error:",
+        error.message
+      );
+
+    }
+  );
 }
 
 /* ============================================================
-   KLINE DATA
+   HISTORICAL KLINE REQUEST
    ============================================================ */
 
-function upsertCandle(interval, candle) {
-  if (!candles[interval]) {
-    candles[interval] = [];
-  }
+function requestHistoricalKlines(
+  interval
+) {
 
-  const list = candles[interval];
-
-  const index = list.findIndex(
-    x => x.openTime === candle.openTime
-  );
-
-  if (index >= 0) {
-    list[index] = candle;
-  } else {
-    list.push(candle);
-  }
-
-  list.sort(
-    (a, b) => a.openTime - b.openTime
-  );
-
-  const max =
-    STRUCTURE[interval]?.candles || 300;
-
-  if (list.length > max) {
-    list.splice(0, list.length - max);
-  }
-
-  if (candle.closed) {
-    rebuildStructure();
-  }
-}
-
-/* ============================================================
-   HISTORICAL KLINES THROUGH WEBSOCKET API
-   ============================================================ */
-
-let klineRequestId = 100000;
-
-function requestHistoricalKlines(interval) {
   if (
     !snapshotWs ||
-    snapshotWs.readyState !== WebSocket.OPEN
+    snapshotWs.readyState !==
+      WebSocket.OPEN
   ) {
     return;
   }
 
-  const config = STRUCTURE[interval];
+  const config =
+    STRUCTURE[interval];
 
-  if (!config) return;
+  if (!config) {
+    return;
+  }
 
-  const id = String(++klineRequestId);
+  const id =
+    String(
+      ++historicalKlineRequestId
+    );
+
+  historicalKlineRequests.set(
+    id,
+    interval
+  );
 
   const request = {
     id,
     method: "klines",
     params: {
       symbol: SYMBOL,
-      interval: config.interval,
-      limit: config.candles
+      interval:
+        config.interval,
+      limit:
+        config.candles
     }
   };
 
   try {
+
     snapshotWs.send(
-      JSON.stringify(request)
+      JSON.stringify(
+        request
+      )
     );
 
-    historicalKlineRequests.set(id, interval);
-
   } catch (error) {
+
+    historicalKlineRequests.delete(
+      id
+    );
+
     console.error(
       "Historical kline request error:",
       error.message
@@ -943,51 +1189,111 @@ function requestHistoricalKlines(interval) {
   }
 }
 
-const historicalKlineRequests = new Map();
+/* ============================================================
+   HISTORICAL KLINE RESPONSE
+   ============================================================ */
 
-/*
-   Patch snapshot message handling for historical klines.
-*/
-function handleHistoricalKlineResponse(message) {
-  if (!message || !message.id) {
+function handleHistoricalKlineResponse(
+  message
+) {
+
+  if (
+    !message ||
+    message.id ===
+      undefined ||
+    message.id ===
+      null
+  ) {
     return false;
   }
 
-  const id = String(message.id);
+  const id =
+    String(
+      message.id
+    );
 
-  if (!historicalKlineRequests.has(id)) {
+  if (
+    !historicalKlineRequests.has(
+      id
+    )
+  ) {
     return false;
   }
 
   const interval =
-    historicalKlineRequests.get(id);
+    historicalKlineRequests.get(
+      id
+    );
 
-  historicalKlineRequests.delete(id);
+  historicalKlineRequests.delete(
+    id
+  );
 
   if (
     message.status !== 200 ||
-    !Array.isArray(message.result)
+    !Array.isArray(
+      message.result
+    )
   ) {
+
+    console.error(
+      `Historical ${interval} request failed`
+    );
+
     return true;
   }
 
+  const result =
+    message.result;
+
   candles[interval] =
-    message.result
-      .map(row => ({
-        openTime: Number(row[0]),
-        open: Number(row[1]),
-        high: Number(row[2]),
-        low: Number(row[3]),
-        close: Number(row[4]),
-        volume: Number(row[5]),
-        closeTime: Number(row[6]),
-        closed: true
-      }))
-      .filter(x =>
-        Number.isFinite(x.openTime) &&
-        Number.isFinite(x.high) &&
-        Number.isFinite(x.low)
+    result
+      .map(
+        row => ({
+          openTime:
+            Number(row[0]),
+
+          open:
+            Number(row[1]),
+
+          high:
+            Number(row[2]),
+
+          low:
+            Number(row[3]),
+
+          close:
+            Number(row[4]),
+
+          volume:
+            Number(row[5]),
+
+          closeTime:
+            Number(row[6]),
+
+          closed:
+            true
+        })
+      )
+      .filter(
+        candle =>
+          Number.isFinite(
+            candle.openTime
+          ) &&
+          Number.isFinite(
+            candle.high
+          ) &&
+          Number.isFinite(
+            candle.low
+          ) &&
+          Number.isFinite(
+            candle.close
+          )
       );
+
+  console.log(
+    `Loaded ${candles[interval].length} ${interval} candles`
+  );
 
   rebuildStructure();
 
@@ -995,29 +1301,453 @@ function handleHistoricalKlineResponse(message) {
 }
 
 /* ============================================================
-   STRUCTURE CALCULATIONS
+   SNAPSHOT WEBSOCKET
    ============================================================ */
 
-function trueRange(candle, previous) {
-  if (!previous) {
-    return candle.high - candle.low;
+function connectSnapshotWebSocket() {
+
+  if (snapshotWs) {
+    try {
+      snapshotWs.close();
+    } catch (e) {}
   }
 
-  return Math.max(
-    candle.high - candle.low,
-    Math.abs(candle.high - previous.close),
-    Math.abs(candle.low - previous.close)
+  snapshotWs =
+    new WebSocket(
+      WS_API
+    );
+
+  snapshotWs.on(
+    "open",
+    () => {
+
+      console.log(
+        "Binance Futures API WebSocket connected"
+      );
+
+      /*
+         Order-book snapshot.
+      */
+      requestSnapshot(
+        "snapshot-connected"
+      );
+
+      /*
+         Historical candles.
+      */
+      setTimeout(
+        () => {
+
+          requestHistoricalKlines(
+            "15m"
+          );
+
+          requestHistoricalKlines(
+            "1h"
+          );
+
+          requestHistoricalKlines(
+            "4h"
+          );
+
+          requestHistoricalKlines(
+            "1d"
+          );
+
+        },
+        500
+      );
+    }
+  );
+
+  snapshotWs.on(
+    "message",
+    raw => {
+
+      try {
+
+        const message =
+          JSON.parse(
+            raw.toString()
+          );
+
+        /*
+           Historical candle response.
+        */
+        if (
+          handleHistoricalKlineResponse(
+            message
+          )
+        ) {
+          return;
+        }
+
+        /*
+           Rate limit.
+        */
+        if (
+          message.status ===
+            429 ||
+          (
+            message.error &&
+            (
+              message.error.code ===
+                -1003 ||
+              message.error.code ===
+                429
+            )
+          )
+        ) {
+
+          snapshot429s++;
+
+          snapshotPending =
+            false;
+
+          lastSnapshotError =
+            message.error?.msg ||
+            "Snapshot rate limit";
+
+          scheduleSnapshotRecovery();
+
+          return;
+        }
+
+        /*
+           Order book snapshot.
+        */
+        if (
+          message.status ===
+            200 &&
+          message.result &&
+          message.result
+            .lastUpdateId !==
+            undefined
+        ) {
+
+          installSnapshot(
+            message.result
+          );
+
+          return;
+        }
+
+        /*
+           Other API error.
+        */
+        if (
+          message.error
+        ) {
+
+          snapshotPending =
+            false;
+
+          lastSnapshotError =
+            message.error.msg ||
+            "Snapshot API error";
+
+          scheduleSnapshotRecovery();
+        }
+
+      } catch (error) {
+
+        lastSnapshotError =
+          error.message;
+
+      }
+    }
+  );
+
+  snapshotWs.on(
+    "close",
+    () => {
+
+      console.log(
+        "Snapshot WebSocket closed"
+      );
+
+      setTimeout(
+        () => {
+          connectSnapshotWebSocket();
+        },
+        3000
+      );
+    }
+  );
+
+  snapshotWs.on(
+    "error",
+    error => {
+
+      console.error(
+        "Snapshot WebSocket error:",
+        error.message
+      );
+
+    }
   );
 }
 
-function averageTrueRange(list, period = 14) {
-  if (!list || list.length < 2) {
+/* ============================================================
+   LIVE KLINE WEBSOCKET
+   ============================================================ */
+
+function connectKlineWebSocket() {
+
+  if (klineWs) {
+    try {
+      klineWs.close();
+    } catch (e) {}
+  }
+
+  klineWs =
+    new WebSocket(
+      KLINE_WS
+    );
+
+  klineWs.on(
+    "open",
+    () => {
+
+      console.log(
+        "Kline WebSocket connected"
+      );
+
+    }
+  );
+
+  klineWs.on(
+    "message",
+    raw => {
+
+      try {
+
+        const wrapper =
+          JSON.parse(
+            raw.toString()
+          );
+
+        const data =
+          wrapper.data;
+
+        if (
+          !data ||
+          data.e !==
+            "kline"
+        ) {
+          return;
+        }
+
+        const k =
+          data.k;
+
+        if (!k) {
+          return;
+        }
+
+        const interval =
+          k.i;
+
+        if (
+          !candles[interval]
+        ) {
+          return;
+        }
+
+        const candle = {
+          openTime:
+            Number(k.t),
+
+          closeTime:
+            Number(k.T),
+
+          open:
+            Number(k.o),
+
+          high:
+            Number(k.h),
+
+          low:
+            Number(k.l),
+
+          close:
+            Number(k.c),
+
+          volume:
+            Number(k.v),
+
+          closed:
+            Boolean(k.x)
+        };
+
+        upsertCandle(
+          interval,
+          candle
+        );
+
+      } catch (error) {
+
+        console.error(
+          "Kline parse error:",
+          error.message
+        );
+
+      }
+    }
+  );
+
+  klineWs.on(
+    "close",
+    () => {
+
+      console.log(
+        "Kline WebSocket closed"
+      );
+
+      setTimeout(
+        () => {
+          connectKlineWebSocket();
+        },
+        3000
+      );
+    }
+  );
+
+  klineWs.on(
+    "error",
+    error => {
+
+      console.error(
+        "Kline WebSocket error:",
+        error.message
+      );
+
+    }
+  );
+}
+
+/* ============================================================
+   UPSERT LIVE CANDLE
+   ============================================================ */
+
+function upsertCandle(
+  interval,
+  candle
+) {
+
+  if (
+    !candles[interval]
+  ) {
+    candles[interval] = [];
+  }
+
+  const list =
+    candles[interval];
+
+  const index =
+    list.findIndex(
+      x =>
+        x.openTime ===
+        candle.openTime
+    );
+
+  if (
+    index >= 0
+  ) {
+
+    list[index] =
+      candle;
+
+  } else {
+
+    list.push(
+      candle
+    );
+  }
+
+  list.sort(
+    (a, b) =>
+      a.openTime -
+      b.openTime
+  );
+
+  const max =
+    STRUCTURE[interval]
+      ?.candles || 300;
+
+  if (
+    list.length >
+    max
+  ) {
+
+    list.splice(
+      0,
+      list.length - max
+    );
+  }
+
+  /*
+     Rebuild structure on closed candles.
+  */
+  if (
+    candle.closed
+  ) {
+    rebuildStructure();
+  }
+}
+
+/* ============================================================
+   ATR
+   ============================================================ */
+
+function trueRange(
+  candle,
+  previous
+) {
+
+  if (!previous) {
+    return (
+      candle.high -
+      candle.low
+    );
+  }
+
+  return Math.max(
+    candle.high -
+      candle.low,
+
+    Math.abs(
+      candle.high -
+      previous.close
+    ),
+
+    Math.abs(
+      candle.low -
+      previous.close
+    )
+  );
+}
+
+function averageTrueRange(
+  list,
+  period = 14
+) {
+
+  if (
+    !list ||
+    list.length < 2
+  ) {
     return null;
   }
 
   const ranges = [];
 
-  for (let i = 1; i < list.length; i++) {
+  for (
+    let i = 1;
+    i < list.length;
+    i++
+  ) {
+
     ranges.push(
       trueRange(
         list[i],
@@ -1027,20 +1757,33 @@ function averageTrueRange(list, period = 14) {
   }
 
   const start =
-    Math.max(0, ranges.length - period);
+    Math.max(
+      0,
+      ranges.length -
+        period
+    );
 
   const selected =
-    ranges.slice(start);
+    ranges.slice(
+      start
+    );
 
-  if (!selected.length) {
+  if (
+    !selected.length
+  ) {
     return null;
   }
 
   return (
     selected.reduce(
-      (sum, value) => sum + value,
+      (
+        sum,
+        value
+      ) =>
+        sum + value,
       0
-    ) / selected.length
+    ) /
+    selected.length
   );
 }
 
@@ -1048,128 +1791,217 @@ function averageTrueRange(list, period = 14) {
    SWING DETECTION
    ============================================================ */
 
-function detectSwings(interval, list) {
-  const config = STRUCTURE[interval];
+function detectSwings(
+  interval,
+  list
+) {
 
-  if (!config || !list) {
-    return {
-      highs: [],
-      lows: []
-    };
-  }
+  const config =
+    STRUCTURE[interval];
 
   const highs = [];
+
   const lows = [];
 
-  const left = config.pivotLeft;
-  const right = config.pivotRight;
-
   if (
+    !config ||
+    !list ||
     list.length <
-    left + right + 5
+      config.pivotLeft +
+      config.pivotRight +
+      5
   ) {
+
     return {
       highs,
       lows
     };
   }
 
-  const atr =
-    averageTrueRange(list, 14);
+  const left =
+    config.pivotLeft;
+
+  const right =
+    config.pivotRight;
 
   for (
     let i = left;
-    i < list.length - right;
+    i <
+      list.length -
+        right;
     i++
   ) {
-    const c = list[i];
+
+    const candle =
+      list[i];
 
     let isHigh = true;
+
     let isLow = true;
 
+    /*
+       Swing high.
+    */
     for (
-      let j = i - left;
-      j <= i + right;
+      let j =
+        i - left;
+      j <=
+        i + right;
       j++
     ) {
-      if (j === i) continue;
 
-      if (list[j].high >= c.high) {
-        isHigh = false;
+      if (
+        j === i
+      ) {
+        continue;
       }
 
-      if (list[j].low <= c.low) {
-        isLow = false;
+      if (
+        list[j].high >=
+        candle.high
+      ) {
+
+        isHigh = false;
+
+        break;
       }
     }
 
+    /*
+       Swing low.
+    */
+    for (
+      let j =
+        i - left;
+      j <=
+        i + right;
+      j++
+    ) {
+
+      if (
+        j === i
+      ) {
+        continue;
+      }
+
+      if (
+        list[j].low <=
+        candle.low
+      ) {
+
+        isLow = false;
+
+        break;
+      }
+    }
+
+    /*
+       Reaction after swing.
+    */
+    let reactionCount = 0;
+
+    const future =
+      list.slice(
+        i + right + 1,
+        Math.min(
+          list.length,
+          i +
+            right +
+            40
+        )
+      );
+
     if (isHigh) {
-      const future =
-        list.slice(
-          i + 1,
-          Math.min(
-            list.length,
-            i + right + 30
-          )
-        );
 
-      let reaction = 0;
+      for (
+        const futureCandle of
+        future
+      ) {
 
-      for (const x of future) {
         if (
-          x.low <=
-          c.high *
-          (1 - REACTION_MOVE_PCT)
+          futureCandle.low <=
+          candle.high *
+            (
+              1 -
+              REACTION_MOVE_PCT
+            )
         ) {
-          reaction++;
+
+          reactionCount++;
+
+          break;
         }
       }
 
       highs.push({
-        type: "swing_high",
-        side: "buy_side",
+        type:
+          "swing_high",
+
+        side:
+          "buy_side",
+
         interval,
-        price: c.high,
-        time: c.openTime,
-        index: i,
-        timeframeWeight: config.weight,
-        reactionCount: reaction,
-        atr
+
+        price:
+          candle.high,
+
+        time:
+          candle.openTime,
+
+        index:
+          i,
+
+        timeframeWeight:
+          config.weight,
+
+        reactionCount
       });
     }
 
     if (isLow) {
-      const future =
-        list.slice(
-          i + 1,
-          Math.min(
-            list.length,
-            i + right + 30
-          )
-        );
 
-      let reaction = 0;
+      for (
+        const futureCandle of
+        future
+      ) {
 
-      for (const x of future) {
         if (
-          x.high >=
-          c.low *
-          (1 + REACTION_MOVE_PCT)
+          futureCandle.high >=
+          candle.low *
+            (
+              1 +
+              REACTION_MOVE_PCT
+            )
         ) {
-          reaction++;
+
+          reactionCount++;
+
+          break;
         }
       }
 
       lows.push({
-        type: "swing_low",
-        side: "sell_side",
+        type:
+          "swing_low",
+
+        side:
+          "sell_side",
+
         interval,
-        price: c.low,
-        time: c.openTime,
-        index: i,
-        timeframeWeight: config.weight,
-        reactionCount: reaction,
-        atr
+
+        price:
+          candle.low,
+
+        time:
+          candle.openTime,
+
+        index:
+          i,
+
+        timeframeWeight:
+          config.weight,
+
+        reactionCount
       });
     }
   }
@@ -1184,35 +2016,83 @@ function detectSwings(interval, list) {
    EQUAL HIGH / LOW DETECTION
    ============================================================ */
 
-function addEqualLiquidity(swingList, tolerancePct) {
+function addEqualLiquidity(
+  swingList,
+  tolerancePct
+) {
+
   const result = [];
 
-  for (let i = 0; i < swingList.length; i++) {
-    const base = swingList[i];
+  for (
+    let i = 0;
+    i <
+      swingList.length;
+    i++
+  ) {
 
-    let matches = 1;
-    let priceSum = base.price;
+    const base =
+      swingList[i];
 
-    for (let j = i + 1; j < swingList.length; j++) {
-      const other = swingList[j];
+    let equalCount = 1;
+
+    const matchedPrices = [
+      base.price
+    ];
+
+    for (
+      let j =
+        0;
+      j <
+        swingList.length;
+      j++
+    ) {
 
       if (
+        j === i
+      ) {
+        continue;
+      }
+
+      const other =
+        swingList[j];
+
+      const difference =
         Math.abs(
-          other.price - base.price
+          other.price -
+          base.price
         ) /
-        base.price <=
+        base.price;
+
+      if (
+        difference <=
         tolerancePct
       ) {
-        matches++;
-        priceSum += other.price;
+
+        equalCount++;
+
+        matchedPrices.push(
+          other.price
+        );
       }
     }
 
+    const averagePrice =
+      matchedPrices.reduce(
+        (
+          sum,
+          value
+        ) =>
+          sum + value,
+        0
+      ) /
+      matchedPrices.length;
+
     result.push({
       ...base,
-      equalCount: matches,
-      averagePrice:
-        priceSum / matches
+
+      equalCount,
+
+      averagePrice
     });
   }
 
@@ -1220,49 +2100,80 @@ function addEqualLiquidity(swingList, tolerancePct) {
 }
 
 /* ============================================================
-   STRUCTURAL LEVEL MERGING
+   MERGE STRUCTURAL LEVELS
    ============================================================ */
 
-function mergeLevels(levels) {
-  if (!levels.length) {
+function mergeLevels(
+  levels
+) {
+
+  if (
+    !levels.length
+  ) {
     return [];
   }
 
   const sorted =
     [...levels].sort(
-      (a, b) => a.price - b.price
+      (a, b) =>
+        a.price -
+        b.price
     );
 
   const groups = [];
 
-  for (const level of sorted) {
+  for (
+    const level of
+    sorted
+  ) {
+
     let group = null;
 
-    for (const g of groups) {
+    for (
+      const candidate of
+      groups
+    ) {
+
       if (
         Math.abs(
-          level.price - g.price
-        ) <= MERGE_LEVEL_DISTANCE_USD
+          level.price -
+          candidate.price
+        ) <=
+        MERGE_LEVEL_DISTANCE_USD
       ) {
-        group = g;
+
+        group =
+          candidate;
+
         break;
       }
     }
 
     if (!group) {
+
       group = {
-        price: level.price,
+        price:
+          level.price,
+
         levels: []
       };
 
-      groups.push(group);
+      groups.push(
+        group
+      );
     }
 
-    group.levels.push(level);
+    group.levels.push(
+      level
+    );
 
     group.price =
       group.levels.reduce(
-        (sum, x) => sum + x.price,
+        (
+          sum,
+          x
+        ) =>
+          sum + x.price,
         0
       ) /
       group.levels.length;
@@ -1272,90 +2183,152 @@ function mergeLevels(levels) {
 }
 
 /* ============================================================
-   STRUCTURAL LEVEL SCORING
+   STRUCTURAL SCORE
    ============================================================ */
 
-function scoreStructuralGroup(group, side) {
-  const levels = group.levels;
+function scoreStructuralGroup(
+  group
+) {
+
+  const levels =
+    group.levels;
 
   let timeframeScore = 0;
+
   let reactions = 0;
-  let equalCount = 0;
 
-  const intervals = new Set();
+  let equalCount = 1;
 
-  for (const level of levels) {
+  const intervals =
+    new Set();
+
+  for (
+    const level of
+    levels
+  ) {
+
     timeframeScore +=
-      level.timeframeWeight || 1;
+      level.timeframeWeight ||
+      1;
 
     reactions +=
-      level.reactionCount || 0;
+      level.reactionCount ||
+      0;
 
     equalCount =
       Math.max(
         equalCount,
-        level.equalCount || 1
+        level.equalCount ||
+          1
       );
 
-    intervals.add(level.interval);
+    intervals.add(
+      level.interval
+    );
   }
 
-  /*
-     Multi-timeframe agreement is important.
-  */
   const timeframeCount =
     intervals.size;
 
   let score = 0;
 
+  /*
+     Higher timeframe = more weight.
+  */
   score +=
     timeframeScore * 10;
 
+  /*
+     Multiple reactions.
+  */
   score +=
-    reactions * 2;
+    reactions * 10;
 
+  /*
+     Equal highs/lows.
+  */
   score +=
-    Math.max(0, equalCount - 1) * 12;
+    Math.max(
+      0,
+      equalCount - 1
+    ) * 20;
 
+  /*
+     Multi-timeframe agreement.
+  */
   score +=
-    Math.max(0, timeframeCount - 1) * 15;
+    Math.max(
+      0,
+      timeframeCount - 1
+    ) * 25;
 
-  if (side === "buy") {
-    score += 5;
-  } else {
-    score += 5;
-  }
+  let importance =
+    "MODERATE";
 
-  let importance = "MODERATE";
+  if (
+    score >= 110
+  ) {
 
-  if (score >= 100) {
-    importance = "VERY HIGH";
-  } else if (score >= 70) {
-    importance = "HIGH";
-  } else if (score >= 45) {
-    importance = "MEDIUM";
+    importance =
+      "VERY HIGH";
+
+  } else if (
+    score >= 80
+  ) {
+
+    importance =
+      "HIGH";
+
+  } else if (
+    score >= 55
+  ) {
+
+    importance =
+      "MEDIUM";
   }
 
   return {
     score,
+
     importance,
+
     timeframeCount,
-    intervals: [...intervals],
+
+    intervals:
+      [...intervals],
+
     reactions,
+
     equalCount
   };
 }
 
 /* ============================================================
-   REBUILD ALL STRUCTURE
+   REBUILD STRUCTURE
    ============================================================ */
 
 function rebuildStructure() {
+
   const allHighs = [];
+
   const allLows = [];
 
-  for (const interval of Object.keys(STRUCTURE)) {
-    const list = candles[interval];
+  for (
+    const interval of
+    Object.keys(
+      STRUCTURE
+    )
+  ) {
+
+    const list =
+      candles[interval];
+
+    if (
+      !list ||
+      !list.length
+    ) {
+      continue;
+    }
 
     const result =
       detectSwings(
@@ -1377,40 +2350,63 @@ function rebuildStructure() {
           .equalTolerancePct
       );
 
-    allHighs.push(...highs);
-    allLows.push(...lows);
+    allHighs.push(
+      ...highs
+    );
+
+    allLows.push(
+      ...lows
+    );
   }
 
-  swingHighs = allHighs;
-  swingLows = allLows;
+  swingHighs =
+    allHighs;
 
-  lastStructureUpdate = nowIso();
+  swingLows =
+    allLows;
+
+  lastStructureUpdate =
+    nowIso();
 }
 
 /* ============================================================
-   CURRENT RESTING LIQUIDITY AROUND A LEVEL
+   RESTING LIQUIDITY AROUND STRUCTURAL LEVEL
    ============================================================ */
 
 function restingLiquidityAround(
   price,
   side
 ) {
+
   const map =
     side === "sell"
       ? asks
       : bids;
 
+  let totalUsd = 0;
+
+  let quantity = 0;
+
+  let strongestUsd = 0;
+
+  let strongestPrice =
+    null;
+
+  let levelCount = 0;
+
   const levels = [];
 
-  let totalUsd = 0;
-  let quantity = 0;
-  let strongestUsd = 0;
-  let strongestPrice = null;
+  for (
+    const [
+      levelPrice,
+      levelQuantity
+    ] of map
+  ) {
 
-  for (const [levelPrice, levelQty] of map) {
     const distance =
       Math.abs(
-        levelPrice - price
+        levelPrice -
+        price
       );
 
     if (
@@ -1423,7 +2419,7 @@ function restingLiquidityAround(
     const usd =
       usdValue(
         levelPrice,
-        levelQty
+        levelQuantity
       );
 
     if (
@@ -1433,76 +2429,128 @@ function restingLiquidityAround(
       continue;
     }
 
-    totalUsd += usd;
-    quantity += levelQty;
+    totalUsd +=
+      usd;
 
-    if (usd > strongestUsd) {
-      strongestUsd = usd;
-      strongestPrice = levelPrice;
+    quantity +=
+      levelQuantity;
+
+    levelCount++;
+
+    if (
+      usd >
+      strongestUsd
+    ) {
+
+      strongestUsd =
+        usd;
+
+      strongestPrice =
+        levelPrice;
     }
 
     levels.push({
-      price: levelPrice,
-      quantity: levelQty,
-      usd
+      price:
+        round(
+          levelPrice,
+          2
+        ),
+
+      quantity:
+        round(
+          levelQuantity,
+          6
+        ),
+
+      usd:
+        round(
+          usd,
+          2
+        )
     });
   }
 
   levels.sort(
     (a, b) =>
-      b.usd - a.usd
+      b.usd -
+      a.usd
   );
 
   return {
     totalUsd,
+
     quantity,
+
     strongestUsd,
+
     strongestPrice,
+
+    levelCount,
+
     levels
   };
 }
 
 /* ============================================================
-   BUILD STRUCTURAL LEVELS
+   BUILD MAJOR LEVELS
    ============================================================ */
 
 function buildMajorLevels() {
-  if (!currentPrice) {
+
+  if (
+    !currentPrice
+  ) {
+
     return {
-      resistance: [],
-      support: [],
       bsl: [],
-      ssl: []
+      ssl: [],
+      resistance: [],
+      support: []
     };
   }
 
-  const highs =
+  /*
+     Only structural highs above current price
+     are BSL candidates.
+  */
+  const highCandidates =
     swingHighs.filter(
-      x =>
-        x.price >
+      level =>
+        level.price >
         currentPrice
     );
 
-  const lows =
+  /*
+     Only structural lows below current price
+     are SSL candidates.
+  */
+  const lowCandidates =
     swingLows.filter(
-      x =>
-        x.price <
+      level =>
+        level.price <
         currentPrice
     );
 
   const highGroups =
-    mergeLevels(highs);
+    mergeLevels(
+      highCandidates
+    );
 
   const lowGroups =
-    mergeLevels(lows);
+    mergeLevels(
+      lowCandidates
+    );
 
   const bsl = [];
 
-  for (const group of highGroups) {
+  for (
+    const group of
+    highGroups
+  ) {
+
     const score =
       scoreStructuralGroup(
-        group,
-        "buy"
+        group
       );
 
     const resting =
@@ -1511,37 +2559,39 @@ function buildMajorLevels() {
         "sell"
       );
 
-    const distancePct =
-      absolutePctDistance(
-        group.price,
-        currentPrice
-      );
-
-    /*
-       More distant levels are still allowed,
-       but levels immediately around price are
-       not automatically considered major.
-    */
-
-    const structuralStrength =
+    let finalScore =
       score.score;
 
-    const restingBonus =
+    if (
       resting.totalUsd >=
       MIN_STRUCTURAL_RESTING_USD
-        ? 20
-        : 0;
+    ) {
 
-    const finalScore =
-      structuralStrength +
-      restingBonus;
+      finalScore += 25;
+
+    }
+
+    /*
+       Do not let raw order-book liquidity
+       create a structural level.
+       It can only strengthen an existing
+       structural level.
+    */
+
+    if (
+      finalScore <
+      MIN_MAJOR_LEVEL_SCORE
+    ) {
+      continue;
+    }
 
     let classification =
-      "STRUCTURAL";
+      "MAJOR SWING HIGH";
 
     if (
       score.equalCount >= 2
     ) {
+
       classification =
         "EQUAL HIGH / BSL";
     }
@@ -1550,24 +2600,45 @@ function buildMajorLevels() {
       resting.totalUsd >=
       MIN_STRUCTURAL_RESTING_USD
     ) {
+
       classification +=
         " + RESTING LIQUIDITY";
     }
 
     bsl.push({
-      side: "buy_side",
-      type: "BSL",
-      price: round(group.price, 2),
-      priceLow: round(
-        group.price *
-        (1 - LEVEL_ZONE_PCT),
-        2
-      ),
-      priceHigh: round(
-        group.price *
-        (1 + LEVEL_ZONE_PCT),
-        2
-      ),
+
+      type:
+        "BSL",
+
+      side:
+        "buy_side",
+
+      price:
+        round(
+          group.price,
+          2
+        ),
+
+      priceLow:
+        round(
+          group.price *
+            (
+              1 -
+              LEVEL_ZONE_PCT
+            ),
+          2
+        ),
+
+      priceHigh:
+        round(
+          group.price *
+            (
+              1 +
+              LEVEL_ZONE_PCT
+            ),
+          2
+        ),
+
       distancePct:
         round(
           pctDistance(
@@ -1576,42 +2647,57 @@ function buildMajorLevels() {
           ),
           3
         ),
+
       importance:
         score.importance,
+
       classification,
-      score: finalScore,
+
+      score:
+        finalScore,
+
       timeframeCount:
         score.timeframeCount,
+
       intervals:
         score.intervals,
+
       equalCount:
         score.equalCount,
+
       reactionCount:
         score.reactions,
+
       restingSellUsd:
         round(
           resting.totalUsd,
           2
         ),
+
       strongestRestingSellUsd:
         round(
           resting.strongestUsd,
           2
         ),
+
       strongestRestingSellPrice:
         resting.strongestPrice,
+
       restingLevels:
-        resting.levels.length
+        resting.levelCount
     });
   }
 
   const ssl = [];
 
-  for (const group of lowGroups) {
+  for (
+    const group of
+    lowGroups
+  ) {
+
     const score =
       scoreStructuralGroup(
-        group,
-        "sell"
+        group
       );
 
     const resting =
@@ -1620,31 +2706,31 @@ function buildMajorLevels() {
         "buy"
       );
 
-    const distancePct =
-      absolutePctDistance(
-        group.price,
-        currentPrice
-      );
-
-    const structuralStrength =
+    let finalScore =
       score.score;
 
-    const restingBonus =
+    if (
       resting.totalUsd >=
       MIN_STRUCTURAL_RESTING_USD
-        ? 20
-        : 0;
+    ) {
 
-    const finalScore =
-      structuralStrength +
-      restingBonus;
+      finalScore += 25;
+    }
+
+    if (
+      finalScore <
+      MIN_MAJOR_LEVEL_SCORE
+    ) {
+      continue;
+    }
 
     let classification =
-      "STRUCTURAL";
+      "MAJOR SWING LOW";
 
     if (
       score.equalCount >= 2
     ) {
+
       classification =
         "EQUAL LOW / SSL";
     }
@@ -1653,24 +2739,45 @@ function buildMajorLevels() {
       resting.totalUsd >=
       MIN_STRUCTURAL_RESTING_USD
     ) {
+
       classification +=
         " + RESTING LIQUIDITY";
     }
 
     ssl.push({
-      side: "sell_side",
-      type: "SSL",
-      price: round(group.price, 2),
-      priceLow: round(
-        group.price *
-        (1 - LEVEL_ZONE_PCT),
-        2
-      ),
-      priceHigh: round(
-        group.price *
-        (1 + LEVEL_ZONE_PCT),
-        2
-      ),
+
+      type:
+        "SSL",
+
+      side:
+        "sell_side",
+
+      price:
+        round(
+          group.price,
+          2
+        ),
+
+      priceLow:
+        round(
+          group.price *
+            (
+              1 -
+              LEVEL_ZONE_PCT
+            ),
+          2
+        ),
+
+      priceHigh:
+        round(
+          group.price *
+            (
+              1 +
+              LEVEL_ZONE_PCT
+            ),
+          2
+        ),
+
       distancePct:
         round(
           pctDistance(
@@ -1679,49 +2786,56 @@ function buildMajorLevels() {
           ),
           3
         ),
+
       importance:
         score.importance,
+
       classification,
-      score: finalScore,
+
+      score:
+        finalScore,
+
       timeframeCount:
         score.timeframeCount,
+
       intervals:
         score.intervals,
+
       equalCount:
         score.equalCount,
+
       reactionCount:
         score.reactions,
+
       restingBuyUsd:
         round(
           resting.totalUsd,
           2
         ),
+
       strongestRestingBuyUsd:
         round(
           resting.strongestUsd,
           2
         ),
+
       strongestRestingBuyPrice:
         resting.strongestPrice,
+
       restingLevels:
-        resting.levels.length
+        resting.levelCount
     });
   }
 
   /*
-     Only keep levels that have enough structural
-     evidence. This is the main noise filter.
+     Sort by structural importance.
   */
-
   const importantBSL =
     bsl
-      .filter(
-        x =>
-          x.score >= 45
-      )
       .sort(
         (a, b) =>
-          b.score - a.score
+          b.score -
+          a.score
       )
       .slice(
         0,
@@ -1730,13 +2844,10 @@ function buildMajorLevels() {
 
   const importantSSL =
     ssl
-      .filter(
-        x =>
-          x.score >= 45
-      )
       .sort(
         (a, b) =>
-          b.score - a.score
+          b.score -
+          a.score
       )
       .slice(
         0,
@@ -1744,55 +2855,86 @@ function buildMajorLevels() {
       );
 
   /*
-     Resistance = BSL levels above price.
-     Support = SSL levels below price.
+     Resistance:
+     nearest BSL first.
   */
+  const resistance =
+    [...importantBSL]
+      .sort(
+        (a, b) =>
+          a.price -
+          b.price
+      );
+
+  /*
+     Support:
+     nearest SSL first.
+  */
+  const support =
+    [...importantSSL]
+      .sort(
+        (a, b) =>
+          b.price -
+          a.price
+      );
 
   return {
-    resistance:
-      [...importantBSL].sort(
-        (a, b) =>
-          a.price - b.price
-      ),
+    bsl:
+      importantBSL,
 
-    support:
-      [...importantSSL].sort(
-        (a, b) =>
-          b.price - a.price
-      ),
+    ssl:
+      importantSSL,
 
-    bsl: importantBSL,
+    resistance,
 
-    ssl: importantSSL
+    support
   };
 }
 
 /* ============================================================
-   RAW BOOK LIQUIDITY
+   RAW RESTING ORDER BOOK
    ============================================================ */
 
 function buildRawBookLiquidity() {
-  if (!currentPrice) {
+
+  if (
+    !currentPrice
+  ) {
+
     return {
-      buy: [],
-      sell: []
+      largeBids: [],
+      largeAsks: []
     };
   }
 
   const lower =
     currentPrice *
-    (1 - RANGE_PCT);
+    (
+      1 -
+      RANGE_PCT
+    );
 
   const upper =
     currentPrice *
-    (1 + RANGE_PCT);
+    (
+      1 +
+      RANGE_PCT
+    );
 
-  const buy = [];
+  const largeBids = [];
 
-  for (const [price, quantity] of bids) {
+  for (
+    const [
+      price,
+      quantity
+    ] of bids
+  ) {
+
     if (
-      price < lower ||
-      price > currentPrice
+      price <
+        lower ||
+      price >
+        currentPrice
     ) {
       continue;
     }
@@ -1804,23 +2946,48 @@ function buildRawBookLiquidity() {
       );
 
     if (
-      usd >=
+      usd <
       RAW_BOOK_MIN_USD
     ) {
-      buy.push({
-        price: round(price, 2),
-        quantity: round(quantity, 6),
-        usd: round(usd, 2)
-      });
+      continue;
     }
+
+    largeBids.push({
+
+      price:
+        round(
+          price,
+          2
+        ),
+
+      quantity:
+        round(
+          quantity,
+          6
+        ),
+
+      usd:
+        round(
+          usd,
+          2
+        )
+    });
   }
 
-  const sell = [];
+  const largeAsks = [];
 
-  for (const [price, quantity] of asks) {
+  for (
+    const [
+      price,
+      quantity
+    ] of asks
+  ) {
+
     if (
-      price > upper ||
-      price < currentPrice
+      price >
+        upper ||
+      price <
+        currentPrice
     ) {
       continue;
     }
@@ -1832,79 +2999,112 @@ function buildRawBookLiquidity() {
       );
 
     if (
-      usd >=
+      usd <
       RAW_BOOK_MIN_USD
     ) {
-      sell.push({
-        price: round(price, 2),
-        quantity: round(quantity, 6),
-        usd: round(usd, 2)
-      });
+      continue;
     }
+
+    largeAsks.push({
+
+      price:
+        round(
+          price,
+          2
+        ),
+
+      quantity:
+        round(
+          quantity,
+          6
+        ),
+
+      usd:
+        round(
+          usd,
+          2
+        )
+    });
   }
 
-  buy.sort(
+  largeBids.sort(
     (a, b) =>
-      b.usd - a.usd
+      b.usd -
+      a.usd
   );
 
-  sell.sort(
+  largeAsks.sort(
     (a, b) =>
-      b.usd - a.usd
+      b.usd -
+      a.usd
   );
 
   return {
-    buy: buy.slice(0, 50),
-    sell: sell.slice(0, 50)
+
+    largeBids:
+      largeBids.slice(
+        0,
+        50
+      ),
+
+    largeAsks:
+      largeAsks.slice(
+        0,
+        50
+      )
   };
 }
 
 /* ============================================================
-   BUILD LIQUIDITY MAP
+   LIQUIDITY MAP
    ============================================================ */
 
 function buildLiquidityMap() {
-  const bookPrice =
+
+  const bookMid =
     getBookMid();
 
-  if (bookPrice) {
-    currentPrice = bookPrice;
+  if (
+    bookMid
+  ) {
+    currentPrice =
+      bookMid;
   }
 
-  const structure =
+  const majorLevels =
     buildMajorLevels();
 
-  const raw =
+  const rawBook =
     buildRawBookLiquidity();
 
   const nearestBSL =
-    [...structure.bsl]
-      .filter(
-        x =>
-          x.price >
-          currentPrice
-      )
+    [...majorLevels.bsl]
       .sort(
         (a, b) =>
-          a.price - b.price
+          a.price -
+          b.price
       )
-      .slice(0, 3);
+      .slice(
+        0,
+        3
+      );
 
   const nearestSSL =
-    [...structure.ssl]
-      .filter(
-        x =>
-          x.price <
-          currentPrice
-      )
+    [...majorLevels.ssl]
       .sort(
         (a, b) =>
-          b.price - a.price
+          b.price -
+          a.price
       )
-      .slice(0, 3);
+      .slice(
+        0,
+        3
+      );
 
   return {
-    symbol: SYMBOL,
+
+    symbol:
+      SYMBOL,
 
     currentPrice:
       currentPrice
@@ -1914,44 +3114,57 @@ function buildLiquidityMap() {
           )
         : null,
 
+    /*
+       THIS IS NOW THE PRIMARY OUTPUT.
+    */
     marketStructure: {
-      majorResistance:
-        structure.resistance,
-
-      majorSupport:
-        structure.support,
 
       buySideLiquidity:
-        structure.bsl,
+        majorLevels.bsl,
 
       sellSideLiquidity:
-        structure.ssl,
+        majorLevels.ssl,
+
+      majorResistance:
+        majorLevels.resistance,
+
+      majorSupport:
+        majorLevels.support,
 
       nearestBSL,
 
       nearestSSL
     },
 
+    /*
+       This remains available for diagnostics,
+       but should NOT be interpreted as major
+       support/resistance by itself.
+    */
     rawRestingLiquidity: {
+
       largeBids:
-        raw.buy,
+        rawBook.largeBids,
 
       largeAsks:
-        raw.sell
+        rawBook.largeAsks
     },
 
     settings: {
-      timeframes:
-        Object.keys(STRUCTURE),
+
+      structureTimeframes:
+        Object.keys(
+          STRUCTURE
+        ),
 
       levelZonePct:
         LEVEL_ZONE_PCT,
 
-      touchTolerancePct:
-        TOUCH_TOLERANCE_PCT,
+      equalHighLowTolerance:
+        "timeframe dependent",
 
-      reactionMovePct:
-        REACTION_MOVE_PCT,
+      minMajorLevelScore:
+        MIN_MAJOR_LEVEL_SCORE,
 
       minStructuralRestingUsd:
         MIN_STRUCTURAL_RESTING_USD,
@@ -1964,6 +3177,7 @@ function buildLiquidityMap() {
     },
 
     structureStats: {
+
       candles15m:
         candles["15m"].length,
 
@@ -1987,15 +3201,20 @@ function buildLiquidityMap() {
     },
 
     book: {
+
       initialized,
+
       bidLevels:
         bids.size,
+
       askLevels:
         asks.size,
+
       lastUpdateId
     },
 
     sync: {
+
       status:
         initialized
           ? (
@@ -2006,10 +3225,13 @@ function buildLiquidityMap() {
           : "syncing",
 
       gapRecovery,
+
       gapDetected,
+
       gapCount,
 
       lastGapLocal,
+
       lastGapIncoming,
 
       pendingEvents:
@@ -2022,20 +3244,27 @@ function buildLiquidityMap() {
     },
 
     connections: {
+
       depthWebSocket:
-        depthWs &&
-        depthWs.readyState ===
-          WebSocket.OPEN,
+        Boolean(
+          depthWs &&
+          depthWs.readyState ===
+            WebSocket.OPEN
+        ),
 
       snapshotWebSocket:
-        snapshotWs &&
-        snapshotWs.readyState ===
-          WebSocket.OPEN,
+        Boolean(
+          snapshotWs &&
+          snapshotWs.readyState ===
+            WebSocket.OPEN
+        ),
 
       klineWebSocket:
-        klineWs &&
-        klineWs.readyState ===
-          WebSocket.OPEN
+        Boolean(
+          klineWs &&
+          klineWs.readyState ===
+            WebSocket.OPEN
+        )
     },
 
     updatedAt:
@@ -2050,10 +3279,14 @@ function buildLiquidityMap() {
 app.get(
   "/health",
   (req, res) => {
-    res.json({
-      ok: true,
 
-      symbol: SYMBOL,
+    res.json({
+
+      ok:
+        true,
+
+      symbol:
+        SYMBOL,
 
       status:
         initialized
@@ -2071,19 +3304,25 @@ app.get(
       snapshotPending,
 
       depthConnected:
-        depthWs &&
-        depthWs.readyState ===
-          WebSocket.OPEN,
+        Boolean(
+          depthWs &&
+          depthWs.readyState ===
+            WebSocket.OPEN
+        ),
 
       snapshotConnected:
-        snapshotWs &&
-        snapshotWs.readyState ===
-          WebSocket.OPEN,
+        Boolean(
+          snapshotWs &&
+          snapshotWs.readyState ===
+            WebSocket.OPEN
+        ),
 
       klineConnected:
-        klineWs &&
-        klineWs.readyState ===
-          WebSocket.OPEN,
+        Boolean(
+          klineWs &&
+          klineWs.readyState ===
+            WebSocket.OPEN
+        ),
 
       currentPrice,
 
@@ -2097,9 +3336,6 @@ app.get(
         pendingDepthEvents.length,
 
       lastUpdateId,
-
-      resyncs:
-        snapshotRequests,
 
       snapshotRequests,
 
@@ -2124,6 +3360,7 @@ app.get(
       lastSnapshotId,
 
       structure: {
+
         candles15m:
           candles["15m"].length,
 
@@ -2159,6 +3396,7 @@ app.get(
 app.get(
   "/liquidity",
   (req, res) => {
+
     res.json(
       buildLiquidityMap()
     );
@@ -2172,24 +3410,35 @@ app.get(
 app.get(
   "/book",
   (req, res) => {
+
     const bidLevels =
       [...bids.entries()]
         .sort(
           (a, b) =>
-            b[0] - a[0]
+            b[0] -
+            a[0]
         )
-        .slice(0, 100);
+        .slice(
+          0,
+          100
+        );
 
     const askLevels =
       [...asks.entries()]
         .sort(
           (a, b) =>
-            a[0] - b[0]
+            a[0] -
+            b[0]
         )
-        .slice(0, 100);
+        .slice(
+          0,
+          100
+        );
 
     res.json({
-      symbol: SYMBOL,
+
+      symbol:
+        SYMBOL,
 
       currentPrice:
         currentPrice
@@ -2201,9 +3450,15 @@ app.get(
 
       bids:
         bidLevels.map(
-          ([price, quantity]) => ({
+          ([
             price,
+            quantity
+          ]) => ({
+
+            price,
+
             quantity,
+
             usd:
               round(
                 usdValue(
@@ -2217,9 +3472,15 @@ app.get(
 
       asks:
         askLevels.map(
-          ([price, quantity]) => ({
+          ([
             price,
+            quantity
+          ]) => ({
+
+            price,
+
             quantity,
+
             usd:
               round(
                 usdValue(
@@ -2248,11 +3509,17 @@ app.get(
 app.get(
   "/",
   (req, res) => {
+
     res.json({
-      ok: true,
+
+      ok:
+        true,
+
       service:
         "Binance Futures Major Liquidity Relay",
-      symbol: SYMBOL,
+
+      symbol:
+        SYMBOL,
 
       endpoints: [
         "/health",
@@ -2260,158 +3527,33 @@ app.get(
         "/book"
       ],
 
-      description:
-        "Major swing structure + BSL/SSL + current resting liquidity"
+      primaryEngine:
+        "Market Structure + BSL/SSL",
+
+      secondaryEngine:
+        "Resting Order Book Liquidity"
     });
   }
 );
 
 /* ============================================================
-   PATCH SNAPSHOT MESSAGE HANDLER
-   ============================================================ */
-
-/*
-   We need to intercept historical kline responses
-   without disturbing depth snapshot responses.
-
-   Wrap the original message handler behavior by replacing
-   the snapshot message listener below.
-*/
-
-function attachSnapshotMessageHandler() {
-  if (!snapshotWs) return;
-
-  snapshotWs.removeAllListeners("message");
-
-  snapshotWs.on("message", raw => {
-    try {
-      const message =
-        JSON.parse(
-          raw.toString()
-        );
-
-      if (
-        handleHistoricalKlineResponse(
-          message
-        )
-      ) {
-        return;
-      }
-
-      if (
-        message.status === 429 ||
-        (
-          message.error &&
-          (
-            message.error.code === -1003 ||
-            message.error.code === 429
-          )
-        )
-      ) {
-        snapshot429s++;
-        snapshotPending = false;
-
-        lastSnapshotError =
-          message.error?.msg ||
-          "Snapshot rate limit";
-
-        scheduleSnapshotRecovery();
-
-        return;
-      }
-
-      if (
-        message.status === 200 &&
-        message.result &&
-        message.result.lastUpdateId !==
-          undefined
-      ) {
-        installSnapshot(
-          message.result
-        );
-
-        return;
-      }
-
-      if (message.error) {
-        snapshotPending = false;
-
-        lastSnapshotError =
-          message.error.msg ||
-          "Snapshot API error";
-
-        scheduleSnapshotRecovery();
-      }
-
-    } catch (error) {
-      lastSnapshotError =
-        error.message;
-    }
-  });
-}
-
-/* ============================================================
-   OVERRIDE SNAPSHOT CONNECTION
-   ============================================================ */
-
-function connectSnapshotWebSocketFinal() {
-  if (snapshotWs) {
-    try {
-      snapshotWs.close();
-    } catch (e) {}
-  }
-
-  snapshotWs =
-    new WebSocket(WS_API);
-
-  snapshotWs.on("open", () => {
-
-    attachSnapshotMessageHandler();
-
-    /*
-       Request order-book snapshot.
-    */
-    requestSnapshot(
-      "snapshot-connected"
-    );
-
-    /*
-       Request structural candle history.
-       Four requests only at startup/reconnect.
-    */
-
-    setTimeout(() => {
-      requestHistoricalKlines("15m");
-      requestHistoricalKlines("1h");
-      requestHistoricalKlines("4h");
-      requestHistoricalKlines("1d");
-    }, 1000);
-  });
-
-  snapshotWs.on("close", () => {
-
-    setTimeout(() => {
-      connectSnapshotWebSocketFinal();
-    }, 3000);
-  });
-
-  snapshotWs.on("error", error => {
-    console.error(
-      "Snapshot WebSocket error:",
-      error.message
-    );
-  });
-}
-
-/* ============================================================
-   START
+   START SERVER
    ============================================================ */
 
 app.listen(
   PORT,
   () => {
+
     console.log(
-      `Binance Futures Major Liquidity Relay running on port ${PORT}`
+      "================================================"
+    );
+
+    console.log(
+      "BINANCE FUTURES MAJOR LIQUIDITY RELAY"
+    );
+
+    console.log(
+      "================================================"
     );
 
     console.log(
@@ -2419,27 +3561,38 @@ app.listen(
     );
 
     console.log(
+      `Port: ${PORT}`
+    );
+
+    console.log(
       "Structure: 15m / 1h / 4h / 1D"
     );
 
     console.log(
-      "Mode: Major Swing + BSL/SSL + Resting Liquidity"
+      "Primary: Swing High/Low + Equal High/Low"
+    );
+
+    console.log(
+      "Secondary: Resting Bids/Asks"
+    );
+
+    console.log(
+      "================================================"
     );
   }
 );
 
-/*
-   Start market streams.
-*/
+/* ============================================================
+   START CONNECTIONS
+   ============================================================ */
 
 connectDepthWebSocket();
 
 connectKlineWebSocket();
 
-/*
-   Snapshot/API WebSocket is deliberately started separately.
-*/
-
-setTimeout(() => {
-  connectSnapshotWebSocketFinal();
-}, 500);
+setTimeout(
+  () => {
+    connectSnapshotWebSocket();
+  },
+  500
+);
