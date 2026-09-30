@@ -9,13 +9,13 @@ const SYMBOL = 'BTCUSDT';
 
 const SPOT_API = 'https://data-api.binance.vision';
 
-const FUTURES_DEPTH_WS =
+const DEPTH_WS =
   'wss://fstream.binance.com/ws/btcusdt@depth@100ms';
 
-const FUTURES_KLINE_WS =
+const KLINE_WS =
   'wss://fstream.binance.com/stream?streams=btcusdt@kline_15m/btcusdt@kline_1h/btcusdt@kline_4h/btcusdt@kline_1d';
 
-const FUTURES_SNAPSHOT_WS =
+const SNAPSHOT_WS =
   'wss://ws-fapi.binance.com/ws-fapi/v1';
 
 /* ============================================================
@@ -27,67 +27,65 @@ const STRUCTURE = {
     interval: '15m',
     weight: 1,
     candles: 300,
-    pivotLeft: 3,
-    pivotRight: 3,
-    equalTolerancePct: 0.0015
+    left: 3,
+    right: 3,
+    eq: 0.0015
   },
 
   '1h': {
     interval: '1h',
     weight: 2,
     candles: 300,
-    pivotLeft: 4,
-    pivotRight: 4,
-    equalTolerancePct: 0.0015
+    left: 4,
+    right: 4,
+    eq: 0.0015
   },
 
   '4h': {
     interval: '4h',
     weight: 3,
     candles: 250,
-    pivotLeft: 5,
-    pivotRight: 5,
-    equalTolerancePct: 0.002
+    left: 5,
+    right: 5,
+    eq: 0.0020
   },
 
   '1d': {
     interval: '1d',
     weight: 4,
     candles: 180,
-    pivotLeft: 5,
-    pivotRight: 5,
-    equalTolerancePct: 0.0025
+    left: 5,
+    right: 5,
+    eq: 0.0025
   }
 };
 
 /* ============================================================
-   LIQUIDITY INTELLIGENCE SETTINGS
+   LIQUIDITY SETTINGS
 ============================================================ */
 
 const SETTINGS = {
-  rawBookMinUsd: 50000,
-
-  restingConfirmUsd: 250000,
+  rawMinUsd: 50000,
 
   restingRadiusUsd: 35,
 
-  levelZonePct: 0.0015,
+  restingConfirmUsd: 250000,
 
-  mergeDistanceUsd: 35,
+  mergeUsd: 35,
 
-  reactionMovePct: 0.003,
+  zonePct: 0.0015,
 
-  minMajorScore: 40,
+  reactionPct: 0.003,
 
-  maxMajorLevels: 8,
+  minScore: 40,
 
-  intelligenceLevels: 5,
+  maxLevels: 8,
 
-  orderClusterGapUsd: 35,
+  orderGapUsd: 35,
 
-  orderClusterMinUsd: 500000,
+  orderMinUsd: 500000,
 
-  sweepLookbackMs: 15 * 60 * 1000
+  sweepMs: 15 * 60 * 1000
 };
 
 /* ============================================================
@@ -114,11 +112,19 @@ const structure = {
   levels: []
 };
 
+/* ============================================================
+   STATE
+============================================================ */
+
 const state = {
   currentPrice: null,
 
+  priceSource: null,
+
   depthConnected: false,
+
   snapshotConnected: false,
+
   klinesConnected: false,
 
   bookInitialized: false,
@@ -127,88 +133,85 @@ const state = {
 
   pendingEvents: [],
 
-  gapRecovery: false,
   gapDetected: false,
+
+  gapRecovery: false,
+
   gapCount: 0,
 
   lastGapLocal: null,
+
   lastGapIncoming: null,
 
   snapshotId: null,
+
   snapshotRequests: 0,
+
   snapshot429s: 0,
 
   snapshotLastStatus: null,
+
   snapshotLastError: null,
+
   lastSnapshotResponse: null,
 
   updatedAt: null,
 
-  candleStats: {
-    '15m': {
-      requests: 0,
-      success: 0,
-      errors: 0
-    },
-
-    '1h': {
-      requests: 0,
-      success: 0,
-      errors: 0
-    },
-
-    '4h': {
-      requests: 0,
-      success: 0,
-      errors: 0
-    },
-
-    '1d': {
-      requests: 0,
-      success: 0,
-      errors: 0
-    }
-  },
-
-  candleLastStatus: null,
-  candleLastError: null,
-
   lastDepthMessage: null,
+
   lastKlineMessage: null,
 
-  sweepEvents: []
+  sweeps: [],
+
+  candleStats: Object.fromEntries(
+    Object.keys(STRUCTURE).map(tf => [
+      tf,
+      {
+        requests: 0,
+        success: 0,
+        errors: 0
+      }
+    ])
+  )
 };
 
 /* ============================================================
    HELPERS
 ============================================================ */
 
-function now() {
-  return Date.now();
+function round(value, decimals = 2) {
+  return Number(
+    Number(value).toFixed(decimals)
+  );
 }
 
-function pctDistance(price, current) {
+function pct(price, current) {
   if (!current) return null;
 
-  return ((price - current) / current) * 100;
+  return (
+    ((price - current) / current) *
+    100
+  );
 }
 
-function round(value, decimals = 2) {
-  return Number(Number(value).toFixed(decimals));
+function iso() {
+  return new Date().toISOString();
 }
 
 /* ============================================================
-   HTTP
+   HTTP JSON
 ============================================================ */
 
 async function getJson(url) {
   const response = await fetch(url, {
     headers: {
-      'User-Agent': 'Binance-Major-Liquidity-Relay/1.0'
+      'User-Agent':
+        'Binance-Major-Liquidity-Relay/1.0'
     }
   });
 
-  const text = await response.text();
+  const text =
+    await response.text();
 
   let data;
 
@@ -222,7 +225,9 @@ async function getJson(url) {
 
   if (!response.ok) {
     throw new Error(
-      `HTTP ${response.status}: ${JSON.stringify(data).slice(0, 500)}`
+      `HTTP ${response.status}: ${JSON.stringify(
+        data
+      ).slice(0, 500)}`
     );
   }
 
@@ -230,10 +235,10 @@ async function getJson(url) {
 }
 
 /* ============================================================
-   CANDLE CONVERSION
+   CANDLE
 ============================================================ */
 
-function candleFromArray(row) {
+function arrayToCandle(row) {
   return {
     openTime: Number(row[0]),
     open: Number(row[1]),
@@ -246,11 +251,15 @@ function candleFromArray(row) {
 }
 
 /* ============================================================
-   HISTORICAL SPOT CANDLES
+   LOAD HISTORICAL CANDLES
 ============================================================ */
 
-async function loadHistoricalCandles() {
-  for (const [tf, cfg] of Object.entries(STRUCTURE)) {
+async function loadHistory() {
+  for (
+    const [tf, cfg] of Object.entries(
+      STRUCTURE
+    )
+  ) {
     state.candleStats[tf].requests += 1;
 
     try {
@@ -260,26 +269,17 @@ async function loadHistoricalCandles() {
         `&interval=${cfg.interval}` +
         `&limit=${cfg.candles}`;
 
-      const data = await getJson(url);
+      const data =
+        await getJson(url);
 
-      candles[tf] = Array.isArray(data)
-        ? data.map(candleFromArray)
-        : [];
+      candles[tf] =
+        Array.isArray(data)
+          ? data.map(arrayToCandle)
+          : [];
 
       state.candleStats[tf].success += 1;
-
-      state.candleLastStatus = 200;
-      state.candleLastError = null;
     } catch (error) {
       state.candleStats[tf].errors += 1;
-
-      const match =
-        String(error.message).match(/HTTP (\d+)/);
-
-      state.candleLastStatus =
-        match ? Number(match[1]) : null;
-
-      state.candleLastError = error.message;
     }
   }
 
@@ -287,25 +287,34 @@ async function loadHistoricalCandles() {
 }
 
 /* ============================================================
-   PIVOT DETECTION
+   PIVOTS
 ============================================================ */
 
-function isPivotHigh(data, i, left, right) {
+function pivotHigh(
+  data,
+  index,
+  left,
+  right
+) {
   if (
-    i < left ||
-    i + right >= data.length
+    index < left ||
+    index + right >= data.length
   ) {
     return false;
   }
 
-  const high = data[i].high;
+  const price =
+    data[index].high;
 
   for (
-    let j = i - left;
-    j <= i + right;
-    j++
+    let i = index - left;
+    i <= index + right;
+    i++
   ) {
-    if (j !== i && data[j].high >= high) {
+    if (
+      i !== index &&
+      data[i].high >= price
+    ) {
       return false;
     }
   }
@@ -313,22 +322,31 @@ function isPivotHigh(data, i, left, right) {
   return true;
 }
 
-function isPivotLow(data, i, left, right) {
+function pivotLow(
+  data,
+  index,
+  left,
+  right
+) {
   if (
-    i < left ||
-    i + right >= data.length
+    index < left ||
+    index + right >= data.length
   ) {
     return false;
   }
 
-  const low = data[i].low;
+  const price =
+    data[index].low;
 
   for (
-    let j = i - left;
-    j <= i + right;
-    j++
+    let i = index - left;
+    i <= index + right;
+    i++
   ) {
-    if (j !== i && data[j].low <= low) {
+    if (
+      i !== index &&
+      data[i].low <= price
+    ) {
       return false;
     }
   }
@@ -344,17 +362,25 @@ function reactionCount(
   data,
   price,
   side,
-  tolerancePct
+  tolerance
 ) {
-  let reactions = 0;
+  let count = 0;
 
-  for (let i = 1; i < data.length; i++) {
+  for (
+    let i = 1;
+    i < data.length;
+    i++
+  ) {
     const candle = data[i];
 
     const near =
       side === 'BSL'
-        ? Math.abs(candle.high - price) / price <= tolerancePct
-        : Math.abs(candle.low - price) / price <= tolerancePct;
+        ? Math.abs(
+            candle.high - price
+          ) / price <= tolerance
+        : Math.abs(
+            candle.low - price
+          ) / price <= tolerance;
 
     if (!near) continue;
 
@@ -369,60 +395,61 @@ function reactionCount(
     const base =
       side === 'BSL'
         ? Math.max(
-            ...previous.map(x => x.high)
+            ...previous.map(
+              x => x.high
+            )
           )
         : Math.min(
-            ...previous.map(x => x.low)
+            ...previous.map(
+              x => x.low
+            )
           );
 
     const move =
       side === 'BSL'
-        ? (base - candle.close) / price
-        : (candle.close - base) / price;
+        ? (base - candle.close) /
+          price
+        : (candle.close - base) /
+          price;
 
-    if (move >= SETTINGS.reactionMovePct) {
-      reactions += 1;
+    if (
+      move >=
+      SETTINGS.reactionPct
+    ) {
+      count += 1;
     }
   }
 
-  return reactions;
+  return count;
 }
 
 /* ============================================================
-   BUILD TIMEFRAME STRUCTURE
+   TIMEFRAME STRUCTURE
 ============================================================ */
 
-function buildTfStructure(tf) {
-  const cfg = STRUCTURE[tf];
-  const data = candles[tf];
+function timeframePoints(tf) {
+  const cfg =
+    STRUCTURE[tf];
+
+  const data =
+    candles[tf];
 
   const highs = [];
   const lows = [];
 
-  if (
-    !data ||
-    data.length <
-      cfg.pivotLeft +
-        cfg.pivotRight +
-        5
-  ) {
-    return {
-      highs,
-      lows
-    };
-  }
-
   for (
-    let i = cfg.pivotLeft;
-    i < data.length - cfg.pivotRight;
+    let i = cfg.left;
+    i <
+      data.length -
+        cfg.right;
     i++
   ) {
     if (
-      isPivotHigh(
+      pivotHigh(
         data,
         i,
-        cfg.pivotLeft,
-        cfg.pivotRight
+        cfg.left,
+        cfg.right
       )
     ) {
       highs.push({
@@ -433,11 +460,11 @@ function buildTfStructure(tf) {
     }
 
     if (
-      isPivotLow(
+      pivotLow(
         data,
         i,
-        cfg.pivotLeft,
-        cfg.pivotRight
+        cfg.left,
+        cfg.right
       )
     ) {
       lows.push({
@@ -455,184 +482,233 @@ function buildTfStructure(tf) {
 }
 
 /* ============================================================
-   EQUAL HIGH / LOW DETECTION
+   EQUAL LEVELS
 ============================================================ */
 
-function findEqualLevels(
+function equalLevels(
   points,
-  tolerancePct,
+  tolerance,
   side
 ) {
-  const out = [];
+  const output = [];
 
-  for (let i = 0; i < points.length; i++) {
-    const cluster = [points[i]];
+  for (
+    let i = 0;
+    i < points.length;
+    i++
+  ) {
+    const cluster = [
+      points[i]
+    ];
 
     for (
       let j = i + 1;
       j < points.length;
       j++
     ) {
-      const reference =
+      const average =
         cluster.reduce(
-          (sum, p) => sum + p.price,
+          (sum, item) =>
+            sum + item.price,
           0
-        ) / cluster.length;
+        ) /
+        cluster.length;
 
       if (
         Math.abs(
-          points[j].price - reference
+          points[j].price -
+            average
         ) /
-          reference <=
-        tolerancePct
+          average <=
+        tolerance
       ) {
-        cluster.push(points[j]);
+        cluster.push(
+          points[j]
+        );
       }
     }
 
-    if (cluster.length >= 2) {
-      const average =
-        cluster.reduce(
-          (sum, p) => sum + p.price,
-          0
-        ) / cluster.length;
-
-      out.push({
+    if (
+      cluster.length >= 2
+    ) {
+      output.push({
         side,
-        price: average,
-        count: cluster.length,
+
+        price:
+          cluster.reduce(
+            (sum, item) =>
+              sum + item.price,
+            0
+          ) /
+          cluster.length,
+
+        count:
+          cluster.length,
+
         timeframes: [
           ...new Set(
-            cluster.map(x => x.tf)
+            cluster.map(
+              item => item.tf
+            )
           )
         ]
       });
     }
   }
 
-  return out;
+  return output;
 }
 
 /* ============================================================
-   MERGE STRUCTURAL POINTS
+   MERGE STRUCTURAL LEVELS
 ============================================================ */
 
-function mergeStructuralPoints(
-  allPoints,
+function mergePoints(
+  points,
   side
 ) {
-  const sorted = [...allPoints].sort(
-    (a, b) => a.price - b.price
-  );
-
-  const clusters = [];
-
-  for (const point of sorted) {
-    const existing = clusters.find(
-      cluster =>
-        Math.abs(
-          point.price - cluster.price
-        ) <=
-        Math.max(
-          SETTINGS.mergeDistanceUsd,
-          cluster.price *
-            SETTINGS.levelZonePct
-        )
+  const sorted =
+    [...points].sort(
+      (a, b) =>
+        a.price - b.price
     );
 
-    if (existing) {
-      existing.points.push(point);
+  const groups = [];
 
-      existing.price =
-        existing.points.reduce(
-          (sum, p) => sum + p.price,
+  for (const point of sorted) {
+    const last =
+      groups[
+        groups.length - 1
+      ];
+
+    if (
+      last &&
+      Math.abs(
+        point.price -
+          last.priceHigh
+      ) <=
+        Math.max(
+          SETTINGS.mergeUsd,
+          last.price *
+            SETTINGS.zonePct
+        )
+    ) {
+      last.points.push(
+        point
+      );
+
+      last.price =
+        last.points.reduce(
+          (sum, x) =>
+            sum + x.price,
           0
         ) /
-        existing.points.length;
+        last.points.length;
+
+      last.priceLow =
+        Math.min(
+          last.priceLow,
+          point.price
+        );
+
+      last.priceHigh =
+        Math.max(
+          last.priceHigh,
+          point.price
+        );
     } else {
-      clusters.push({
+      groups.push({
         price: point.price,
+
+        priceLow:
+          point.price,
+
+        priceHigh:
+          point.price,
+
         points: [point]
       });
     }
   }
 
-  return clusters.map(cluster => {
-    const timeframes = [
-      ...new Set(
-        cluster.points.map(
-          point => point.tf
+  return groups.map(
+    group => {
+      const timeframes = [
+        ...new Set(
+          group.points.map(
+            x => x.tf
+          )
         )
-      )
-    ];
+      ];
 
-    const equalCount =
-      cluster.points.reduce(
-        (sum, point) =>
-          sum +
-          (point.equalCount || 1),
-        0
-      );
+      const equalCount =
+        Math.max(
+          ...group.points.map(
+            x =>
+              x.equalCount ||
+              1
+          )
+        );
 
-    const reactions =
-      cluster.points.reduce(
-        (sum, point) =>
-          sum +
-          (point.reactions || 0),
-        0
-      );
+      const reactions =
+        Math.max(
+          ...group.points.map(
+            x =>
+              x.reactions ||
+              0
+          )
+        );
 
-    const timeframeScore =
-      timeframes.reduce(
-        (sum, tf) =>
-          sum + STRUCTURE[tf].weight,
-        0
-      );
+      const timeframeScore =
+        timeframes.reduce(
+          (sum, tf) =>
+            sum +
+            STRUCTURE[tf]
+              .weight,
+          0
+        );
 
-    const score = Math.round(
-      timeframeScore * 10 +
-        Math.min(equalCount, 12) * 5 +
-        Math.min(reactions, 30) * 2
-    );
+      const score =
+        Math.round(
+          timeframeScore * 10 +
+          Math.min(
+            equalCount,
+            30
+          ) *
+            5 +
+          Math.min(
+            reactions,
+            40
+          ) *
+            2
+        );
 
-    const prices =
-      cluster.points.map(
-        point => point.price
-      );
+      return {
+        side,
 
-    return {
-      side,
+        price:
+          group.price,
 
-      price: cluster.price,
+        priceLow:
+          group.priceLow,
 
-      priceLow: Math.min(...prices),
+        priceHigh:
+          group.priceHigh,
 
-      priceHigh: Math.max(...prices),
+        score,
 
-      score,
+        timeframes,
 
-      timeframes,
+        equalCount,
 
-      equalCount,
+        reactions,
 
-      reactions,
+        restingUsd: 0,
 
-      restingUsd: 0,
-
-      restingLevels: [],
-
-      distancePct:
-        state.currentPrice
-          ? pctDistance(
-              cluster.price,
-              state.currentPrice
-            )
-          : null,
-
-      source:
-        'spot_structure+futures_liquidity'
-    };
-  });
+        restingLevels: []
+      };
+    }
+  );
 }
 
 /* ============================================================
@@ -640,78 +716,66 @@ function mergeStructuralPoints(
 ============================================================ */
 
 function rebuildStructure() {
-  const allHighs = [];
-  const allLows = [];
+  const highs = [];
+  const lows = [];
 
   const equalHighs = [];
   const equalLows = [];
 
-  for (const tf of Object.keys(STRUCTURE)) {
-    const tfStructure =
-      buildTfStructure(tf);
+  for (
+    const tf of Object.keys(
+      STRUCTURE
+    )
+  ) {
+    const points =
+      timeframePoints(tf);
 
-    allHighs.push(
-      ...tfStructure.highs
+    highs.push(
+      ...points.highs
     );
 
-    allLows.push(
-      ...tfStructure.lows
+    lows.push(
+      ...points.lows
     );
-
-    const cfg = STRUCTURE[tf];
-
-    const eh =
-      findEqualLevels(
-        tfStructure.highs,
-        cfg.equalTolerancePct,
-        'BSL'
-      );
-
-    const el =
-      findEqualLevels(
-        tfStructure.lows,
-        cfg.equalTolerancePct,
-        'SSL'
-      );
 
     equalHighs.push(
-      ...eh.map(x => ({
-        ...x,
-        tf
-      }))
+      ...equalLevels(
+        points.highs,
+        STRUCTURE[tf].eq,
+        'BSL'
+      )
     );
 
     equalLows.push(
-      ...el.map(x => ({
-        ...x,
-        tf
-      }))
+      ...equalLevels(
+        points.lows,
+        STRUCTURE[tf].eq,
+        'SSL'
+      )
     );
   }
 
-  const highsWithMetrics =
-    allHighs.map(point => ({
+  const highMetrics =
+    highs.map(point => ({
       ...point,
 
       equalCount:
-        equalHighs
-          .filter(
-            level =>
-              Math.abs(
-                level.price -
-                  point.price
-              ) /
-                point.price <=
-              0.003
-          )
-          .reduce(
-            (max, level) =>
-              Math.max(
-                max,
-                level.count
-              ),
-            1
-          ),
+        Math.max(
+          1,
+          ...equalHighs
+            .filter(
+              x =>
+                Math.abs(
+                  x.price -
+                    point.price
+                ) /
+                  point.price <=
+                0.003
+            )
+            .map(
+              x => x.count
+            )
+        ),
 
       reactions:
         reactionCount(
@@ -720,33 +784,31 @@ function rebuildStructure() {
           'BSL',
           STRUCTURE[
             point.tf
-          ].equalTolerancePct
+          ].eq
         )
     }));
 
-  const lowsWithMetrics =
-    allLows.map(point => ({
+  const lowMetrics =
+    lows.map(point => ({
       ...point,
 
       equalCount:
-        equalLows
-          .filter(
-            level =>
-              Math.abs(
-                level.price -
-                  point.price
-              ) /
-                point.price <=
-              0.003
-          )
-          .reduce(
-            (max, level) =>
-              Math.max(
-                max,
-                level.count
-              ),
-            1
-          ),
+        Math.max(
+          1,
+          ...equalLows
+            .filter(
+              x =>
+                Math.abs(
+                  x.price -
+                    point.price
+                ) /
+                  point.price <=
+                0.003
+            )
+            .map(
+              x => x.count
+            )
+        ),
 
       reactions:
         reactionCount(
@@ -755,15 +817,15 @@ function rebuildStructure() {
           'SSL',
           STRUCTURE[
             point.tf
-          ].equalTolerancePct
+          ].eq
         )
     }));
 
   structure.swingHighs =
-    highsWithMetrics;
+    highMetrics;
 
   structure.swingLows =
-    lowsWithMetrics;
+    lowMetrics;
 
   structure.equalHighs =
     equalHighs;
@@ -772,25 +834,25 @@ function rebuildStructure() {
     equalLows;
 
   structure.levels = [
-    ...mergeStructuralPoints(
-      highsWithMetrics,
+    ...mergePoints(
+      highMetrics,
       'BSL'
     ),
 
-    ...mergeStructuralPoints(
-      lowsWithMetrics,
+    ...mergePoints(
+      lowMetrics,
       'SSL'
     )
   ];
 
-  applyRestingLiquidity();
+  applyResting();
 }
 
 /* ============================================================
-   ORDER BOOK
+   ORDER BOOK ROWS
 ============================================================ */
 
-function getBookRows(side) {
+function bookRows(side) {
   const map =
     side === 'BSL'
       ? book.asks
@@ -798,41 +860,47 @@ function getBookRows(side) {
 
   const rows = [];
 
-  for (const [
-    price,
-    quantity
-  ] of map.entries()) {
-    const value =
+  for (
+    const [
+      price,
+      quantity
+    ] of map.entries()
+  ) {
+    const usd =
       Number(price) *
       Number(quantity);
 
     if (
-      value >=
-      SETTINGS.rawBookMinUsd
+      usd >=
+      SETTINGS.rawMinUsd
     ) {
       rows.push({
         price: Number(price),
-        quantity: Number(quantity),
-        usd: value
+
+        quantity:
+          Number(quantity),
+
+        usd
       });
     }
   }
 
-  rows.sort((a, b) =>
-    side === 'BSL'
-      ? a.price - b.price
-      : b.price - a.price
+  rows.sort(
+    (a, b) =>
+      side === 'BSL'
+        ? a.price - b.price
+        : b.price - a.price
   );
 
   return rows;
 }
 
 /* ============================================================
-   RESTING LIQUIDITY NEAR STRUCTURE
+   RESTING LIQUIDITY
 ============================================================ */
 
 function restingNear(
-  levelPrice,
+  price,
   side
 ) {
   const map =
@@ -844,45 +912,53 @@ function restingNear(
 
   const levels = [];
 
-  for (const [
-    priceKey,
-    quantity
-  ] of map.entries()) {
-    const price =
+  for (
+    const [
+      priceKey,
+      quantity
+    ] of map.entries()
+  ) {
+    const p =
       Number(priceKey);
 
     if (
       Math.abs(
-        price - levelPrice
+        p - price
       ) <=
       SETTINGS.restingRadiusUsd
     ) {
-      const value =
-        price *
+      const usd =
+        p *
         Number(quantity);
 
       if (
-        value >=
-        SETTINGS.rawBookMinUsd
+        usd >=
+        SETTINGS.rawMinUsd
       ) {
-        total += value;
+        total += usd;
 
         levels.push({
-          price,
-          quantity: Number(quantity),
-          usd: value
+          price: p,
+
+          quantity:
+            Number(quantity),
+
+          usd
         });
       }
     }
   }
 
   levels.sort(
-    (a, b) => b.usd - a.usd
+    (a, b) =>
+      b.usd - a.usd
   );
 
   return {
     total,
-    levels: levels.slice(0, 10)
+
+    levels:
+      levels.slice(0, 10)
   };
 }
 
@@ -890,8 +966,11 @@ function restingNear(
    APPLY ORDER BOOK CONFIRMATION
 ============================================================ */
 
-function applyRestingLiquidity() {
-  for (const level of structure.levels) {
+function applyResting() {
+  for (
+    const level of
+      structure.levels
+  ) {
     const resting =
       restingNear(
         level.price,
@@ -899,10 +978,18 @@ function applyRestingLiquidity() {
       );
 
     level.restingUsd =
-      round(resting.total, 2);
+      resting.total;
 
     level.restingLevels =
       resting.levels;
+
+    level.distancePct =
+      state.currentPrice
+        ? pct(
+            level.price,
+            state.currentPrice
+          )
+        : null;
 
     if (
       resting.total >=
@@ -911,159 +998,12 @@ function applyRestingLiquidity() {
       level.score += Math.min(
         25,
         Math.floor(
-          resting.total / 250000
+          resting.total /
+            250000
         ) * 5
       );
     }
-
-    level.distancePct =
-      state.currentPrice
-        ? round(
-            pctDistance(
-              level.price,
-              state.currentPrice
-            ),
-            3
-          )
-        : null;
   }
-}
-
-/* ============================================================
-   FILTER STRUCTURAL LEVELS
-============================================================ */
-
-function filteredLevels(side) {
-  return structure.levels
-    .filter(
-      level =>
-        level.side === side &&
-        level.score >=
-          SETTINGS.minMajorScore
-    )
-    .sort((a, b) => {
-      const distanceA =
-        state.currentPrice
-          ? Math.abs(
-              a.price -
-                state.currentPrice
-            )
-          : Infinity;
-
-      const distanceB =
-        state.currentPrice
-          ? Math.abs(
-              b.price -
-                state.currentPrice
-            )
-          : Infinity;
-
-      return distanceA - distanceB;
-    });
-}
-
-/* ============================================================
-   LEVEL CLUSTERING
-============================================================ */
-
-function clusterLevels(levels) {
-  const sorted =
-    [...levels].sort(
-      (a, b) =>
-        a.price - b.price
-    );
-
-  const result = [];
-
-  for (const level of sorted) {
-    const last =
-      result[result.length - 1];
-
-    if (
-      last &&
-      Math.abs(
-        level.price -
-          last.priceHigh
-      ) <=
-        Math.max(
-          SETTINGS.mergeDistanceUsd,
-          last.price *
-            SETTINGS.levelZonePct
-        )
-    ) {
-      last.members.push(level);
-
-      last.priceLow =
-        Math.min(
-          last.priceLow,
-          level.priceLow
-        );
-
-      last.priceHigh =
-        Math.max(
-          last.priceHigh,
-          level.priceHigh
-        );
-
-      last.price =
-        last.members.reduce(
-          (sum, x) =>
-            sum + x.price,
-          0
-        ) /
-        last.members.length;
-
-      last.score =
-        Math.max(
-          ...last.members.map(
-            x => x.score
-          )
-        );
-
-      last.equalCount =
-        Math.max(
-          ...last.members.map(
-            x => x.equalCount
-          )
-        );
-
-      last.reactions =
-        Math.max(
-          ...last.members.map(
-            x => x.reactions
-          )
-        );
-
-      last.timeframes = [
-        ...new Set(
-          last.members.flatMap(
-            x => x.timeframes
-          )
-        )
-      ];
-
-      last.restingUsd =
-        last.members.reduce(
-          (sum, x) =>
-            sum + x.restingUsd,
-          0
-        );
-    } else {
-      result.push({
-        ...level,
-
-        members: [level],
-
-        priceLow:
-          level.priceLow,
-
-        priceHigh:
-          level.priceHigh
-      });
-    }
-  }
-
-  return result;
 }
 
 /* ============================================================
@@ -1071,13 +1011,11 @@ function clusterLevels(levels) {
 ============================================================ */
 
 function strength(level) {
-  const timeframeCount =
-    level.timeframes.length;
-
   if (
     level.score >= 125 ||
     (
-      timeframeCount >= 3 &&
+      level.timeframes.length >=
+        3 &&
       level.equalCount >= 4
     )
   ) {
@@ -1086,7 +1024,8 @@ function strength(level) {
 
   if (
     level.score >= 90 ||
-    timeframeCount >= 2 ||
+    level.timeframes.length >=
+      2 ||
     level.equalCount >= 3
   ) {
     return 'MEDIUM';
@@ -1096,29 +1035,27 @@ function strength(level) {
 }
 
 /* ============================================================
-   DECORATE LEVEL
+   DECORATE
 ============================================================ */
 
-function decorateLevel(level) {
+function decorate(level) {
   return {
     side: level.side,
 
     price: round(
-      level.price,
-      2
+      level.price
     ),
 
     priceLow: round(
-      level.priceLow,
-      2
+      level.priceLow
     ),
 
     priceHigh: round(
-      level.priceHigh,
-      2
+      level.priceHigh
     ),
 
-    score: level.score,
+    score:
+      level.score,
 
     strength:
       strength(level),
@@ -1134,8 +1071,7 @@ function decorateLevel(level) {
 
     restingUsd:
       round(
-        level.restingUsd,
-        2
+        level.restingUsd
       ),
 
     restingConfirmed:
@@ -1148,7 +1084,7 @@ function decorateLevel(level) {
     distancePct:
       state.currentPrice
         ? round(
-            pctDistance(
+            pct(
               level.price,
               state.currentPrice
             ),
@@ -1159,110 +1095,251 @@ function decorateLevel(level) {
 }
 
 /* ============================================================
+   STRUCTURAL LEVELS
+============================================================ */
+
+function structural(side) {
+  return structure.levels
+    .filter(
+      level =>
+        level.side === side &&
+        level.score >=
+          SETTINGS.minScore
+    )
+    .map(decorate);
+}
+
+/* ============================================================
    ORDER BOOK CLUSTERS
 ============================================================ */
 
-function clusterBookRows(
-  rows,
-  side
-) {
-  const output = [];
+function bookClusters() {
+  function cluster(
+    rows,
+    side
+  ) {
+    const output = [];
 
-  for (const row of rows) {
-    const last =
-      output[
-        output.length - 1
-      ];
-
-    if (
-      last &&
-      Math.abs(
-        row.price -
-          last.priceHigh
-      ) <=
-        SETTINGS.orderClusterGapUsd
+    for (
+      const row of rows
     ) {
-      last.priceLow =
-        Math.min(
-          last.priceLow,
-          row.price
-        );
+      const last =
+        output[
+          output.length - 1
+        ];
 
-      last.priceHigh =
-        Math.max(
-          last.priceHigh,
-          row.price
-        );
+      if (
+        last &&
+        Math.abs(
+          row.price -
+            last.priceHigh
+        ) <=
+          SETTINGS.orderGapUsd
+      ) {
+        last.priceLow =
+          Math.min(
+            last.priceLow,
+            row.price
+          );
 
-      last.usd += row.usd;
+        last.priceHigh =
+          Math.max(
+            last.priceHigh,
+            row.price
+          );
 
-      last.levels += 1;
-    } else {
-      output.push({
-        side,
+        last.usd +=
+          row.usd;
 
-        priceLow:
-          row.price,
+        last.levels += 1;
+      } else {
+        output.push({
+          side,
 
-        priceHigh:
-          row.price,
+          priceLow:
+            row.price,
+
+          priceHigh:
+            row.price,
+
+          midpoint:
+            row.price,
+
+          usd:
+            row.usd,
+
+          levels: 1
+        });
+      }
+    }
+
+    return output
+      .filter(
+        x =>
+          x.usd >=
+          SETTINGS.orderMinUsd
+      )
+      .map(x => ({
+        ...x,
 
         midpoint:
-          row.price,
+          round(
+            (
+              x.priceLow +
+              x.priceHigh
+            ) / 2
+          ),
 
         usd:
-          row.usd,
-
-        levels: 1
-      });
-    }
+          round(
+            x.usd
+          )
+      }));
   }
 
-  return output
-    .filter(
-      x =>
-        x.usd >=
-        SETTINGS.orderClusterMinUsd
-    )
-    .map(x => ({
-      ...x,
-
-      midpoint: round(
-        (
-          x.priceLow +
-          x.priceHigh
-        ) / 2,
-        2
-      ),
-
-      usd: round(
-        x.usd,
-        2
-      )
-    }));
-}
-
-function orderBookClusters() {
-  const bids =
-    clusterBookRows(
-      getBookRows('SSL'),
-      'bid'
-    );
-
-  const asks =
-    clusterBookRows(
-      getBookRows('BSL'),
-      'ask'
-    );
-
   return {
-    bids: bids.slice(0, 5),
-    asks: asks.slice(0, 5)
+    bids: cluster(
+      bookRows('SSL'),
+      'bid'
+    ),
+
+    asks: cluster(
+      bookRows('BSL'),
+      'ask'
+    )
   };
 }
 
 /* ============================================================
-   LIQUIDITY SWEEPS
+   LIVE PRICE
+   IMPORTANT FIX
+============================================================ */
+
+function updatePrice(
+  price,
+  source
+) {
+  const p =
+    Number(price);
+
+  if (
+    !Number.isFinite(p) ||
+    p <= 0
+  ) {
+    return;
+  }
+
+  const previous =
+    state.currentPrice;
+
+  state.currentPrice =
+    p;
+
+  state.priceSource =
+    source ||
+    state.priceSource;
+
+  if (previous) {
+    detectSweep(
+      previous,
+      p
+    );
+  }
+
+  applyResting();
+
+  state.updatedAt =
+    iso();
+}
+
+/*
+   NEW:
+   Always derive a live BTC price
+   from the best Futures bid/ask.
+*/
+
+function updatePriceFromBook() {
+  if (
+    !book.bids.size &&
+    !book.asks.size
+  ) {
+    return;
+  }
+
+  let bestBid =
+    -Infinity;
+
+  let bestAsk =
+    Infinity;
+
+  for (
+    const price of
+      book.bids.keys()
+  ) {
+    if (
+      Number(price) >
+      bestBid
+    ) {
+      bestBid =
+        Number(price);
+    }
+  }
+
+  for (
+    const price of
+      book.asks.keys()
+  ) {
+    if (
+      Number(price) <
+      bestAsk
+    ) {
+      bestAsk =
+        Number(price);
+    }
+  }
+
+  let price =
+    null;
+
+  if (
+    Number.isFinite(
+      bestBid
+    ) &&
+    Number.isFinite(
+      bestAsk
+    )
+  ) {
+    price =
+      (
+        bestBid +
+        bestAsk
+      ) / 2;
+  } else if (
+    Number.isFinite(
+      bestBid
+    )
+  ) {
+    price =
+      bestBid;
+  } else if (
+    Number.isFinite(
+      bestAsk
+    )
+  ) {
+    price =
+      bestAsk;
+  }
+
+  if (price) {
+    updatePrice(
+      price,
+      'futures_orderbook_mid'
+    );
+  }
+}
+
+/* ============================================================
+   SWEEP DETECTION
 ============================================================ */
 
 function recordSweep(
@@ -1270,26 +1347,9 @@ function recordSweep(
   level,
   price
 ) {
-  const event = {
-    side,
-
-    level: round(
-      level,
-      2
-    ),
-
-    price: round(
-      price,
-      2
-    ),
-
-    time:
-      new Date().toISOString()
-  };
-
   const last =
-    state.sweepEvents[
-      state.sweepEvents.length - 1
+    state.sweeps[
+      state.sweeps.length - 1
     ];
 
   if (
@@ -1298,296 +1358,315 @@ function recordSweep(
     Math.abs(
       last.level - level
     ) < 20 &&
-    now() -
+    Date.now() -
       new Date(
         last.time
       ).getTime() <
-      SETTINGS.sweepLookbackMs
+      SETTINGS.sweepMs
   ) {
     return;
   }
 
-  state.sweepEvents.push(
-    event
-  );
+  state.sweeps.push({
+    side,
+
+    level:
+      round(level),
+
+    price:
+      round(price),
+
+    time:
+      iso()
+  });
 
   if (
-    state.sweepEvents.length >
+    state.sweeps.length >
     30
   ) {
-    state.sweepEvents.shift();
+    state.sweeps.shift();
   }
 }
 
 function detectSweep(
-  previousPrice,
-  currentPrice
+  previous,
+  current
 ) {
-  if (
-    !previousPrice ||
-    !currentPrice
+  for (
+    const level of
+      structure.levels
   ) {
-    return;
-  }
-
-  for (const level of structure.levels) {
     if (
       level.side === 'BSL' &&
-      previousPrice <
+      previous <
         level.price &&
-      currentPrice >=
+      current >=
         level.price
     ) {
       recordSweep(
         'BSL',
         level.price,
-        currentPrice
+        current
       );
     }
 
     if (
       level.side === 'SSL' &&
-      previousPrice >
+      previous >
         level.price &&
-      currentPrice <=
+      current <=
         level.price
     ) {
       recordSweep(
         'SSL',
         level.price,
-        currentPrice
+        current
       );
     }
   }
 }
 
 /* ============================================================
-   PRICE
-============================================================ */
-
-function updatePrice(price) {
-  const p = Number(price);
-
-  if (!Number.isFinite(p)) {
-    return;
-  }
-
-  const previous =
-    state.currentPrice;
-
-  state.currentPrice = p;
-
-  detectSweep(
-    previous,
-    p
-  );
-
-  applyRestingLiquidity();
-
-  state.updatedAt =
-    new Date().toISOString();
-}
-
-/* ============================================================
-   LIQUIDITY INTELLIGENCE
+   INTELLIGENCE
 ============================================================ */
 
 function intelligence() {
-  applyRestingLiquidity();
+  applyResting();
 
-  let bsl =
-    clusterLevels(
-      filteredLevels('BSL')
-    ).filter(
-      level =>
-        level.price >
-        (state.currentPrice || 0)
-    );
+  const current =
+    state.currentPrice;
 
-  let ssl =
-    clusterLevels(
-      filteredLevels('SSL')
-    ).filter(
-      level =>
-        level.price <
-        (
-          state.currentPrice ||
-          Infinity
-        )
-    );
+  if (!current) {
+    return {
+      state:
+        'WAITING FOR LIVE PRICE',
 
-  bsl.sort(
-    (a, b) =>
-      a.price - b.price
-  );
+      nearestBSL:
+        null,
 
-  ssl.sort(
-    (a, b) =>
-      b.price - a.price
-  );
+      nearestSSL:
+        null,
 
-  const nearestBSL =
-    bsl[0] || null;
+      nextBSL: [],
 
-  const nearestSSL =
-    ssl[0] || null;
+      nextSSL: [],
 
-  const nextBSL =
-    bsl
-      .slice(
-        0,
-        SETTINGS.intelligenceLevels
-      )
-      .map(decorateLevel);
+      orderBook:
+        bookClusters(),
 
-  const nextSSL =
-    ssl
-      .slice(
-        0,
-        SETTINGS.intelligenceLevels
-      )
-      .map(decorateLevel);
-
-  let stateName =
-    'NO STRUCTURAL LIQUIDITY';
-
-  if (
-    nearestBSL &&
-    nearestSSL
-  ) {
-    stateName =
-      'BETWEEN LIQUIDITY';
-  } else if (nearestBSL) {
-    stateName =
-      'UPSIDE LIQUIDITY ONLY';
-  } else if (nearestSSL) {
-    stateName =
-      'DOWNSIDE LIQUIDITY ONLY';
+      recentSweeps:
+        state.sweeps
+          .slice(-10)
+          .reverse()
+    };
   }
+
+  const bsl =
+    structural('BSL')
+      .filter(
+        level =>
+          level.price >
+          current
+      )
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      );
+
+  const ssl =
+    structural('SSL')
+      .filter(
+        level =>
+          level.price <
+          current
+      )
+      .sort(
+        (a, b) =>
+          b.price - a.price
+      );
 
   return {
     state:
-      stateName,
+      bsl[0] && ssl[0]
+        ? 'BETWEEN LIQUIDITY'
+        : bsl[0]
+        ? 'UPSIDE LIQUIDITY ONLY'
+        : ssl[0]
+        ? 'DOWNSIDE LIQUIDITY ONLY'
+        : 'NO STRUCTURAL LIQUIDITY',
 
     nearestBSL:
-      nearestBSL
-        ? decorateLevel(
-            nearestBSL
-          )
-        : null,
+      bsl[0] || null,
 
     nearestSSL:
-      nearestSSL
-        ? decorateLevel(
-            nearestSSL
-          )
-        : null,
+      ssl[0] || null,
 
-    nextBSL,
+    nextBSL:
+      bsl.slice(0, 5),
 
-    nextSSL,
+    nextSSL:
+      ssl.slice(0, 5),
 
     orderBook:
-      orderBookClusters(),
+      bookClusters(),
 
     recentSweeps:
-      state.sweepEvents
+      state.sweeps
         .slice(-10)
         .reverse()
   };
 }
 
 /* ============================================================
-   SNAPSHOT
+   PUBLIC STRUCTURE
 ============================================================ */
 
-function setBookSnapshot(
-  snapshot
-) {
-  book.bids.clear();
-  book.asks.clear();
-
-  for (
-    const [
-      price,
-      quantity
-    ] of snapshot.bids || []
-  ) {
-    if (
-      Number(quantity) > 0
-    ) {
-      book.bids.set(
-        Number(price),
-        Number(quantity)
+function publicStructure() {
+  const bsl =
+    structural('BSL')
+      .sort(
+        (a, b) =>
+          Math.abs(
+            a.price -
+              (
+                state.currentPrice ||
+                0
+              )
+          ) -
+          Math.abs(
+            b.price -
+              (
+                state.currentPrice ||
+                0
+              )
+          )
+      )
+      .slice(
+        0,
+        SETTINGS.maxLevels
       );
-    }
-  }
 
-  for (
-    const [
-      price,
-      quantity
-    ] of snapshot.asks || []
-  ) {
-    if (
-      Number(quantity) > 0
-    ) {
-      book.asks.set(
-        Number(price),
-        Number(quantity)
+  const ssl =
+    structural('SSL')
+      .sort(
+        (a, b) =>
+          Math.abs(
+            a.price -
+              (
+                state.currentPrice ||
+                0
+              )
+          ) -
+          Math.abs(
+            b.price -
+              (
+                state.currentPrice ||
+                0
+              )
+          )
+      )
+      .slice(
+        0,
+        SETTINGS.maxLevels
       );
-    }
-  }
 
-  state.bookInitialized =
-    true;
+  const resistance =
+    bsl
+      .filter(
+        level =>
+          state.currentPrice
+            ? level.price >
+              state.currentPrice
+            : true
+      )
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      )
+      .slice(0, 3);
 
-  state.lastUpdateId =
-    Number(
-      snapshot.lastUpdateId ||
-      0
-    );
+  const support =
+    ssl
+      .filter(
+        level =>
+          state.currentPrice
+            ? level.price <
+              state.currentPrice
+            : true
+      )
+      .sort(
+        (a, b) =>
+          b.price - a.price
+      )
+      .slice(0, 3);
 
-  state.snapshotId =
-    state.lastUpdateId;
+  return {
+    buySideLiquidity:
+      bsl,
 
-  state.pendingEvents = [];
+    sellSideLiquidity:
+      ssl,
 
-  state.gapRecovery =
-    false;
+    majorResistance:
+      resistance,
 
-  state.gapDetected =
-    false;
+    majorSupport:
+      support,
 
-  state.updatedAt =
-    new Date().toISOString();
+    nearestBSL:
+      resistance.slice(
+        0,
+        1
+      ),
 
-  applyRestingLiquidity();
+    nearestSSL:
+      support.slice(
+        0,
+        1
+      )
+  };
+}
+
+/* ============================================================
+   RAW LIQUIDITY
+============================================================ */
+
+function rawLiquidity() {
+  return {
+    largeBids:
+      bookRows('SSL')
+        .sort(
+          (a, b) =>
+            b.usd - a.usd
+        )
+        .slice(0, 25),
+
+    largeAsks:
+      bookRows('BSL')
+        .sort(
+          (a, b) =>
+            b.usd - a.usd
+        )
+        .slice(0, 25)
+  };
 }
 
 /* ============================================================
    APPLY DEPTH EVENT
 ============================================================ */
 
-function applyDepthEvent(
-  msg
-) {
-  if (
-    !msg ||
-    !Array.isArray(msg.b) ||
-    !Array.isArray(msg.a)
-  ) {
-    return;
-  }
-
+function applyDepth(message) {
   for (
     const [
       price,
       quantity
-    ] of msg.b
+    ] of message.b || []
   ) {
-    const p = Number(price);
-    const q = Number(quantity);
+    const p =
+      Number(price);
+
+    const q =
+      Number(quantity);
 
     if (q === 0) {
       book.bids.delete(p);
@@ -1603,10 +1682,13 @@ function applyDepthEvent(
     const [
       price,
       quantity
-    ] of msg.a
+    ] of message.a || []
   ) {
-    const p = Number(price);
-    const q = Number(quantity);
+    const p =
+      Number(price);
+
+    const q =
+      Number(quantity);
 
     if (q === 0) {
       book.asks.delete(p);
@@ -1620,111 +1702,47 @@ function applyDepthEvent(
 
   state.lastUpdateId =
     Number(
-      msg.u ||
-      state.lastUpdateId
+      message.u ||
+        state.lastUpdateId
     );
 
   state.lastDepthMessage =
-    new Date().toISOString();
+    iso();
 
-  state.updatedAt =
-    state.lastDepthMessage;
+  /*
+     IMPORTANT:
+     Every depth update now refreshes
+     the live BTC price.
+  */
+
+  updatePriceFromBook();
 }
 
 /* ============================================================
-   DEPTH EVENT HANDLER
+   SNAPSHOT
 ============================================================ */
 
-function handleDepthMessage(
-  msg
-) {
-  const U = Number(msg.U);
-  const u = Number(msg.u);
+let snapshotBusy =
+  false;
 
-  if (
-    !Number.isFinite(U) ||
-    !Number.isFinite(u)
-  ) {
-    return;
-  }
-
-  if (
-    !state.bookInitialized
-  ) {
-    if (
-      state.pendingEvents.length <
-      5000
-    ) {
-      state.pendingEvents.push(
-        msg
-      );
-    }
-
-    return;
-  }
-
-  if (
-    u <=
-    state.lastUpdateId
-  ) {
-    return;
-  }
-
-  if (
-    U >
-    state.lastUpdateId + 1
-  ) {
-    state.gapDetected =
-      true;
-
-    state.gapRecovery =
-      true;
-
-    state.gapCount += 1;
-
-    state.lastGapLocal =
-      state.lastUpdateId;
-
-    state.lastGapIncoming =
-      U;
-
-    state.bookInitialized =
-      false;
-
-    state.pendingEvents = [
-      msg
-    ];
-
-    requestSnapshot();
-
-    return;
-  }
-
-  applyDepthEvent(msg);
-}
-
-/* ============================================================
-   SNAPSHOT REQUEST
-============================================================ */
-
-let snapshotBusy = false;
-let snapshotLastAt = 0;
+let lastSnapshotAt =
+  0;
 
 function requestSnapshot() {
-  if (snapshotBusy) {
-    return;
-  }
-
   if (
-    now() -
-      snapshotLastAt <
-    65000
+    snapshotBusy ||
+    Date.now() -
+      lastSnapshotAt <
+      65000
   ) {
     return;
   }
 
-  snapshotBusy = true;
-  snapshotLastAt = now();
+  snapshotBusy =
+    true;
+
+  lastSnapshotAt =
+    Date.now();
 
   state.snapshotRequests +=
     1;
@@ -1734,10 +1752,10 @@ function requestSnapshot() {
   try {
     ws =
       new WebSocket(
-        FUTURES_SNAPSHOT_WS
+        SNAPSHOT_WS
       );
 
-    const requestId =
+    const id =
       `depth-${Date.now()}`;
 
     const timer =
@@ -1755,12 +1773,15 @@ function requestSnapshot() {
 
         ws.send(
           JSON.stringify({
-            id: requestId,
+            id,
 
-            method: 'depth',
+            method:
+              'depth',
 
             params: {
-              symbol: SYMBOL,
+              symbol:
+                SYMBOL,
+
               limit: 1000
             }
           })
@@ -1778,8 +1799,28 @@ function requestSnapshot() {
             );
 
           if (
-            data.id !==
-              requestId ||
+            data.id !== id
+          ) {
+            return;
+          }
+
+          if (
+            data.status &&
+            data.status !== 200
+          ) {
+            state.snapshotLastStatus =
+              data.status;
+
+            state.snapshotLastError =
+              JSON.stringify(
+                data.error ||
+                  data
+              );
+
+            return;
+          }
+
+          if (
             !data.result
           ) {
             return;
@@ -1789,9 +1830,64 @@ function requestSnapshot() {
             timer
           );
 
-          setBookSnapshot(
-            data.result
-          );
+          book.bids.clear();
+          book.asks.clear();
+
+          for (
+            const [
+              price,
+              quantity
+            ] of
+              data.result
+                .bids || []
+          ) {
+            if (
+              Number(quantity) >
+              0
+            ) {
+              book.bids.set(
+                Number(price),
+                Number(quantity)
+              );
+            }
+          }
+
+          for (
+            const [
+              price,
+              quantity
+            ] of
+              data.result
+                .asks || []
+          ) {
+            if (
+              Number(quantity) >
+              0
+            ) {
+              book.asks.set(
+                Number(price),
+                Number(quantity)
+              );
+            }
+          }
+
+          state.lastUpdateId =
+            Number(
+              data.result
+                .lastUpdateId
+            );
+
+          state.snapshotId =
+            state.lastUpdateId;
+
+          state.bookInitialized =
+            true;
+
+          state.gapRecovery =
+            false;
+
+          state.gapDetected =
+            false;
 
           state.snapshotLastStatus =
             200;
@@ -1800,7 +1896,12 @@ function requestSnapshot() {
             null;
 
           state.lastSnapshotResponse =
-            new Date().toISOString();
+            iso();
+
+          /*
+             Re-apply buffered
+             depth events.
+          */
 
           const pending =
             [
@@ -1818,7 +1919,8 @@ function requestSnapshot() {
             false;
 
           for (
-            const event of pending
+            const event of
+              pending
           ) {
             const U =
               Number(event.U);
@@ -1841,7 +1943,7 @@ function requestSnapshot() {
                 state.lastUpdateId +
                   1
             ) {
-              applyDepthEvent(
+              applyDepth(
                 event
               );
 
@@ -1857,7 +1959,7 @@ function requestSnapshot() {
                 state.lastUpdateId +
                   1
             ) {
-              applyDepthEvent(
+              applyDepth(
                 event
               );
 
@@ -1883,8 +1985,15 @@ function requestSnapshot() {
             }
           }
 
-          state.updatedAt =
-            new Date().toISOString();
+          /*
+             CRITICAL:
+             Set price from snapshot
+             immediately.
+          */
+
+          updatePriceFromBook();
+
+          applyResting();
 
           try {
             ws.close();
@@ -1914,21 +2023,22 @@ function requestSnapshot() {
   } catch (error) {
     state.snapshotLastError =
       error.message;
-  } finally {
-    setTimeout(() => {
-      snapshotBusy = false;
-    }, 1000);
   }
+
+  setTimeout(() => {
+    snapshotBusy =
+      false;
+  }, 1000);
 }
 
 /* ============================================================
-   DEPTH CONNECTION
+   DEPTH WEBSOCKET
 ============================================================ */
 
 function connectDepth() {
   const ws =
     new WebSocket(
-      FUTURES_DEPTH_WS
+      DEPTH_WS
     );
 
   state.depthConnected =
@@ -1940,9 +2050,6 @@ function connectDepth() {
       state.depthConnected =
         true;
 
-      state.updatedAt =
-        new Date().toISOString();
-
       requestSnapshot();
     }
   );
@@ -1951,19 +2058,98 @@ function connectDepth() {
     'message',
     raw => {
       try {
-        const msg =
+        const message =
           JSON.parse(
             raw.toString()
           );
 
         if (
-          msg.e ===
+          message.e !==
           'depthUpdate'
         ) {
-          handleDepthMessage(
-            msg
-          );
+          return;
         }
+
+        const U =
+          Number(
+            message.U
+          );
+
+        const u =
+          Number(
+            message.u
+          );
+
+        /*
+           Before snapshot:
+           buffer events.
+        */
+
+        if (
+          !state.bookInitialized
+        ) {
+          if (
+            state.pendingEvents
+              .length < 5000
+          ) {
+            state.pendingEvents.push(
+              message
+            );
+          }
+
+          return;
+        }
+
+        /*
+           Already processed.
+        */
+
+        if (
+          u <=
+          state.lastUpdateId
+        ) {
+          return;
+        }
+
+        /*
+           Real sequence gap.
+        */
+
+        if (
+          U >
+          state.lastUpdateId +
+            1
+        ) {
+          state.gapDetected =
+            true;
+
+          state.gapRecovery =
+            true;
+
+          state.gapCount +=
+            1;
+
+          state.lastGapLocal =
+            state.lastUpdateId;
+
+          state.lastGapIncoming =
+            U;
+
+          state.bookInitialized =
+            false;
+
+          state.pendingEvents = [
+            message
+          ];
+
+          requestSnapshot();
+
+          return;
+        }
+
+        applyDepth(
+          message
+        );
       } catch (_) {}
     }
   );
@@ -1988,13 +2174,13 @@ function connectDepth() {
 }
 
 /* ============================================================
-   FUTURES KLINE CONNECTION
+   KLINE WEBSOCKET
 ============================================================ */
 
 function connectKlines() {
   const ws =
     new WebSocket(
-      FUTURES_KLINE_WS
+      KLINE_WS
     );
 
   state.klinesConnected =
@@ -2027,7 +2213,9 @@ function connectKlines() {
         const tf =
           String(k.i);
 
-        if (!candles[tf]) {
+        if (
+          !candles[tf]
+        ) {
           return;
         }
 
@@ -2054,39 +2242,47 @@ function connectKlines() {
             Number(k.T)
         };
 
-        const arr =
+        const data =
           candles[tf];
 
         const index =
-          arr.findIndex(
+          data.findIndex(
             x =>
               x.openTime ===
               candle.openTime
           );
 
-        if (index >= 0) {
-          arr[index] =
+        if (
+          index >= 0
+        ) {
+          data[index] =
             candle;
         } else {
-          arr.push(
+          data.push(
             candle
           );
 
           if (
-            arr.length >
+            data.length >
             STRUCTURE[tf]
               .candles
           ) {
-            arr.shift();
+            data.shift();
           }
         }
 
+        /*
+           Kline is also a
+           live price source.
+        */
+
         updatePrice(
-          candle.close
+          candle.close,
+          'futures_kline'
         );
 
         state.lastKlineMessage =
-          new Date().toISOString();
+          iso();
 
         if (k.x) {
           rebuildStructure();
@@ -2115,101 +2311,6 @@ function connectKlines() {
 }
 
 /* ============================================================
-   PUBLIC STRUCTURE
-============================================================ */
-
-function publicStructure() {
-  applyRestingLiquidity();
-
-  const bsl =
-    filteredLevels('BSL')
-      .sort(
-        (a, b) =>
-          a.price - b.price
-      )
-      .slice(
-        0,
-        SETTINGS.maxMajorLevels
-      )
-      .map(decorateLevel);
-
-  const ssl =
-    filteredLevels('SSL')
-      .sort(
-        (a, b) =>
-          b.price - a.price
-      )
-      .slice(
-        0,
-        SETTINGS.maxMajorLevels
-      )
-      .map(decorateLevel);
-
-  const resistance =
-    bsl
-      .filter(
-        level =>
-          level.price >
-          (state.currentPrice || 0)
-      )
-      .slice(0, 3);
-
-  const support =
-    ssl
-      .filter(
-        level =>
-          level.price <
-          (
-            state.currentPrice ||
-            Infinity
-          )
-      )
-      .slice(0, 3);
-
-  return {
-    buySideLiquidity: bsl,
-
-    sellSideLiquidity: ssl,
-
-    majorResistance:
-      resistance,
-
-    majorSupport:
-      support,
-
-    nearestBSL:
-      resistance.slice(0, 1),
-
-    nearestSSL:
-      support.slice(0, 1)
-  };
-}
-
-/* ============================================================
-   RAW RESTING LIQUIDITY
-============================================================ */
-
-function rawRestingLiquidity() {
-  return {
-    largeBids:
-      getBookRows('SSL')
-        .sort(
-          (a, b) =>
-            b.usd - a.usd
-        )
-        .slice(0, 25),
-
-    largeAsks:
-      getBookRows('BSL')
-        .sort(
-          (a, b) =>
-            b.usd - a.usd
-        )
-        .slice(0, 25)
-  };
-}
-
-/* ============================================================
    HEALTH
 ============================================================ */
 
@@ -2220,10 +2321,14 @@ function health() {
     service:
       'Binance BTCUSDT Major Liquidity Relay',
 
-    symbol: SYMBOL,
+    symbol:
+      SYMBOL,
 
     currentPrice:
       state.currentPrice,
+
+    priceSource:
+      state.priceSource,
 
     historicalStructureSource:
       'Binance Spot',
@@ -2239,9 +2344,9 @@ function health() {
         Object.entries(
           candles
         ).map(
-          ([tf, arr]) => [
+          ([tf, data]) => [
             tf,
-            arr.length
+            data.length
           ]
         )
       ),
@@ -2261,36 +2366,30 @@ function health() {
     candleStats:
       state.candleStats,
 
-    candleLastStatus:
-      state.candleLastStatus,
-
-    candleLastError:
-      state.candleLastError,
-
     structure: {
       swingHighs:
-        structure.swingHighs
-          .length,
+        structure
+          .swingHighs.length,
 
       swingLows:
-        structure.swingLows
-          .length,
+        structure
+          .swingLows.length,
 
       equalHighs:
-        structure.equalHighs
-          .length,
+        structure
+          .equalHighs.length,
 
       equalLows:
-        structure.equalLows
-          .length,
+        structure
+          .equalLows.length,
 
       majorBSL:
-        filteredLevels(
+        structural(
           'BSL'
         ).length,
 
       majorSSL:
-        filteredLevels(
+        structural(
           'SSL'
         ).length,
 
@@ -2370,12 +2469,12 @@ function health() {
 }
 
 /* ============================================================
-   API ROUTES
+   API
 ============================================================ */
 
 app.get(
   '/',
-  (_req, res) => {
+  (req, res) => {
     res.json(
       health()
     );
@@ -2384,7 +2483,7 @@ app.get(
 
 app.get(
   '/health',
-  (_req, res) => {
+  (req, res) => {
     res.json(
       health()
     );
@@ -2392,15 +2491,43 @@ app.get(
 );
 
 app.get(
-  '/structure',
-  (_req, res) => {
+  '/intelligence',
+  (req, res) => {
     res.json({
       ok: true,
 
-      symbol: SYMBOL,
+      symbol:
+        SYMBOL,
 
       currentPrice:
         state.currentPrice,
+
+      priceSource:
+        state.priceSource,
+
+      intelligence:
+        intelligence(),
+
+      updatedAt:
+        state.updatedAt
+    });
+  }
+);
+
+app.get(
+  '/structure',
+  (req, res) => {
+    res.json({
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice:
+        state.currentPrice,
+
+      priceSource:
+        state.priceSource,
 
       marketStructure:
         publicStructure(),
@@ -2426,28 +2553,28 @@ app.get(
             Object.entries(
               candles
             ).map(
-              ([tf, arr]) => [
+              ([tf, data]) => [
                 tf,
-                arr.length
+                data.length
               ]
             )
           ),
 
         swingHighs:
-          structure.swingHighs
-            .length,
+          structure
+            .swingHighs.length,
 
         swingLows:
-          structure.swingLows
-            .length,
+          structure
+            .swingLows.length,
 
         equalHighs:
-          structure.equalHighs
-            .length,
+          structure
+            .equalHighs.length,
 
         equalLows:
-          structure.equalLows
-            .length
+          structure
+            .equalLows.length
       },
 
       updatedAt:
@@ -2458,14 +2585,18 @@ app.get(
 
 app.get(
   '/liquidity',
-  (_req, res) => {
+  (req, res) => {
     res.json({
       ok: true,
 
-      symbol: SYMBOL,
+      symbol:
+        SYMBOL,
 
       currentPrice:
         state.currentPrice,
+
+      priceSource:
+        state.priceSource,
 
       marketStructure:
         publicStructure(),
@@ -2474,7 +2605,7 @@ app.get(
         intelligence(),
 
       rawRestingLiquidity:
-        rawRestingLiquidity(),
+        rawLiquidity(),
 
       structureStats: {
         candleSource:
@@ -2494,28 +2625,28 @@ app.get(
             Object.entries(
               candles
             ).map(
-              ([tf, arr]) => [
+              ([tf, data]) => [
                 tf,
-                arr.length
+                data.length
               ]
             )
           ),
 
         swingHighs:
-          structure.swingHighs
-            .length,
+          structure
+            .swingHighs.length,
 
         swingLows:
-          structure.swingLows
-            .length,
+          structure
+            .swingLows.length,
 
         equalHighs:
-          structure.equalHighs
-            .length,
+          structure
+            .equalHighs.length,
 
         equalLows:
-          structure.equalLows
-            .length
+          structure
+            .equalLows.length
       },
 
       updatedAt:
@@ -2525,35 +2656,19 @@ app.get(
 );
 
 app.get(
-  '/intelligence',
-  (_req, res) => {
-    res.json({
-      ok: true,
-
-      symbol: SYMBOL,
-
-      currentPrice:
-        state.currentPrice,
-
-      intelligence:
-        intelligence(),
-
-      updatedAt:
-        state.updatedAt
-    });
-  }
-);
-
-app.get(
   '/book',
-  (_req, res) => {
+  (req, res) => {
     res.json({
       ok: true,
 
-      symbol: SYMBOL,
+      symbol:
+        SYMBOL,
 
       currentPrice:
         state.currentPrice,
+
+      priceSource:
+        state.priceSource,
 
       initialized:
         state.bookInitialized,
@@ -2590,7 +2705,14 @@ setInterval(
     if (
       state.bookInitialized
     ) {
-      applyRestingLiquidity();
+      /*
+         Keep price alive even if
+         no kline message arrives.
+      */
+
+      updatePriceFromBook();
+
+      applyResting();
     }
   },
   5000
@@ -2602,14 +2724,13 @@ setInterval(
       Object.values(
         candles
       ).every(
-        arr => arr.length > 0
+        data =>
+          data.length > 0
       );
 
-    if (!ready) {
-      return;
+    if (ready) {
+      rebuildStructure();
     }
-
-    rebuildStructure();
   },
   60000
 );
@@ -2618,8 +2739,8 @@ setInterval(
    START
 ============================================================ */
 
-async function start() {
-  await loadHistoricalCandles();
+(async () => {
+  await loadHistory();
 
   connectDepth();
 
@@ -2633,9 +2754,7 @@ async function start() {
       );
     }
   );
-}
-
-start().catch(
+})().catch(
   error => {
     console.error(
       'STARTUP ERROR',
