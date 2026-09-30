@@ -4,723 +4,812 @@ const WebSocket = require("ws");
 const app = express();
 
 const PORT = process.env.PORT || 10000;
-
 const SYMBOL = "BTCUSDT";
 const SYMBOL_LOWER = SYMBOL.toLowerCase();
 
-const FUTURES_REST =
-  "https://fapi.binance.com";
+const STREAM_URL =
+  `wss://fstream.binance.com/ws/${SYMBOL_LOWER}@depth@100ms`;
 
-const FUTURES_WS =
-  `wss://fstream.binance.com/ws/${SYMBOL_LOWER}@depth20@100ms`;
+const SNAPSHOT_WS_URL =
+  "wss://ws-fapi.binance.com/ws-fapi/v1";
 
-// ============================================================
-// SETTINGS
-// ============================================================
+const MIN_CLUSTER_USD = 500000;
+const RANGE_PCT = 0.03;
+const CLUSTER_GAP_PCT = 0.0002;
 
-// Wider REST order-book snapshot
-const ORDERBOOK_LIMIT = 1000;
+let book = {
+  bids: new Map(),
+  asks: new Map(),
 
-// Refresh the wide order book every 5 seconds
-const REST_REFRESH_MS = 5000;
-
-// Only consider liquidity within this distance from price
-const DEFAULT_RANGE_PCT = 0.03;
-
-// Minimum total USD value for a cluster
-const DEFAULT_MIN_CLUSTER_USD = 500000;
-
-// Neighboring orders within this percentage are grouped
-const DEFAULT_CLUSTER_GAP_PCT = 0.0002;
-
-// Maximum number of clusters returned per side
-const MAX_CLUSTERS_PER_SIDE = 10;
-
-// Persistence tracking
-const PERSISTENCE_MATCH_PCT = 0.0015;
-
-// ============================================================
-// STATE
-// ============================================================
-
-let latestBook = {
-  symbol: SYMBOL,
   currentPrice: null,
 
-  bids: [],
-  asks: [],
+  lastUpdateId: 0,
 
-  bidClusters: [],
-  askClusters: [],
-
-  updatedAt: null,
-  restUpdatedAt: null,
+  initialized: false,
 
   websocketConnected: false,
-  restConnected: false,
+  snapshotConnected: false,
 
-  depthLevels: 0,
+  lastUpdate: null,
 
   status: "starting"
 };
 
-let ws = null;
-let reconnectTimer = null;
-let restTimer = null;
+let depthWs = null;
+let snapshotWs = null;
 
-let previousClusters = {
-  bids: [],
-  asks: []
-};
+let reconnectTimer = null;
+let snapshotTimer = null;
+
+let requestId = 1;
 
 // ============================================================
 // HELPERS
 // ============================================================
 
-function number(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : 0;
+function n(value) {
+  const x = Number(value);
+  return Number.isFinite(x) ? x : 0;
 }
 
 function round(value, decimals = 2) {
   const factor = Math.pow(10, decimals);
+
   return Math.round(value * factor) / factor;
 }
 
-function formatUsd(value) {
-  if (value >= 1000000000) {
-    return `$${(value / 1000000000).toFixed(2)}B`;
-  }
-
-  if (value >= 1000000) {
-    return `$${(value / 1000000).toFixed(2)}M`;
-  }
-
-  if (value >= 1000) {
-    return `$${(value / 1000).toFixed(1)}K`;
-  }
-
-  return `$${value.toFixed(0)}`;
-}
-
-function distancePct(price, currentPrice) {
-  if (!currentPrice) return 0;
-
-  return ((price - currentPrice) / currentPrice) * 100;
+function usd(price, quantity) {
+  return price * quantity;
 }
 
 function getCurrentPrice() {
-  if (
-    latestBook.bids.length > 0 &&
-    latestBook.asks.length > 0
-  ) {
-    const bestBid = latestBook.bids[0].price;
-    const bestAsk = latestBook.asks[0].price;
+  let bestBid = null;
+  let bestAsk = null;
 
+  for (const [price, quantity] of book.bids) {
+    if (quantity <= 0) continue;
+
+    if (bestBid === null || price > bestBid) {
+      bestBid = price;
+    }
+  }
+
+  for (const [price, quantity] of book.asks) {
+    if (quantity <= 0) continue;
+
+    if (bestAsk === null || price < bestAsk) {
+      bestAsk = price;
+    }
+  }
+
+  if (
+    bestBid !== null &&
+    bestAsk !== null
+  ) {
     return (bestBid + bestAsk) / 2;
   }
 
-  if (latestBook.bids.length > 0) {
-    return latestBook.bids[0].price;
+  if (bestBid !== null) {
+    return bestBid;
   }
 
-  if (latestBook.asks.length > 0) {
-    return latestBook.asks[0].price;
+  if (bestAsk !== null) {
+    return bestAsk;
   }
 
   return null;
 }
 
 // ============================================================
-// BINANCE WEBSOCKET
+// APPLY DEPTH UPDATE
 // ============================================================
 
-function connectBinanceWebSocket() {
-  console.log("Connecting to Binance Futures WebSocket...");
+function applyUpdates(event) {
+  if (!event) return;
+
+  if (
+    event.b &&
+    Array.isArray(event.b)
+  ) {
+    for (const level of event.b) {
+      const price = n(level[0]);
+      const quantity = n(level[1]);
+
+      if (!price) continue;
+
+      if (quantity === 0) {
+        book.bids.delete(price);
+      } else {
+        book.bids.set(
+          price,
+          quantity
+        );
+      }
+    }
+  }
+
+  if (
+    event.a &&
+    Array.isArray(event.a)
+  ) {
+    for (const level of event.a) {
+      const price = n(level[0]);
+      const quantity = n(level[1]);
+
+      if (!price) continue;
+
+      if (quantity === 0) {
+        book.asks.delete(price);
+      } else {
+        book.asks.set(
+          price,
+          quantity
+        );
+      }
+    }
+  }
+
+  if (event.u) {
+    book.lastUpdateId =
+      n(event.u);
+  }
+
+  book.currentPrice =
+    getCurrentPrice();
+
+  book.lastUpdate =
+    new Date().toISOString();
+}
+
+// ============================================================
+// SNAPSHOT VIA BINANCE WEBSOCKET API
+// ============================================================
+
+function requestSnapshot() {
+  if (!snapshotWs) {
+    return;
+  }
+
+  if (
+    snapshotWs.readyState !==
+    WebSocket.OPEN
+  ) {
+    return;
+  }
+
+  const id = requestId++;
+
+  const request = {
+    id: String(id),
+
+    method: "depth",
+
+    params: {
+      symbol: SYMBOL,
+      limit: 1000
+    }
+  };
+
+  console.log(
+    "Requesting Futures depth snapshot..."
+  );
+
+  snapshotWs.send(
+    JSON.stringify(request)
+  );
+}
+
+function connectSnapshotWs() {
+  console.log(
+    "Connecting to Binance Futures WebSocket API..."
+  );
 
   try {
-    ws = new WebSocket(FUTURES_WS);
-
-    ws.on("open", () => {
-      console.log(
-        "Connected to Binance Futures WebSocket."
+    snapshotWs =
+      new WebSocket(
+        SNAPSHOT_WS_URL
       );
 
-      latestBook.websocketConnected = true;
+    snapshotWs.on("open", () => {
+      console.log(
+        "Binance Futures WebSocket API connected."
+      );
+
+      book.snapshotConnected =
+        true;
+
+      requestSnapshot();
     });
 
-    ws.on("message", (data) => {
+    snapshotWs.on("message", (data) => {
       try {
-        const message = JSON.parse(data.toString());
+        const response =
+          JSON.parse(
+            data.toString()
+          );
 
-        if (!message.b || !message.a) {
+        if (
+          response.status !== 200 ||
+          !response.result
+        ) {
+          console.log(
+            "Snapshot response:",
+            JSON.stringify(
+              response
+            )
+          );
+
           return;
         }
 
-        const bids = message.b.map((level) => {
-          const price = number(level[0]);
-          const quantity = number(level[1]);
+        if (
+          !response.result.bids ||
+          !response.result.asks
+        ) {
+          return;
+        }
 
-          return {
-            price,
-            quantity,
-            usd: price * quantity
-          };
-        });
+        book.bids.clear();
+        book.asks.clear();
 
-        const asks = message.a.map((level) => {
-          const price = number(level[0]);
-          const quantity = number(level[1]);
+        for (
+          const level of response.result.bids
+        ) {
+          const price =
+            n(level[0]);
 
-          return {
-            price,
-            quantity,
-            usd: price * quantity
-          };
-        });
+          const quantity =
+            n(level[1]);
 
-        latestBook.bids = bids;
-        latestBook.asks = asks;
+          if (
+            price > 0 &&
+            quantity > 0
+          ) {
+            book.bids.set(
+              price,
+              quantity
+            );
+          }
+        }
 
-        latestBook.currentPrice = getCurrentPrice();
+        for (
+          const level of response.result.asks
+        ) {
+          const price =
+            n(level[0]);
 
-        latestBook.updatedAt =
+          const quantity =
+            n(level[1]);
+
+          if (
+            price > 0 &&
+            quantity > 0
+          ) {
+            book.asks.set(
+              price,
+              quantity
+            );
+          }
+        }
+
+        book.lastUpdateId =
+          n(
+            response.result.lastUpdateId
+          );
+
+        book.currentPrice =
+          getCurrentPrice();
+
+        book.initialized =
+          true;
+
+        book.status =
+          "live";
+
+        book.lastUpdate =
           new Date().toISOString();
 
-        latestBook.websocketConnected = true;
+        console.log(
+          "SNAPSHOT SUCCESS",
+          "bids:",
+          book.bids.size,
+          "asks:",
+          book.asks.size,
+          "updateId:",
+          book.lastUpdateId
+        );
+
+        console.log(
+          "Current price:",
+          book.currentPrice
+        );
+
       } catch (error) {
         console.log(
-          "WebSocket message parse error:",
+          "Snapshot parse error:",
           error.message
         );
       }
     });
 
-    ws.on("close", () => {
+    snapshotWs.on("close", () => {
       console.log(
-        "Binance Futures WebSocket disconnected."
+        "Snapshot WebSocket disconnected."
       );
 
-      latestBook.websocketConnected = false;
+      book.snapshotConnected =
+        false;
 
-      scheduleWebSocketReconnect();
+      scheduleSnapshotReconnect();
     });
 
-    ws.on("error", (error) => {
+    snapshotWs.on("error", (error) => {
       console.log(
-        "Binance Futures WebSocket error:",
+        "Snapshot WebSocket error:",
         error.message
       );
     });
+
   } catch (error) {
     console.log(
-      "WebSocket connection error:",
+      "Snapshot connection error:",
       error.message
     );
 
-    scheduleWebSocketReconnect();
+    scheduleSnapshotReconnect();
   }
 }
 
-function scheduleWebSocketReconnect() {
-  if (reconnectTimer) {
+function scheduleSnapshotReconnect() {
+  if (snapshotTimer) {
     return;
   }
 
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
+  snapshotTimer =
+    setTimeout(() => {
+      snapshotTimer = null;
 
-    connectBinanceWebSocket();
-  }, 5000);
+      connectSnapshotWs();
+    }, 5000);
 }
 
 // ============================================================
-// WIDE REST ORDER BOOK
+// LIVE DIFF DEPTH STREAM
 // ============================================================
 
-async function refreshWideOrderBook() {
+function connectDepthWs() {
+  console.log(
+    "Connecting to Binance Futures depth stream..."
+  );
+
   try {
-    const url =
-      `${FUTURES_REST}/fapi/v1/depth` +
-      `?symbol=${SYMBOL}` +
-      `&limit=${ORDERBOOK_LIMIT}`;
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}`
+    depthWs =
+      new WebSocket(
+        STREAM_URL
       );
-    }
 
-    const data = await response.json();
+    depthWs.on("open", () => {
+      console.log(
+        "Binance Futures depth stream connected."
+      );
 
-    const bids = Array.isArray(data.bids)
-      ? data.bids.map((level) => {
-          const price = number(level[0]);
-          const quantity = number(level[1]);
+      book.websocketConnected =
+        true;
+    });
 
-          return {
-            price,
-            quantity,
-            usd: price * quantity
-          };
-        })
-      : [];
+    depthWs.on("message", (data) => {
+      try {
+        const event =
+          JSON.parse(
+            data.toString()
+          );
 
-    const asks = Array.isArray(data.asks)
-      ? data.asks.map((level) => {
-          const price = number(level[0]);
-          const quantity = number(level[1]);
+        if (
+          event.e !==
+          "depthUpdate"
+        ) {
+          return;
+        }
 
-          return {
-            price,
-            quantity,
-            usd: price * quantity
-          };
-        })
-      : [];
+        // Ignore updates until snapshot exists.
+        if (!book.initialized) {
+          return;
+        }
 
-    bids.sort((a, b) => b.price - a.price);
-    asks.sort((a, b) => a.price - b.price);
+        const firstUpdate =
+          n(event.U);
 
-    latestBook.bids = bids;
-    latestBook.asks = asks;
+        const finalUpdate =
+          n(event.u);
 
-    latestBook.currentPrice =
-      getCurrentPrice();
+        // Ignore events completely
+        // older than our snapshot.
+        if (
+          finalUpdate <=
+          book.lastUpdateId
+        ) {
+          return;
+        }
 
-    latestBook.restUpdatedAt =
-      new Date().toISOString();
+        // Detect a gap.
+        if (
+          firstUpdate >
+          book.lastUpdateId + 1
+        ) {
+          console.log(
+            "ORDER BOOK GAP DETECTED"
+          );
 
-    latestBook.restConnected = true;
+          console.log(
+            "Local:",
+            book.lastUpdateId
+          );
 
-    latestBook.depthLevels =
-      bids.length + asks.length;
+          console.log(
+            "Event starts:",
+            firstUpdate
+          );
 
-    latestBook.status = "live";
+          book.initialized =
+            false;
 
-    updateLiquidityClusters();
+          requestSnapshot();
 
-    console.log(
-      `Wide order book updated: ${bids.length} bids / ${asks.length} asks`
-    );
+          return;
+        }
+
+        applyUpdates(event);
+
+      } catch (error) {
+        console.log(
+          "Depth event error:",
+          error.message
+        );
+      }
+    });
+
+    depthWs.on("close", () => {
+      console.log(
+        "Depth stream disconnected."
+      );
+
+      book.websocketConnected =
+        false;
+
+      setTimeout(() => {
+        connectDepthWs();
+      }, 5000);
+    });
+
+    depthWs.on("error", (error) => {
+      console.log(
+        "Depth stream error:",
+        error.message
+      );
+    });
+
   } catch (error) {
-    latestBook.restConnected = false;
-
     console.log(
-      "Wide order book error:",
+      "Depth connection error:",
       error.message
     );
+
+    setTimeout(() => {
+      connectDepthWs();
+    }, 5000);
   }
-}
-
-function startRestRefresh() {
-  if (restTimer) {
-    clearInterval(restTimer);
-  }
-
-  refreshWideOrderBook();
-
-  restTimer = setInterval(() => {
-    refreshWideOrderBook();
-  }, REST_REFRESH_MS);
 }
 
 // ============================================================
-// CLUSTER ENGINE
+// CONVERT MAP TO LEVELS
+// ============================================================
+
+function getLevels(side) {
+  const map =
+    side === "bid"
+      ? book.bids
+      : book.asks;
+
+  const levels = [];
+
+  for (
+    const [price, quantity]
+    of map
+  ) {
+    if (
+      price <= 0 ||
+      quantity <= 0
+    ) {
+      continue;
+    }
+
+    levels.push({
+      price,
+      quantity,
+      usd:
+        usd(
+          price,
+          quantity
+        )
+    });
+  }
+
+  if (side === "bid") {
+    levels.sort(
+      (a, b) =>
+        b.price -
+        a.price
+    );
+  } else {
+    levels.sort(
+      (a, b) =>
+        a.price -
+        b.price
+    );
+  }
+
+  return levels;
+}
+
+// ============================================================
+// CLUSTERS
 // ============================================================
 
 function buildClusters(
   levels,
-  side,
-  currentPrice,
-  minClusterUsd,
-  rangePct,
-  gapPct
+  side
 ) {
-  if (!currentPrice) {
+  const currentPrice =
+    book.currentPrice;
+
+  if (
+    !currentPrice ||
+    !levels.length
+  ) {
     return [];
   }
 
-  if (!levels || levels.length === 0) {
-    return [];
-  }
+  const range =
+    currentPrice *
+    RANGE_PCT;
 
-  const filtered = [];
+  const filtered =
+    levels.filter(
+      (level) => {
 
-  for (const level of levels) {
-    if (!level || level.price <= 0) {
-      continue;
-    }
+        if (side === "bid") {
+          return (
+            level.price <
+              currentPrice &&
+            currentPrice -
+              level.price <=
+              range
+          );
+        }
 
-    const distance =
-      Math.abs(
-        (level.price - currentPrice) /
-          currentPrice
-      );
-
-    if (distance > rangePct) {
-      continue;
-    }
-
-    // Buy liquidity should be below current price.
-    if (
-      side === "bid" &&
-      level.price >= currentPrice
-    ) {
-      continue;
-    }
-
-    // Sell liquidity should be above current price.
-    if (
-      side === "ask" &&
-      level.price <= currentPrice
-    ) {
-      continue;
-    }
-
-    filtered.push(level);
-  }
-
-  if (filtered.length === 0) {
-    return [];
-  }
-
-  if (side === "bid") {
-    filtered.sort(
-      (a, b) => b.price - a.price
+        return (
+          level.price >
+            currentPrice &&
+          level.price -
+            currentPrice <=
+            range
+        );
+      }
     );
-  } else {
-    filtered.sort(
-      (a, b) => a.price - b.price
-    );
-  }
 
   const clusters = [];
 
-  let cluster = null;
+  let current = null;
 
-  for (const level of filtered) {
-    if (!cluster) {
-      cluster = createCluster(
-        level,
-        side
-      );
+  const maxGap =
+    currentPrice *
+    CLUSTER_GAP_PCT;
+
+  for (
+    const level of filtered
+  ) {
+    if (!current) {
+      current = {
+        side,
+
+        priceLow:
+          level.price,
+
+        priceHigh:
+          level.price,
+
+        totalUsd:
+          level.usd,
+
+        totalQuantity:
+          level.quantity,
+
+        levels: 1,
+
+        strongestPrice:
+          level.price,
+
+        strongestUsd:
+          level.usd
+      };
 
       continue;
     }
 
     const previousPrice =
-      cluster.lastPrice;
+      side === "bid"
+        ? current.priceLow
+        : current.priceHigh;
 
-    const priceGap =
+    const gap =
       Math.abs(
-        level.price - previousPrice
+        level.price -
+          previousPrice
       );
 
-    const allowedGap =
-      currentPrice * gapPct;
+    if (
+      gap <= maxGap
+    ) {
+      current.priceLow =
+        Math.min(
+          current.priceLow,
+          level.price
+        );
 
-    if (priceGap <= allowedGap) {
-      addLevelToCluster(
-        cluster,
-        level
-      );
+      current.priceHigh =
+        Math.max(
+          current.priceHigh,
+          level.price
+        );
+
+      current.totalUsd +=
+        level.usd;
+
+      current.totalQuantity +=
+        level.quantity;
+
+      current.levels++;
+
+      if (
+        level.usd >
+        current.strongestUsd
+      ) {
+        current.strongestUsd =
+          level.usd;
+
+        current.strongestPrice =
+          level.price;
+      }
+
     } else {
-      clusters.push(cluster);
+      if (
+        current.totalUsd >=
+        MIN_CLUSTER_USD
+      ) {
+        clusters.push(
+          current
+        );
+      }
 
-      cluster = createCluster(
-        level,
-        side
-      );
+      current = {
+        side,
+
+        priceLow:
+          level.price,
+
+        priceHigh:
+          level.price,
+
+        totalUsd:
+          level.usd,
+
+        totalQuantity:
+          level.quantity,
+
+        levels: 1,
+
+        strongestPrice:
+          level.price,
+
+        strongestUsd:
+          level.usd
+      };
     }
   }
-
-  if (cluster) {
-    clusters.push(cluster);
-  }
-
-  // Only retain meaningful clusters
-  const strongClusters =
-    clusters.filter(
-      (cluster) =>
-        cluster.totalUsd >=
-        minClusterUsd
-    );
-
-  // Sort by total USD value
-  strongClusters.sort(
-    (a, b) =>
-      b.totalUsd - a.totalUsd
-  );
-
-  return strongClusters
-    .slice(0, MAX_CLUSTERS_PER_SIDE)
-    .map((cluster) => {
-      return finalizeCluster(
-        cluster,
-        currentPrice
-      );
-    });
-}
-
-function createCluster(level, side) {
-  return {
-    side,
-
-    firstPrice: level.price,
-    lastPrice: level.price,
-
-    minPrice: level.price,
-    maxPrice: level.price,
-
-    totalUsd: level.usd,
-    totalQuantity: level.quantity,
-
-    levels: 1,
-
-    strongestPrice: level.price,
-    strongestUsd: level.usd
-  };
-}
-
-function addLevelToCluster(
-  cluster,
-  level
-) {
-  cluster.lastPrice =
-    level.price;
-
-  cluster.minPrice =
-    Math.min(
-      cluster.minPrice,
-      level.price
-    );
-
-  cluster.maxPrice =
-    Math.max(
-      cluster.maxPrice,
-      level.price
-    );
-
-  cluster.totalUsd +=
-    level.usd;
-
-  cluster.totalQuantity +=
-    level.quantity;
-
-  cluster.levels++;
 
   if (
-    level.usd >
-    cluster.strongestUsd
+    current &&
+    current.totalUsd >=
+      MIN_CLUSTER_USD
   ) {
-    cluster.strongestUsd =
-      level.usd;
-
-    cluster.strongestPrice =
-      level.price;
-  }
-}
-
-function finalizeCluster(
-  cluster,
-  currentPrice
-) {
-  const midpoint =
-    (cluster.minPrice +
-      cluster.maxPrice) /
-    2;
-
-  const distance =
-    distancePct(
-      midpoint,
-      currentPrice
+    clusters.push(
+      current
     );
+  }
 
-  return {
-    side: cluster.side,
+  clusters.sort(
+    (a, b) =>
+      b.totalUsd -
+      a.totalUsd
+  );
 
-    priceLow: round(
-      cluster.minPrice,
-      2
-    ),
+  return clusters
+    .slice(0, 15)
+    .map(
+      (cluster) => {
 
-    priceHigh: round(
-      cluster.maxPrice,
-      2
-    ),
-
-    midpoint: round(
-      midpoint,
-      2
-    ),
-
-    strongestPrice: round(
-      cluster.strongestPrice,
-      2
-    ),
-
-    strongestUsd:
-      round(
-        cluster.strongestUsd,
-        2
-      ),
-
-    totalUsd:
-      round(
-        cluster.totalUsd,
-        2
-      ),
-
-    totalQuantity:
-      round(
-        cluster.totalQuantity,
-        6
-      ),
-
-    levels:
-      cluster.levels,
-
-    distancePct:
-      round(
-        distance,
-        3
-      ),
-
-    persistence:
-      1
-  };
-}
-
-// ============================================================
-// PERSISTENCE
-// ============================================================
-
-function updatePersistence(
-  newClusters,
-  oldClusters
-) {
-  return newClusters.map(
-    (cluster) => {
-      let bestMatch = null;
-
-      let bestDistance =
-        Infinity;
-
-      for (const oldCluster of oldClusters) {
-        if (
-          oldCluster.side !==
-          cluster.side
-        ) {
-          continue;
-        }
+        const midpoint =
+          (
+            cluster.priceLow +
+            cluster.priceHigh
+          ) / 2;
 
         const distance =
-          Math.abs(
-            oldCluster.midpoint -
-              cluster.midpoint
-          ) /
-          cluster.midpoint;
+          (
+            (
+              midpoint -
+              currentPrice
+            ) /
+            currentPrice
+          ) * 100;
 
-        if (
-          distance <
-            PERSISTENCE_MATCH_PCT &&
-          distance <
-            bestDistance
-        ) {
-          bestMatch =
-            oldCluster;
+        return {
+          side:
+            cluster.side,
 
-          bestDistance =
-            distance;
-        }
+          priceLow:
+            round(
+              cluster.priceLow,
+              2
+            ),
+
+          priceHigh:
+            round(
+              cluster.priceHigh,
+              2
+            ),
+
+          midpoint:
+            round(
+              midpoint,
+              2
+            ),
+
+          strongestPrice:
+            round(
+              cluster.strongestPrice,
+              2
+            ),
+
+          strongestUsd:
+            round(
+              cluster.strongestUsd,
+              2
+            ),
+
+          totalUsd:
+            round(
+              cluster.totalUsd,
+              2
+            ),
+
+          totalQuantity:
+            round(
+              cluster.totalQuantity,
+              6
+            ),
+
+          levels:
+            cluster.levels,
+
+          distancePct:
+            round(
+              distance,
+              3
+            )
+        };
       }
-
-      if (bestMatch) {
-        cluster.persistence =
-          (bestMatch.persistence ||
-            1) + 1;
-      }
-
-      return cluster;
-    }
-  );
-}
-
-// ============================================================
-// UPDATE CLUSTERS
-// ============================================================
-
-function updateLiquidityClusters() {
-  const currentPrice =
-    latestBook.currentPrice;
-
-  if (!currentPrice) {
-    return;
-  }
-
-  const rangePct =
-    DEFAULT_RANGE_PCT;
-
-  const minClusterUsd =
-    DEFAULT_MIN_CLUSTER_USD;
-
-  const gapPct =
-    DEFAULT_CLUSTER_GAP_PCT;
-
-  let bidClusters =
-    buildClusters(
-      latestBook.bids,
-      "bid",
-      currentPrice,
-      minClusterUsd,
-      rangePct,
-      gapPct
     );
-
-  let askClusters =
-    buildClusters(
-      latestBook.asks,
-      "ask",
-      currentPrice,
-      minClusterUsd,
-      rangePct,
-      gapPct
-    );
-
-  bidClusters =
-    updatePersistence(
-      bidClusters,
-      previousClusters.bids
-    );
-
-  askClusters =
-    updatePersistence(
-      askClusters,
-      previousClusters.asks
-    );
-
-  latestBook.bidClusters =
-    bidClusters;
-
-  latestBook.askClusters =
-    askClusters;
-
-  previousClusters = {
-    bids: bidClusters.map(
-      (cluster) => ({
-        ...cluster
-      })
-    ),
-
-    asks: askClusters.map(
-      (cluster) => ({
-        ...cluster
-      })
-    )
-  };
 }
 
 // ============================================================
@@ -735,65 +824,73 @@ app.get("/", (req, res) => {
     symbol: SYMBOL,
 
     status:
-      latestBook.status,
+      book.status,
 
-    binanceWebSocket:
-      latestBook.websocketConnected,
+    initialized:
+      book.initialized,
 
-    binanceRest:
-      latestBook.restConnected,
+    websocketConnected:
+      book.websocketConnected,
+
+    snapshotConnected:
+      book.snapshotConnected,
 
     currentPrice:
-      latestBook.currentPrice,
+      book.currentPrice,
 
-    depthLevels:
-      latestBook.depthLevels,
+    bidLevels:
+      book.bids.size,
 
-    bidClusters:
-      latestBook.bidClusters.length,
+    askLevels:
+      book.asks.size,
 
-    askClusters:
-      latestBook.askClusters.length,
+    lastUpdateId:
+      book.lastUpdateId,
 
     updatedAt:
-      latestBook.updatedAt,
-
-    restUpdatedAt:
-      latestBook.restUpdatedAt
+      book.lastUpdate
   });
 });
+
+// ============================================================
+// HEALTH
+// ============================================================
 
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
 
-    symbol: SYMBOL,
-
     status:
-      latestBook.status,
+      book.status,
+
+    initialized:
+      book.initialized,
 
     websocketConnected:
-      latestBook.websocketConnected,
+      book.websocketConnected,
 
-    restConnected:
-      latestBook.restConnected,
+    snapshotConnected:
+      book.snapshotConnected,
 
     currentPrice:
-      latestBook.currentPrice,
+      book.currentPrice,
 
-    depthLevels:
-      latestBook.depthLevels,
+    bidLevels:
+      book.bids.size,
+
+    askLevels:
+      book.asks.size,
+
+    lastUpdateId:
+      book.lastUpdateId,
 
     updatedAt:
-      latestBook.updatedAt,
-
-    restUpdatedAt:
-      latestBook.restUpdatedAt
+      book.lastUpdate
   });
 });
 
 // ============================================================
-// RAW WIDE ORDER BOOK
+// RAW BOOK
 // ============================================================
 
 app.get("/book", (req, res) => {
@@ -801,182 +898,137 @@ app.get("/book", (req, res) => {
     symbol: SYMBOL,
 
     currentPrice:
-      latestBook.currentPrice,
+      book.currentPrice,
 
     bids:
-      latestBook.bids,
+      getLevels("bid"),
 
     asks:
-      latestBook.asks,
+      getLevels("ask"),
 
-    bidCount:
-      latestBook.bids.length,
+    bidLevels:
+      book.bids.size,
 
-    askCount:
-      latestBook.asks.length,
+    askLevels:
+      book.asks.size,
+
+    initialized:
+      book.initialized,
+
+    lastUpdateId:
+      book.lastUpdateId,
 
     updatedAt:
-      latestBook.updatedAt,
-
-    restUpdatedAt:
-      latestBook.restUpdatedAt,
-
-    websocketConnected:
-      latestBook.websocketConnected,
-
-    restConnected:
-      latestBook.restConnected
+      book.lastUpdate
   });
 });
 
 // ============================================================
-// LIQUIDITY CLUSTERS
+// LIQUIDITY
 // ============================================================
 
 app.get("/liquidity", (req, res) => {
-  const requestedMinUsd =
-    number(
-      req.query.minUsd
-    );
-
-  const requestedRangePct =
-    number(
-      req.query.rangePct
-    );
-
-  const requestedGapPct =
-    number(
-      req.query.gapPct
-    );
-
-  const minClusterUsd =
-    requestedMinUsd > 0
-      ? requestedMinUsd
-      : DEFAULT_MIN_CLUSTER_USD;
-
-  const rangePct =
-    requestedRangePct > 0
-      ? requestedRangePct
-      : DEFAULT_RANGE_PCT;
-
-  const gapPct =
-    requestedGapPct > 0
-      ? requestedGapPct / 100
-      : DEFAULT_CLUSTER_GAP_PCT;
-
-  const currentPrice =
-    latestBook.currentPrice;
-
-  const bidClusters =
+  const bids =
     buildClusters(
-      latestBook.bids,
-      "bid",
-      currentPrice,
-      minClusterUsd,
-      rangePct,
-      gapPct
+      getLevels("bid"),
+      "bid"
     );
 
-  const askClusters =
+  const asks =
     buildClusters(
-      latestBook.asks,
-      "ask",
-      currentPrice,
-      minClusterUsd,
-      rangePct,
-      gapPct
+      getLevels("ask"),
+      "ask"
     );
 
-  const persistedBids =
-    updatePersistence(
-      bidClusters,
-      previousClusters.bids
+  const totalBuyUsd =
+    bids.reduce(
+      (sum, cluster) =>
+        sum +
+        cluster.totalUsd,
+      0
     );
 
-  const persistedAsks =
-    updatePersistence(
-      askClusters,
-      previousClusters.asks
+  const totalSellUsd =
+    asks.reduce(
+      (sum, cluster) =>
+        sum +
+        cluster.totalUsd,
+      0
     );
 
   res.json({
     symbol: SYMBOL,
 
     currentPrice:
-
-      currentPrice
-        ? round(
-            currentPrice,
-            2
-          )
-        : null,
-
-    settings: {
-      minClusterUsd,
-      rangePct,
-      gapPct
-    },
+      book.currentPrice,
 
     buyLiquidity:
-      persistedBids,
+      bids,
 
     sellLiquidity:
-      persistedAsks,
+      asks,
 
     summary: {
       buyClusters:
-        persistedBids.length,
+        bids.length,
 
       sellClusters:
-        persistedAsks.length,
+        asks.length,
 
       totalBuyUsd:
         round(
-          persistedBids.reduce(
-            (sum, cluster) =>
-              sum +
-              cluster.totalUsd,
-            0
-          ),
+          totalBuyUsd,
           2
         ),
 
       totalSellUsd:
         round(
-          persistedAsks.reduce(
-            (sum, cluster) =>
-              sum +
-              cluster.totalUsd,
-            0
-          ),
+          totalSellUsd,
           2
         )
     },
 
-    restConnected:
-      latestBook.restConnected,
+    book: {
+      initialized:
+        book.initialized,
 
-    websocketConnected:
-      latestBook.websocketConnected,
+      bidLevels:
+        book.bids.size,
 
-    depthLevels:
-      latestBook.depthLevels,
+      askLevels:
+        book.asks.size,
+
+      lastUpdateId:
+        book.lastUpdateId
+    },
+
+    connections: {
+      depthWebSocket:
+        book.websocketConnected,
+
+      snapshotWebSocket:
+        book.snapshotConnected
+    },
 
     updatedAt:
-      latestBook.restUpdatedAt
+      book.lastUpdate
   });
 });
 
 // ============================================================
-// START SERVER
+// START
 // ============================================================
 
-app.listen(PORT, () => {
-  console.log(
-    `Relay server running on port ${PORT}`
-  );
+app.listen(
+  PORT,
+  () => {
 
-  connectBinanceWebSocket();
+    console.log(
+      `Server listening on ${PORT}`
+    );
 
-  startRestRefresh();
-});
+    connectDepthWs();
+
+    connectSnapshotWs();
+  }
+);
