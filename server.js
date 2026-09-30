@@ -8,24 +8,18 @@ const PORT = process.env.PORT || 10000;
 const SYMBOL = "BTCUSDT";
 const SYMBOL_LOWER = SYMBOL.toLowerCase();
 
-// ============================================================
-// BINANCE CONNECTIONS
-// ============================================================
-
 const DEPTH_STREAM =
   `wss://fstream.binance.com/ws/${SYMBOL_LOWER}@depth@100ms`;
 
 const WS_API =
-  "wss://ws-fapi.binance.com/ws-fapi/v1";
+  "wss://ws-fapi.binance.com/ws-fapi/v1`;
 
 // ============================================================
 // LIQUIDITY SETTINGS
 // ============================================================
 
 const MIN_CLUSTER_USD = 500000;
-
 const MIN_CLUSTER_LEVELS = 3;
-
 const SEED_LEVEL_USD = 100000;
 
 const PRICE_BUCKET_SIZE = 1;
@@ -37,37 +31,21 @@ const RANGE_PCT = 0.03;
 const MAX_CLUSTERS = 12;
 
 // ============================================================
-// SYNCHRONIZATION SETTINGS
+// SNAPSHOT PROTECTION
 // ============================================================
 
-// IMPORTANT:
-//
-// We do NOT repeatedly hammer the snapshot endpoint.
-//
-// After a snapshot request, wait at least 65 seconds before
-// another request.
-//
-// This protects the Render IP from Binance 429 errors.
+const SNAPSHOT_MIN_INTERVAL_MS = 65000;
 
-const SNAPSHOT_MIN_INTERVAL_MS =
-  65000;
+const SNAPSHOT_TIMEOUT_MS = 15000;
 
-const SNAPSHOT_TIMEOUT_MS =
-  15000;
-
-// Maximum number of depth events we keep while waiting.
-
-const MAX_PENDING_EVENTS =
-  20000;
+const MAX_PENDING_EVENTS = 20000;
 
 // ============================================================
-// BOOK STATE
+// BOOK
 // ============================================================
 
 let book = {
-
   bids: new Map(),
-
   asks: new Map(),
 
   currentPrice: null,
@@ -106,26 +84,19 @@ let book = {
 };
 
 // ============================================================
-// WEBSOCKET STATE
+// CONNECTION STATE
 // ============================================================
 
 let depthWs = null;
-
 let snapshotWs = null;
 
 let depthReconnectTimer = null;
-
 let snapshotReconnectTimer = null;
 
 let snapshotRetryTimer = null;
-
 let snapshotTimeoutTimer = null;
 
 let requestId = 1;
-
-// ============================================================
-// SNAPSHOT REQUEST CONTROL
-// ============================================================
 
 let lastSnapshotRequestAt = 0;
 
@@ -136,22 +107,19 @@ let lastSnapshotRequestAt = 0;
 let pendingDepthEvents = [];
 
 // ============================================================
-// CLUSTER PERSISTENCE
+// CLUSTER HISTORY
 // ============================================================
 
 let clusterHistory = {
-
   bid: [],
-
   ask: []
 };
 
 // ============================================================
-// BASIC HELPERS
+// HELPERS
 // ============================================================
 
 function num(value) {
-
   const n = Number(value);
 
   return Number.isFinite(n)
@@ -160,9 +128,7 @@ function num(value) {
 }
 
 function round(value, decimals = 2) {
-
-  const factor =
-    Math.pow(10, decimals);
+  const factor = Math.pow(10, decimals);
 
   return (
     Math.round(value * factor) /
@@ -177,7 +143,6 @@ function round(value, decimals = 2) {
 function getCurrentPrice() {
 
   let bestBid = null;
-
   let bestAsk = null;
 
   for (
@@ -235,7 +200,7 @@ function getCurrentPrice() {
 }
 
 // ============================================================
-// APPLY DEPTH EVENT
+// APPLY ONE DEPTH EVENT
 // ============================================================
 
 function applyDepthEvent(event) {
@@ -256,23 +221,16 @@ function applyDepthEvent(event) {
       const level of event.b
     ) {
 
-      const price =
-        num(level[0]);
-
-      const quantity =
-        num(level[1]);
+      const price = num(level[0]);
+      const quantity = num(level[1]);
 
       if (!price) {
         continue;
       }
 
-      if (
-        quantity === 0
-      ) {
+      if (quantity === 0) {
 
-        book.bids.delete(
-          price
-        );
+        book.bids.delete(price);
 
       } else {
 
@@ -296,23 +254,16 @@ function applyDepthEvent(event) {
       const level of event.a
     ) {
 
-      const price =
-        num(level[0]);
-
-      const quantity =
-        num(level[1]);
+      const price = num(level[0]);
+      const quantity = num(level[1]);
 
       if (!price) {
         continue;
       }
 
-      if (
-        quantity === 0
-      ) {
+      if (quantity === 0) {
 
-        book.asks.delete(
-          price
-        );
+        book.asks.delete(price);
 
       } else {
 
@@ -335,7 +286,7 @@ function applyDepthEvent(event) {
 }
 
 // ============================================================
-// RESET BOOK
+// RESET
 // ============================================================
 
 function resetForSnapshot(reason) {
@@ -345,7 +296,7 @@ function resetForSnapshot(reason) {
   );
 
   console.log(
-    "RESETTING ORDER BOOK"
+    "RESET FOR SNAPSHOT"
   );
 
   console.log(
@@ -358,35 +309,21 @@ function resetForSnapshot(reason) {
   );
 
   book.bids.clear();
-
   book.asks.clear();
 
-  book.currentPrice =
-    null;
+  book.currentPrice = null;
 
-  book.lastUpdateId =
-    0;
+  book.lastUpdateId = 0;
 
-  book.initialized =
-    false;
+  book.initialized = false;
 
-  book.waitingForBridge =
-    false;
+  book.waitingForBridge = false;
 
-  book.snapshotPending =
-    false;
+  book.snapshotPending = false;
 
-  book.status =
-    "syncing";
+  book.status = "syncing";
 
   book.resyncs++;
-
-  // ----------------------------------------------------------
-  // IMPORTANT:
-  //
-  // We clear old events because they belong to the old
-  // synchronization cycle.
-  // ----------------------------------------------------------
 
   pendingDepthEvents = [];
 }
@@ -397,18 +334,13 @@ function resetForSnapshot(reason) {
 
 function scheduleSnapshotRetry(delayMs) {
 
-  if (
-    snapshotRetryTimer
-  ) {
-
+  if (snapshotRetryTimer) {
     return;
   }
 
   console.log(
-    "Snapshot retry scheduled in",
-    Math.ceil(
-      delayMs / 1000
-    ),
+    "Snapshot retry in",
+    Math.ceil(delayMs / 1000),
     "seconds."
   );
 
@@ -416,8 +348,7 @@ function scheduleSnapshotRetry(delayMs) {
     setTimeout(
       () => {
 
-        snapshotRetryTimer =
-          null;
+        snapshotRetryTimer = null;
 
         requestSnapshot();
 
@@ -432,20 +363,12 @@ function scheduleSnapshotRetry(delayMs) {
 
 function requestSnapshot() {
 
-  // ----------------------------------------------------------
-  // Never request two snapshots simultaneously.
-  // ----------------------------------------------------------
-
   if (
     book.snapshotPending
   ) {
 
     return;
   }
-
-  // ----------------------------------------------------------
-  // If already live, don't request anything.
-  // ----------------------------------------------------------
 
   if (
     book.initialized
@@ -454,15 +377,9 @@ function requestSnapshot() {
     return;
   }
 
-  // ----------------------------------------------------------
-  // Snapshot socket must exist.
-  // ----------------------------------------------------------
-
   if (!snapshotWs) {
 
-    scheduleSnapshotRetry(
-      5000
-    );
+    scheduleSnapshotRetry(5000);
 
     return;
   }
@@ -472,19 +389,12 @@ function requestSnapshot() {
     WebSocket.OPEN
   ) {
 
-    scheduleSnapshotRetry(
-      5000
-    );
+    scheduleSnapshotRetry(5000);
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // Rate-limit protection.
-  // ----------------------------------------------------------
-
-  const now =
-    Date.now();
+  const now = Date.now();
 
   const elapsed =
     now -
@@ -498,26 +408,20 @@ function requestSnapshot() {
 
     scheduleSnapshotRetry(
       SNAPSHOT_MIN_INTERVAL_MS -
-        elapsed
+      elapsed
     );
 
     return;
   }
 
-  // ----------------------------------------------------------
-  // Mark pending BEFORE sending.
-  // ----------------------------------------------------------
-
-  book.snapshotPending =
-    true;
+  book.snapshotPending = true;
 
   book.snapshotRequests++;
 
   book.lastSnapshotRequest =
     new Date().toISOString();
 
-  lastSnapshotRequestAt =
-    now;
+  lastSnapshotRequestAt = now;
 
   const id =
     String(requestId++);
@@ -541,11 +445,11 @@ function requestSnapshot() {
   );
 
   console.log(
-    "REQUESTING BINANCE SNAPSHOT"
+    "REQUESTING SNAPSHOT"
   );
 
   console.log(
-    "Request ID:",
+    "ID:",
     id
   );
 
@@ -577,22 +481,21 @@ function requestSnapshot() {
       setTimeout(
         () => {
 
-          snapshotTimeoutTimer =
-            null;
+          snapshotTimeoutTimer = null;
 
           if (
             book.snapshotPending
           ) {
 
             console.log(
-              "Snapshot response timeout."
+              "SNAPSHOT TIMEOUT"
             );
 
             book.snapshotPending =
               false;
 
             book.lastSnapshotError =
-              "Snapshot response timeout.";
+              "Snapshot timeout.";
 
             scheduleSnapshotRetry(
               SNAPSHOT_MIN_INTERVAL_MS
@@ -605,16 +508,10 @@ function requestSnapshot() {
 
   } catch (error) {
 
-    book.snapshotPending =
-      false;
+    book.snapshotPending = false;
 
     book.lastSnapshotError =
       error.message;
-
-    console.log(
-      "Snapshot send error:",
-      error.message
-    );
 
     scheduleSnapshotRetry(
       SNAPSHOT_MIN_INTERVAL_MS
@@ -628,66 +525,41 @@ function requestSnapshot() {
 
 function installSnapshot(result) {
 
-  if (
-    !result
-  ) {
+  if (!result) {
 
-    book.snapshotPending =
-      false;
+    book.snapshotPending = false;
 
     book.lastSnapshotError =
-      "Empty snapshot result.";
+      "Empty snapshot.";
 
     return;
   }
 
   if (
-    !Array.isArray(
-      result.bids
-    ) ||
-    !Array.isArray(
-      result.asks
-    )
+    !Array.isArray(result.bids) ||
+    !Array.isArray(result.asks)
   ) {
 
-    book.snapshotPending =
-      false;
+    book.snapshotPending = false;
 
     book.lastSnapshotError =
-      "Snapshot missing bids/asks.";
-
-    console.log(
-      "Invalid snapshot structure."
-    );
+      "Invalid snapshot structure.";
 
     return;
   }
 
   const snapshotId =
-    num(
-      result.lastUpdateId
-    );
+    num(result.lastUpdateId);
 
-  if (
-    !snapshotId
-  ) {
+  if (!snapshotId) {
 
-    book.snapshotPending =
-      false;
+    book.snapshotPending = false;
 
     book.lastSnapshotError =
       "Snapshot missing lastUpdateId.";
 
-    console.log(
-      "Snapshot has no lastUpdateId."
-    );
-
     return;
   }
-
-  // ----------------------------------------------------------
-  // Cancel timeout.
-  // ----------------------------------------------------------
 
   if (
     snapshotTimeoutTimer
@@ -697,27 +569,22 @@ function installSnapshot(result) {
       snapshotTimeoutTimer
     );
 
-    snapshotTimeoutTimer =
-      null;
+    snapshotTimeoutTimer = null;
   }
 
   // ----------------------------------------------------------
-  // Install bids.
+  // Install snapshot book.
   // ----------------------------------------------------------
 
   book.bids.clear();
-
   book.asks.clear();
 
   for (
     const level of result.bids
   ) {
 
-    const price =
-      num(level[0]);
-
-    const quantity =
-      num(level[1]);
+    const price = num(level[0]);
+    const quantity = num(level[1]);
 
     if (
       price > 0 &&
@@ -731,19 +598,12 @@ function installSnapshot(result) {
     }
   }
 
-  // ----------------------------------------------------------
-  // Install asks.
-  // ----------------------------------------------------------
-
   for (
     const level of result.asks
   ) {
 
-    const price =
-      num(level[0]);
-
-    const quantity =
-      num(level[1]);
+    const price = num(level[0]);
+    const quantity = num(level[1]);
 
     if (
       price > 0 &&
@@ -758,7 +618,7 @@ function installSnapshot(result) {
   }
 
   // ----------------------------------------------------------
-  // Snapshot becomes our sequence starting point.
+  // Snapshot sequence.
   // ----------------------------------------------------------
 
   book.lastUpdateId =
@@ -794,7 +654,7 @@ function installSnapshot(result) {
   );
 
   console.log(
-    "Snapshot lastUpdateId:",
+    "Snapshot ID:",
     snapshotId
   );
 
@@ -809,7 +669,7 @@ function installSnapshot(result) {
   );
 
   console.log(
-    "Buffered events:",
+    "Buffered:",
     pendingDepthEvents.length
   );
 
@@ -817,18 +677,14 @@ function installSnapshot(result) {
     "================================"
   );
 
-  // ----------------------------------------------------------
-  // Now find the bridge.
-  // ----------------------------------------------------------
-
-  findBridgeEvent();
+  findBridge();
 }
 
 // ============================================================
-// FIND BRIDGE EVENT
+// FIND BRIDGE
 // ============================================================
 
-function findBridgeEvent() {
+function findBridge() {
 
   if (
     !book.waitingForBridge
@@ -837,34 +693,13 @@ function findBridgeEvent() {
     return;
   }
 
-  if (
-    !pendingDepthEvents.length
-  ) {
-
-    console.log(
-      "Waiting for bridge event..."
-    );
-
-    return;
-  }
-
   book.bridgeAttempts++;
-
-  // ----------------------------------------------------------
-  // Sort oldest first.
-  // ----------------------------------------------------------
-
-  pendingDepthEvents.sort(
-    (a, b) =>
-      num(a.U) -
-      num(b.U)
-  );
 
   const snapshotId =
     book.lastUpdateId;
 
   // ----------------------------------------------------------
-  // Remove events completely before snapshot.
+  // Remove events that are completely before snapshot.
   // ----------------------------------------------------------
 
   pendingDepthEvents =
@@ -875,12 +710,8 @@ function findBridgeEvent() {
     );
 
   if (
-    !pendingDepthEvents.length
+    pendingDepthEvents.length === 0
   ) {
-
-    console.log(
-      "No bridge event yet."
-    );
 
     return;
   }
@@ -888,9 +719,13 @@ function findBridgeEvent() {
   // ----------------------------------------------------------
   // IMPORTANT:
   //
-  // We do NOT assume the first event must bridge.
+  // Find the first event satisfying:
   //
-  // We search the entire buffer.
+  // U <= snapshotId + 1
+  // AND
+  // u >= snapshotId + 1
+  //
+  // Do NOT require U === snapshotId + 1.
   // ----------------------------------------------------------
 
   let bridgeIndex = -1;
@@ -911,12 +746,6 @@ function findBridgeEvent() {
     const last =
       num(event.u);
 
-    // Binance bridge condition:
-    //
-    // U <= snapshotId + 1
-    // AND
-    // u >= snapshotId + 1
-
     if (
       first <=
         snapshotId + 1 &&
@@ -924,64 +753,36 @@ function findBridgeEvent() {
         snapshotId + 1
     ) {
 
-      bridgeIndex =
-        i;
+      bridgeIndex = i;
 
       break;
     }
   }
 
   // ----------------------------------------------------------
-  // No bridge yet.
-  //
-  // DO NOT RESYNC.
-  //
-  // More depth events are still arriving.
+  // Still waiting.
   // ----------------------------------------------------------
 
   if (
     bridgeIndex === -1
   ) {
 
-    const oldest =
-      pendingDepthEvents[0];
-
-    const newest =
-      pendingDepthEvents[
-        pendingDepthEvents.length - 1
-      ];
-
-    console.log(
-      "Still waiting for bridge."
-    );
-
-    console.log(
-      "Snapshot:",
-      snapshotId
-    );
-
-    console.log(
-      "Buffered range:",
-      oldest.U,
-      "-",
-      newest.u
-    );
-
     return;
   }
 
-  // ----------------------------------------------------------
-  // Found bridge.
-  // ----------------------------------------------------------
-
   book.bridgeFound++;
+
+  const bridgeEvent =
+    pendingDepthEvents[
+      bridgeIndex
+    ];
 
   console.log(
     "================================"
   );
 
   console.log(
-    "BRIDGE EVENT FOUND"
+    "BRIDGE FOUND"
   );
 
   console.log(
@@ -990,14 +791,13 @@ function findBridgeEvent() {
   );
 
   console.log(
-    "Bridge:",
-    pendingDepthEvents[
-      bridgeIndex
-    ].U,
-    "-",
-    pendingDepthEvents[
-      bridgeIndex
-    ].u
+    "Bridge U:",
+    bridgeEvent.U
+  );
+
+  console.log(
+    "Bridge u:",
+    bridgeEvent.u
   );
 
   console.log(
@@ -1005,98 +805,37 @@ function findBridgeEvent() {
   );
 
   // ----------------------------------------------------------
-  // Everything before bridge is discarded.
+  // Discard everything before bridge.
   // ----------------------------------------------------------
 
-  pendingDepthEvents =
+  const eventsToApply =
     pendingDepthEvents.slice(
       bridgeIndex
     );
 
-  // ----------------------------------------------------------
-  // Apply bridge and following events.
-  // ----------------------------------------------------------
-
-  while (
-    pendingDepthEvents.length
-  ) {
-
-    const event =
-      pendingDepthEvents.shift();
-
-    const first =
-      num(event.U);
-
-    const last =
-      num(event.u);
-
-    // Ignore old event.
-
-    if (
-      last <=
-      book.lastUpdateId
-    ) {
-
-      continue;
-    }
-
-    // --------------------------------------------------------
-    // The first event must bridge.
-    // --------------------------------------------------------
-
-    if (
-      first <=
-        book.lastUpdateId + 1 &&
-      last >=
-        book.lastUpdateId + 1
-    ) {
-
-      applyDepthEvent(
-        event
-      );
-
-      continue;
-    }
-
-    // --------------------------------------------------------
-    // A genuine gap has occurred.
-    // --------------------------------------------------------
-
-    if (
-      first >
-      book.lastUpdateId + 1
-    ) {
-
-      console.log(
-        "Gap encountered while applying bridge."
-      );
-
-      console.log(
-        "Expected:",
-        book.lastUpdateId + 1
-      );
-
-      console.log(
-        "Received:",
-        first,
-        "-",
-        last
-      );
-
-      resetForSnapshot(
-        "gap during bridge"
-      );
-
-      scheduleSnapshotRetry(
-        SNAPSHOT_MIN_INTERVAL_MS
-      );
-
-      return;
-    }
-  }
+  pendingDepthEvents = [];
 
   // ----------------------------------------------------------
-  // Successfully synchronized.
+  // CRITICAL FIX:
+  //
+  // Apply bridge event FIRST.
+  //
+  // We already know it is valid because:
+  //
+  // U <= snapshot + 1
+  // u >= snapshot + 1
+  //
+  // Therefore it can safely advance the snapshot.
+  // ----------------------------------------------------------
+
+  applyDepthEvent(
+    eventsToApply[0]
+  );
+
+  // ----------------------------------------------------------
+  // The book is now synchronized.
+  //
+  // We transition to LIVE immediately after the bridge.
   // ----------------------------------------------------------
 
   book.waitingForBridge =
@@ -1122,11 +861,7 @@ function findBridgeEvent() {
   );
 
   console.log(
-    "ORDER BOOK SYNCHRONIZED"
-  );
-
-  console.log(
-    "Status: LIVE"
+    "ORDER BOOK IS NOW LIVE"
   );
 
   console.log(
@@ -1152,6 +887,97 @@ function findBridgeEvent() {
   console.log(
     "================================"
   );
+
+  // ----------------------------------------------------------
+  // Apply remaining buffered events.
+  //
+  // If there is a gap after the bridge, we resync later.
+  // But importantly, the snapshot is NOT discarded before
+  // the bridge is established.
+  // ----------------------------------------------------------
+
+  for (
+    let i = 1;
+    i <
+      eventsToApply.length;
+    i++
+  ) {
+
+    const event =
+      eventsToApply[i];
+
+    const first =
+      num(event.U);
+
+    const last =
+      num(event.u);
+
+    if (
+      last <=
+      book.lastUpdateId
+    ) {
+
+      continue;
+    }
+
+    if (
+      first <=
+        book.lastUpdateId + 1 &&
+      last >=
+        book.lastUpdateId + 1
+    ) {
+
+      applyDepthEvent(
+        event
+      );
+
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // A real gap occurred after synchronization.
+    // --------------------------------------------------------
+
+    if (
+      first >
+      book.lastUpdateId + 1
+    ) {
+
+      console.log(
+        "GAP AFTER BRIDGE"
+      );
+
+      console.log(
+        "Local:",
+        book.lastUpdateId
+      );
+
+      console.log(
+        "Incoming:",
+        first,
+        "-",
+        last
+      );
+
+      // Keep the book intact for now.
+      // Mark it syncing and schedule a safe resync.
+
+      book.initialized =
+        false;
+
+      book.waitingForBridge =
+        false;
+
+      book.status =
+        "resync_pending";
+
+      scheduleSnapshotRetry(
+        SNAPSHOT_MIN_INTERVAL_MS
+      );
+
+      return;
+    }
+  }
 }
 
 // ============================================================
@@ -1182,10 +1008,6 @@ function connectSnapshot() {
         book.snapshotConnected =
           true;
 
-        // ----------------------------------------------------
-        // One initial request.
-        // ----------------------------------------------------
-
         if (
           !book.initialized &&
           !book.snapshotPending
@@ -1208,7 +1030,7 @@ function connectSnapshot() {
             );
 
           // --------------------------------------------------
-          // Error response.
+          // Binance error.
           // --------------------------------------------------
 
           if (
@@ -1229,9 +1051,7 @@ function connectSnapshot() {
 
             console.log(
               "Snapshot API error:",
-              JSON.stringify(
-                response
-              )
+              JSON.stringify(response)
             );
 
             book.snapshotPending =
@@ -1239,10 +1059,6 @@ function connectSnapshot() {
 
             book.lastSnapshotError =
               `${code}: ${message}`;
-
-            // ------------------------------------------------
-            // 429 / -1003.
-            // ------------------------------------------------
 
             if (
               response.status === 429 ||
@@ -1255,10 +1071,6 @@ function connectSnapshot() {
                 "BINANCE RATE LIMIT."
               );
 
-              console.log(
-                "Backing off."
-              );
-
               scheduleSnapshotRetry(
                 SNAPSHOT_MIN_INTERVAL_MS
               );
@@ -1266,20 +1078,12 @@ function connectSnapshot() {
               return;
             }
 
-            // ------------------------------------------------
-            // Other API errors.
-            // ------------------------------------------------
-
             scheduleSnapshotRetry(
               30000
             );
 
             return;
           }
-
-          // --------------------------------------------------
-          // Valid result.
-          // --------------------------------------------------
 
           if (
             response.result
@@ -1289,11 +1093,6 @@ function connectSnapshot() {
               response.result
             );
 
-          } else {
-
-            console.log(
-              "Snapshot response contained no result."
-            );
           }
 
         } catch (error) {
@@ -1369,14 +1168,11 @@ function connectSnapshot() {
   } catch (error) {
 
     console.log(
-      "Snapshot connection exception:",
+      "Snapshot connection error:",
       error.message
     );
 
     book.snapshotConnected =
-      false;
-
-    book.snapshotPending =
       false;
 
     setTimeout(
@@ -1452,13 +1248,11 @@ function connectDepth() {
             return;
           }
 
-          // ==================================================
-          // BEFORE LIVE:
+          // --------------------------------------------------
+          // Before live:
           //
-          // ALWAYS BUFFER.
-          //
-          // We do NOT try to synchronize here.
-          // ==================================================
+          // BUFFER EVERYTHING.
+          // --------------------------------------------------
 
           if (
             !book.initialized
@@ -1467,8 +1261,6 @@ function connectDepth() {
             pendingDepthEvents.push(
               event
             );
-
-            // Prevent unlimited memory growth.
 
             if (
               pendingDepthEvents.length >
@@ -1481,26 +1273,19 @@ function connectDepth() {
                 );
             }
 
-            // ------------------------------------------------
-            // If snapshot has already been installed,
-            // try to find the bridge.
-            // ------------------------------------------------
-
             if (
               book.waitingForBridge
             ) {
 
-              findBridgeEvent();
+              findBridge();
             }
 
             return;
           }
 
-          // ==================================================
+          // --------------------------------------------------
           // LIVE MODE
-          // ==================================================
-
-          // Ignore old update.
+          // --------------------------------------------------
 
           if (
             last <=
@@ -1509,10 +1294,6 @@ function connectDepth() {
 
             return;
           }
-
-          // --------------------------------------------------
-          // Correct next update.
-          // --------------------------------------------------
 
           if (
             first <=
@@ -1529,7 +1310,7 @@ function connectDepth() {
           }
 
           // --------------------------------------------------
-          // Genuine sequence gap.
+          // Genuine gap.
           // --------------------------------------------------
 
           if (
@@ -1542,7 +1323,7 @@ function connectDepth() {
             );
 
             console.log(
-              "LIVE SEQUENCE GAP"
+              "LIVE DEPTH GAP"
             );
 
             console.log(
@@ -1568,8 +1349,6 @@ function connectDepth() {
             scheduleSnapshotRetry(
               SNAPSHOT_MIN_INTERVAL_MS
             );
-
-            return;
           }
 
         } catch (error) {
@@ -1638,7 +1417,7 @@ function connectDepth() {
   } catch (error) {
 
     console.log(
-      "Depth connection exception:",
+      "Depth connection error:",
       error.message
     );
 
@@ -1653,7 +1432,7 @@ function connectDepth() {
 }
 
 // ============================================================
-// GET ORDER BOOK LEVELS
+// LEVELS
 // ============================================================
 
 function getLevels(side) {
@@ -1666,10 +1445,7 @@ function getLevels(side) {
   const levels = [];
 
   for (
-    const [
-      price,
-      quantity
-    ]
+    const [price, quantity]
     of source
   ) {
 
@@ -1716,7 +1492,7 @@ function getLevels(side) {
 }
 
 // ============================================================
-// CREATE PRICE BUCKETS
+// BUCKETS
 // ============================================================
 
 function createBuckets(
@@ -1746,10 +1522,6 @@ function createBuckets(
     const level of levels
   ) {
 
-    // --------------------------------------------------------
-    // BIDS must be below current price.
-    // --------------------------------------------------------
-
     if (
       side === "bid"
     ) {
@@ -1764,17 +1536,13 @@ function createBuckets(
 
       if (
         currentPrice -
-          level.price >
+        level.price >
         range
       ) {
 
         continue;
       }
     }
-
-    // --------------------------------------------------------
-    // ASKS must be above current price.
-    // --------------------------------------------------------
 
     if (
       side === "ask"
@@ -1790,7 +1558,7 @@ function createBuckets(
 
       if (
         level.price -
-          currentPrice >
+        currentPrice >
         range
       ) {
 
@@ -1805,9 +1573,7 @@ function createBuckets(
       );
 
     let bucket =
-      buckets.get(
-        index
-      );
+      buckets.get(index);
 
     if (!bucket) {
 
@@ -1820,9 +1586,7 @@ function createBuckets(
           PRICE_BUCKET_SIZE,
 
         high:
-          (
-            index + 1
-          ) *
+          (index + 1) *
           PRICE_BUCKET_SIZE,
 
         totalUsd: 0,
@@ -1885,7 +1649,7 @@ function createBuckets(
 }
 
 // ============================================================
-// BUILD LIQUIDITY CLUSTERS
+// CLUSTERS
 // ============================================================
 
 function buildClusters(
@@ -1905,10 +1669,6 @@ function buildClusters(
 
     return [];
   }
-
-  // ----------------------------------------------------------
-  // Only buckets with significant liquidity are seeds.
-  // ----------------------------------------------------------
 
   const strong =
     buckets.filter(
@@ -2185,15 +1945,13 @@ function updatePersistence(
 
           return (
             difference /
-              cluster.midpoint <=
+            cluster.midpoint <=
             0.0005
           );
         }
       );
 
-    if (
-      match
-    ) {
+    if (match) {
 
       match.lastSeen =
         now;
@@ -2228,9 +1986,7 @@ function updatePersistence(
 
       clusterHistory[
         side
-      ].push(
-        match
-      );
+      ].push(match);
 
       cluster.persistence =
         1;
@@ -2245,7 +2001,7 @@ function updatePersistence(
     ].filter(
       item =>
         now -
-          item.lastSeen <
+        item.lastSeen <
         10 *
         60 *
         1000
@@ -2331,7 +2087,7 @@ app.get(
 );
 
 // ============================================================
-// LIQUIDITY ENDPOINT
+// LIQUIDITY
 // ============================================================
 
 app.get(
@@ -2370,8 +2126,7 @@ app.get(
 
         book: {
 
-          initialized:
-            false,
+          initialized: false,
 
           bidLevels:
             book.bids.size,
@@ -2664,7 +2419,7 @@ app.get(
 );
 
 // ============================================================
-// START SERVER
+// START
 // ============================================================
 
 app.listen(
