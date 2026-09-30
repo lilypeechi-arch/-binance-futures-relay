@@ -7,17 +7,10 @@ const PORT = process.env.PORT || 10000;
 const SYMBOL = 'BTCUSDT';
 const S = SYMBOL.toLowerCase();
 
-const SPOT_KLINES =
-  'https://data-api.binance.vision/api/v3/klines';
-
-const DEPTH_WS =
-  `wss://fstream.binance.com/ws/${S}@depth@100ms`;
-
-const KLINE_WS =
-  `wss://fstream.binance.com/stream?streams=${S}@kline_15m/${S}@kline_1h/${S}@kline_4h/${S}@kline_1d`;
-
-const SNAPSHOT_WS =
-  'wss://ws-fapi.binance.com/ws-fapi/v1';
+const SPOT_KLINES = 'https://data-api.binance.vision/api/v3/klines';
+const DEPTH_WS = `wss://fstream.binance.com/ws/${S}@depth@100ms`;
+const KLINE_WS = `wss://fstream.binance.com/stream?streams=${S}@kline_15m/${S}@kline_1h/${S}@kline_4h/${S}@kline_1d`;
+const SNAPSHOT_WS = 'wss://ws-fapi.binance.com/ws-fapi/v1';
 
 /* =========================================================
    TIMEFRAMES
@@ -47,7 +40,7 @@ const TF = {
     limit: 250,
     left: 5,
     right: 5,
-    weight: 3,
+    weight: 4,
     equal: 0.0020
   },
 
@@ -56,13 +49,13 @@ const TF = {
     limit: 180,
     left: 5,
     right: 5,
-    weight: 4,
+    weight: 6,
     equal: 0.0025
   }
 };
 
 /* =========================================================
-   CANDLE STATE
+   CANDLES
 ========================================================= */
 
 const candles = {
@@ -88,9 +81,6 @@ for (const tf of Object.keys(TF)) {
     errors: 0
   };
 }
-
-let candleLastStatus = null;
-let candleLastError = null;
 
 /* =========================================================
    ORDER BOOK
@@ -121,10 +111,6 @@ let gapCount = 0;
 let lastGapLocal = null;
 let lastGapIncoming = null;
 
-/* =========================================================
-   SNAPSHOT
-========================================================= */
-
 let snapshotPending = false;
 let snapshotRequests = 0;
 let snapshot429s = 0;
@@ -154,25 +140,48 @@ const structure = {
 };
 
 /* =========================================================
+   MARKET STATE
+========================================================= */
+
+let marketState = {
+  state: 'NEUTRAL',
+  direction: 'NONE',
+  level: null,
+  side: null,
+  swept: false,
+  rejected: false,
+  structureShift: false,
+  updatedAt: null
+};
+
+/* =========================================================
    HELPERS
 ========================================================= */
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function pct(a, b) {
-  if (!a || !b) return 999;
-
-  return Math.abs(a - b) / b;
+function iso() {
+  return new Date().toISOString();
 }
 
 function round(value) {
   return Number(Number(value).toFixed(2));
 }
 
-function iso() {
-  return new Date().toISOString();
+function pct(a, b) {
+  if (!a || !b) return 999;
+  return Math.abs(a - b) / b;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function priceZone(price) {
+  const width = price * 0.00035;
+
+  return {
+    low: price - width,
+    high: price + width
+  };
 }
 
 /* =========================================================
@@ -227,18 +236,12 @@ async function loadHistory(tf) {
 
     candles[tf] = result;
 
-    candleSource[tf] =
-      'binance_spot';
+    candleSource[tf] = 'binance_spot';
 
     candleStats[tf].success++;
 
-    candleLastStatus =
-      response.status;
-
-    candleLastError = null;
-
     console.log(
-      `[HISTORY] ${tf}: ${result.length} candles`
+      `[HISTORY] ${tf}: ${result.length}`
     );
 
     return true;
@@ -247,16 +250,8 @@ async function loadHistory(tf) {
 
     candleStats[tf].errors++;
 
-    candleLastStatus =
-      error.response?.status || null;
-
-    candleLastError =
-      error.response?.data
-        ? JSON.stringify(error.response.data)
-        : error.message;
-
     console.log(
-      `[HISTORY ERROR] ${tf}: ${candleLastStatus} ${candleLastError}`
+      `[HISTORY ERROR] ${tf}: ${error.response?.status || ''} ${error.message}`
     );
 
     return false;
@@ -269,10 +264,6 @@ async function loadHistory(tf) {
 
 async function loadAllHistory() {
 
-  console.log(
-    '[HISTORY] Loading Binance Spot candles...'
-  );
-
   for (const tf of Object.keys(TF)) {
 
     await loadHistory(tf);
@@ -281,14 +272,10 @@ async function loadAllHistory() {
   }
 
   rebuildStructure();
-
-  console.log(
-    '[HISTORY] Historical structure initialized'
-  );
 }
 
 /* =========================================================
-   PIVOTS
+   PIVOT HIGH
 ========================================================= */
 
 function isPivotHigh(
@@ -328,6 +315,10 @@ function isPivotHigh(
   return true;
 }
 
+/* =========================================================
+   PIVOT LOW
+========================================================= */
+
 function isPivotLow(
   list,
   index,
@@ -366,15 +357,13 @@ function isPivotLow(
 }
 
 /* =========================================================
-   SWINGS
+   FIND SWINGS
 ========================================================= */
 
 function swings(tf) {
 
   const cfg = TF[tf];
-
-  const list =
-    candles[tf];
+  const list = candles[tf];
 
   const highs = [];
   const lows = [];
@@ -425,10 +414,10 @@ function swings(tf) {
 }
 
 /* =========================================================
-   EQUAL LEVELS
+   EQUAL HIGH / LOW GROUPS
 ========================================================= */
 
-function equalLevels(
+function buildEqualGroups(
   levels,
   tolerance
 ) {
@@ -439,10 +428,10 @@ function equalLevels(
 
     let group =
       groups.find(
-        item =>
+        g =>
           pct(
             level.price,
-            item.price
+            g.price
           ) <= tolerance
       );
 
@@ -451,20 +440,25 @@ function equalLevels(
       group = {
         price: level.price,
         count: 0,
-        timeframes: new Set()
+        timeframes: new Set(),
+        levels: []
       };
 
       groups.push(group);
     }
 
-    group.price =
-      (
-        group.price * group.count +
-        level.price
-      ) /
-      (group.count + 1);
+    group.levels.push(level);
 
-    group.count++;
+    group.price =
+      group.levels.reduce(
+        (sum, item) =>
+          sum + item.price,
+        0
+      ) /
+      group.levels.length;
+
+    group.count =
+      group.levels.length;
 
     group.timeframes.add(
       level.timeframe
@@ -473,26 +467,25 @@ function equalLevels(
 
   return groups
     .filter(
-      group =>
-        group.count >= 2
+      g =>
+        g.count >= 2
     )
     .map(
-      group => ({
-        price: group.price,
-        count: group.count,
+      g => ({
+        price: g.price,
+        count: g.count,
         timeframes:
-          [...group.timeframes]
+          [...g.timeframes]
       })
     );
 }
 
 /* =========================================================
-   MERGE NEARBY STRUCTURAL LEVELS
+   MERGE STRUCTURAL LEVELS
 ========================================================= */
 
-function merge(
-  levels,
-  side
+function mergeStructural(
+  levels
 ) {
 
   const groups = [];
@@ -507,9 +500,9 @@ function merge(
 
     let group =
       groups.find(
-        item =>
+        g =>
           Math.abs(
-            item.price -
+            g.price -
             level.price
           ) <= 35
       );
@@ -517,9 +510,9 @@ function merge(
     if (!group) {
 
       group = {
-        side,
         prices: [],
         timeframes: new Set(),
+        levels: [],
         price: level.price
       };
 
@@ -530,116 +523,51 @@ function merge(
       level.price
     );
 
+    group.levels.push(
+      level
+    );
+
     group.timeframes.add(
       level.timeframe
     );
 
     group.price =
       group.prices.reduce(
-        (a, b) => a + b,
+        (a, b) =>
+          a + b,
         0
       ) /
       group.prices.length;
   }
 
   return groups.map(
-    group => ({
-      side: group.side,
-
-      price: group.price,
+    g => ({
+      price: g.price,
 
       priceLow:
         Math.min(
-          ...group.prices
+          ...g.prices
         ),
 
       priceHigh:
         Math.max(
-          ...group.prices
+          ...g.prices
         ),
 
       touches:
-        group.prices.length,
+        g.prices.length,
 
       timeframes:
-        [...group.timeframes]
+        [...g.timeframes],
+
+      sourceLevels:
+        g.levels
     })
   );
 }
 
 /* =========================================================
-   REACTION COUNT
-========================================================= */
-
-function reactionCount(
-  price,
-  tf
-) {
-
-  const list =
-    candles[tf];
-
-  let count = 0;
-
-  const zone =
-    price * 0.0015;
-
-  for (
-    let i = 0;
-    i < list.length - 4;
-    i++
-  ) {
-
-    if (
-      list[i].high <
-        price - zone ||
-      list[i].low >
-        price + zone
-    ) {
-      continue;
-    }
-
-    let high =
-      list[i].high;
-
-    let low =
-      list[i].low;
-
-    for (
-      let j = i + 1;
-      j <= i + 4;
-      j++
-    ) {
-
-      high =
-        Math.max(
-          high,
-          list[j].high
-        );
-
-      low =
-        Math.min(
-          low,
-          list[j].low
-        );
-    }
-
-    if (
-      (high - price) / price >=
-        0.003 ||
-      (price - low) / price >=
-        0.003
-    ) {
-
-      count++;
-    }
-  }
-
-  return count;
-}
-
-/* =========================================================
-   RESTING LIQUIDITY
+   CURRENT RESTING LIQUIDITY
 ========================================================= */
 
 function restingNear(
@@ -669,25 +597,27 @@ function restingNear(
     const qty =
       Number(quantity);
 
+    const usd =
+      levelPrice * qty;
+
     if (
-      !Number.isFinite(levelPrice) ||
-      !Number.isFinite(qty)
+      !Number.isFinite(
+        levelPrice
+      ) ||
+      !Number.isFinite(
+        qty
+      ) ||
+      usd < 50000
     ) {
       continue;
     }
 
     if (
       Math.abs(
-        levelPrice - price
+        levelPrice -
+        price
       ) > 35
     ) {
-      continue;
-    }
-
-    const usd =
-      levelPrice * qty;
-
-    if (usd < 50000) {
       continue;
     }
 
@@ -707,52 +637,221 @@ function restingNear(
 
   return {
     totalUsd,
+
     levels:
-      levels.slice(0, 10)
+      levels.slice(
+        0,
+        10
+      )
   };
+}
+
+/* =========================================================
+   DISTINCT REACTION COUNT
+========================================================= */
+
+function distinctReactions(
+  price,
+  tf,
+  side
+) {
+
+  const list =
+    candles[tf];
+
+  if (
+    list.length < 10
+  ) {
+    return 0;
+  }
+
+  const zone =
+    price * 0.0012;
+
+  const minMove =
+    price * 0.003;
+
+  let reactions = 0;
+
+  let lastReaction =
+    -999;
+
+  for (
+    let i = 0;
+    i < list.length - 5;
+    i++
+  ) {
+
+    const candle =
+      list[i];
+
+    const touched =
+      side === 'BSL'
+        ? candle.high >=
+            price - zone &&
+          candle.low <=
+            price + zone
+        : candle.low <=
+            price + zone &&
+          candle.high >=
+            price - zone;
+
+    if (
+      !touched
+    ) {
+      continue;
+    }
+
+    if (
+      i - lastReaction < 5
+    ) {
+      continue;
+    }
+
+    let futureHigh =
+      candle.high;
+
+    let futureLow =
+      candle.low;
+
+    for (
+      let j = i + 1;
+      j <=
+        Math.min(
+          i + 5,
+          list.length - 1
+        );
+      j++
+    ) {
+
+      futureHigh =
+        Math.max(
+          futureHigh,
+          list[j].high
+        );
+
+      futureLow =
+        Math.min(
+          futureLow,
+          list[j].low
+        );
+    }
+
+    const rejection =
+      side === 'BSL'
+        ? price -
+            futureLow >=
+          minMove
+        : futureHigh -
+            price >=
+          minMove;
+
+    if (
+      rejection
+    ) {
+
+      reactions++;
+
+      lastReaction =
+        i;
+    }
+  }
+
+  return reactions;
 }
 
 /* =========================================================
    STRUCTURAL SCORE
 ========================================================= */
 
-function score(
+function scoreLevel(
   level,
   side,
-  equal
+  equalGroups
 ) {
 
-  let scoreValue = 0;
+  let score = 0;
+
+  const tfSet =
+    new Set(
+      level.timeframes
+    );
+
+  /*
+     HIGHER TIMEFRAME WEIGHT
+  */
+
+  if (
+    tfSet.has('1d')
+  ) {
+    score += 45;
+  }
+
+  if (
+    tfSet.has('4h')
+  ) {
+    score += 35;
+  }
+
+  if (
+    tfSet.has('1h')
+  ) {
+    score += 15;
+  }
+
+  if (
+    tfSet.has('15m')
+  ) {
+    score += 5;
+  }
+
+  /*
+     MULTI-TIMEFRAME AGREEMENT
+  */
+
+  if (
+    tfSet.size >= 2
+  ) {
+    score += 12;
+  }
+
+  if (
+    tfSet.size >= 3
+  ) {
+    score += 15;
+  }
+
+  /*
+     EQUAL HIGHS / LOWS
+  */
+
+  let equalCount = 0;
 
   for (
-    const tf of level.timeframes
+    const equal of equalGroups
   ) {
 
-    scoreValue +=
-      (
-        TF[tf]?.weight || 0
-      ) * 10;
+    if (
+      pct(
+        equal.price,
+        level.price
+      ) <= 0.002
+    ) {
+
+      equalCount +=
+        equal.count;
+    }
   }
 
-  if (
-    level.timeframes.length >= 2
-  ) {
-
-    scoreValue += 10;
-  }
-
-  if (
-    level.timeframes.length >= 3
-  ) {
-
-    scoreValue += 10;
-  }
-
-  scoreValue +=
+  score +=
     Math.min(
-      level.touches * 3,
-      15
+      equalCount * 7,
+      28
     );
+
+  /*
+     DISTINCT REACTIONS
+  */
 
   let reactions = 0;
 
@@ -761,41 +860,22 @@ function score(
   ) {
 
     reactions +=
-      reactionCount(
+      distinctReactions(
         level.price,
-        tf
+        tf,
+        side
       );
   }
 
-  scoreValue +=
+  score +=
     Math.min(
-      reactions * 2,
-      15
+      reactions * 4,
+      24
     );
 
-  let equalCount = 0;
-
-  for (
-    const item of equal
-  ) {
-
-    if (
-      pct(
-        item.price,
-        level.price
-      ) <= 0.0015
-    ) {
-
-      equalCount +=
-        item.count;
-    }
-  }
-
-  scoreValue +=
-    Math.min(
-      equalCount * 6,
-      18
-    );
+  /*
+     RESTING LIQUIDITY CONFIRMATION
+  */
 
   const resting =
     restingNear(
@@ -805,17 +885,24 @@ function score(
 
   if (
     resting.totalUsd >=
-    250000
+    1000000
   ) {
 
-    scoreValue += 15;
+    score += 15;
 
   } else if (
     resting.totalUsd >=
-    100000
+    500000
   ) {
 
-    scoreValue += 7;
+    score += 10;
+
+  } else if (
+    resting.totalUsd >=
+    250000
+  ) {
+
+    score += 6;
   }
 
   return {
@@ -823,7 +910,7 @@ function score(
 
     score:
       Math.round(
-        scoreValue
+        score
       ),
 
     reactions,
@@ -834,7 +921,91 @@ function score(
       resting.totalUsd,
 
     restingLevels:
-      resting.levels,
+      resting.levels
+  };
+}
+
+/* =========================================================
+   FORMAT LEVEL
+========================================================= */
+
+function formatLevel(
+  level
+) {
+
+  const zone =
+    priceZone(
+      level.price
+    );
+
+  return {
+
+    side:
+      level.side,
+
+    price:
+      round(
+        level.price
+      ),
+
+    priceLow:
+      round(
+        Math.min(
+          level.priceLow ??
+            zone.low,
+          zone.low
+        )
+      ),
+
+    priceHigh:
+      round(
+        Math.max(
+          level.priceHigh ??
+            zone.high,
+          zone.high
+        )
+      ),
+
+    score:
+      level.score,
+
+    strength:
+      level.score >= 100
+        ? 'MAJOR'
+        : level.score >= 70
+          ? 'STRONG'
+          : 'SECONDARY',
+
+    timeframes:
+      level.timeframes,
+
+    equalCount:
+      level.equalCount,
+
+    reactions:
+      level.reactions,
+
+    restingUsd:
+      round(
+        level.restingUsd
+      ),
+
+    restingLevels:
+      level.restingLevels,
+
+    distancePct:
+      currentPrice == null
+        ? null
+        : Number(
+            (
+              (
+                level.price -
+                currentPrice
+              ) /
+              currentPrice *
+              100
+            ).toFixed(3)
+          ),
 
     source:
       'spot_structure+futures_liquidity'
@@ -850,8 +1021,8 @@ function rebuildStructure() {
   const highs = [];
   const lows = [];
 
-  const equalHighs = [];
-  const equalLows = [];
+  const allEqualHighs = [];
+  const allEqualLows = [];
 
   for (
     const tf of Object.keys(TF)
@@ -868,15 +1039,15 @@ function rebuildStructure() {
       ...result.lows
     );
 
-    equalHighs.push(
-      ...equalLevels(
+    allEqualHighs.push(
+      ...buildEqualGroups(
         result.highs,
         TF[tf].equal
       )
     );
 
-    equalLows.push(
-      ...equalLevels(
+    allEqualLows.push(
+      ...buildEqualGroups(
         result.lows,
         TF[tf].equal
       )
@@ -890,68 +1061,100 @@ function rebuildStructure() {
     lows;
 
   structure.equalHighs =
-    equalHighs;
+    allEqualHighs;
 
   structure.equalLows =
-    equalLows;
+    allEqualLows;
 
-  structure.majorBSL =
-    merge(
-      highs,
-      'BSL'
+  const bsl =
+    mergeStructural(
+      highs
     )
       .map(
-        level =>
-          score(
+        level => ({
+          ...scoreLevel(
             level,
             'BSL',
-            equalHighs
+            allEqualHighs
+          ),
+          side: 'BSL'
+        })
+      )
+      .filter(
+        level =>
+          level.timeframes.includes(
+            '4h'
+          ) ||
+          level.timeframes.includes(
+            '1d'
+          ) ||
+          (
+            level.equalCount >= 4 &&
+            level.score >= 70
           )
       )
       .filter(
         level =>
-          level.score >= 40
+          level.score >= 65
       )
       .sort(
         (a, b) =>
           b.score - a.score
-      )
-      .slice(
-        0,
-        8
       );
 
-  structure.majorSSL =
-    merge(
-      lows,
-      'SSL'
+  const ssl =
+    mergeStructural(
+      lows
     )
       .map(
-        level =>
-          score(
+        level => ({
+          ...scoreLevel(
             level,
             'SSL',
-            equalLows
+            allEqualLows
+          ),
+          side: 'SSL'
+        })
+      )
+      .filter(
+        level =>
+          level.timeframes.includes(
+            '4h'
+          ) ||
+          level.timeframes.includes(
+            '1d'
+          ) ||
+          (
+            level.equalCount >= 4 &&
+            level.score >= 70
           )
       )
       .filter(
         level =>
-          level.score >= 40
+          level.score >= 65
       )
       .sort(
         (a, b) =>
           b.score - a.score
-      )
-      .slice(
-        0,
-        8
       );
 
+  structure.majorBSL =
+    bsl.slice(
+      0,
+      8
+    );
+
+  structure.majorSSL =
+    ssl.slice(
+      0,
+      8
+    );
+
   structure.majorResistance =
-    structure.majorBSL
+    bsl
       .filter(
         level =>
-          currentPrice === null ||
+          currentPrice == null ||
           level.price >
             currentPrice
       )
@@ -965,10 +1168,10 @@ function rebuildStructure() {
       );
 
   structure.majorSupport =
-    structure.majorSSL
+    ssl
       .filter(
         level =>
-          currentPrice === null ||
+          currentPrice == null ||
           level.price <
             currentPrice
       )
@@ -983,13 +1186,354 @@ function rebuildStructure() {
 
   structure.updatedAt =
     iso();
+
+  updateMarketState();
 }
 
 /* =========================================================
-   ORDER BOOK UPDATE
+   LIQUIDITY SWEEP DETECTION
 ========================================================= */
 
-function applyDepth(data) {
+function detectSweep(
+  level
+) {
+
+  if (
+    currentPrice == null ||
+    !candles['15m'].length
+  ) {
+    return false;
+  }
+
+  const list =
+    candles['15m'];
+
+  const recent =
+    list.slice(
+      -6
+    );
+
+  const zone =
+    Math.max(
+      level.price *
+        0.0012,
+      20
+    );
+
+  if (
+    level.side === 'BSL'
+  ) {
+
+    return recent.some(
+      candle =>
+        candle.high >=
+          level.price -
+            zone &&
+        candle.close <
+          level.price -
+            zone *
+              0.15
+    );
+  }
+
+  return recent.some(
+    candle =>
+      candle.low <=
+        level.price +
+          zone &&
+      candle.close >
+        level.price +
+          zone *
+            0.15
+  );
+}
+
+/* =========================================================
+   REJECTION DETECTION
+========================================================= */
+
+function detectRejection(
+  level
+) {
+
+  if (
+    !candles['15m'].length
+  ) {
+    return false;
+  }
+
+  const candle =
+    candles['15m'][
+      candles['15m'].length - 1
+    ];
+
+  const zone =
+    Math.max(
+      level.price *
+        0.001,
+      15
+    );
+
+  if (
+    level.side === 'BSL'
+  ) {
+
+    return (
+      candle.high >=
+        level.price -
+          zone &&
+      candle.close <
+        candle.open &&
+      candle.close <
+        level.price
+    );
+  }
+
+  return (
+    candle.low <=
+      level.price +
+        zone &&
+    candle.close >
+      candle.open &&
+    candle.close >
+      level.price
+  );
+}
+
+/* =========================================================
+   STRUCTURE SHIFT
+========================================================= */
+
+function detectStructureShift(
+  side
+) {
+
+  const list =
+    candles['15m'];
+
+  if (
+    list.length < 30
+  ) {
+    return false;
+  }
+
+  const recent =
+    list.slice(
+      -12
+    );
+
+  const prior =
+    list.slice(
+      -24,
+      -12
+    );
+
+  const recentHigh =
+    Math.max(
+      ...recent.map(
+        c => c.high
+      )
+    );
+
+  const recentLow =
+    Math.min(
+      ...recent.map(
+        c => c.low
+      )
+    );
+
+  const priorHigh =
+    Math.max(
+      ...prior.map(
+        c => c.high
+      )
+    );
+
+  const priorLow =
+    Math.min(
+      ...prior.map(
+        c => c.low
+      )
+    );
+
+  if (
+    side === 'BSL'
+  ) {
+
+    return (
+      recentLow <
+      priorLow
+    );
+  }
+
+  return (
+    recentHigh >
+    priorHigh
+  );
+}
+
+/* =========================================================
+   MARKET STATE
+========================================================= */
+
+function updateMarketState() {
+
+  if (
+    currentPrice == null
+  ) {
+    return;
+  }
+
+  const above =
+    structure.majorBSL
+      .filter(
+        level =>
+          level.price >=
+          currentPrice
+      )
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      );
+
+  const below =
+    structure.majorSSL
+      .filter(
+        level =>
+          level.price <=
+          currentPrice
+      )
+      .sort(
+        (a, b) =>
+          b.price - a.price
+      );
+
+  const candidates = [];
+
+  if (
+    above[0]
+  ) {
+
+    candidates.push({
+      level:
+        above[0],
+
+      distance:
+        pct(
+          above[0].price,
+          currentPrice
+        )
+    });
+  }
+
+  if (
+    below[0]
+  ) {
+
+    candidates.push({
+      level:
+        below[0],
+
+      distance:
+        pct(
+          below[0].price,
+          currentPrice
+        )
+    });
+  }
+
+  if (
+    !candidates.length
+  ) {
+    return;
+  }
+
+  candidates.sort(
+    (a, b) =>
+      a.distance -
+      b.distance
+  );
+
+  const target =
+    candidates[0].level;
+
+  const swept =
+    detectSweep(
+      target
+    );
+
+  const rejected =
+    swept &&
+    detectRejection(
+      target
+    );
+
+  const shifted =
+    rejected &&
+    detectStructureShift(
+      target.side
+    );
+
+  let state =
+    'APPROACHING_LIQUIDITY';
+
+  if (
+    swept
+  ) {
+    state =
+      'LIQUIDITY_SWEPT';
+  }
+
+  if (
+    rejected
+  ) {
+    state =
+      'REJECTION';
+  }
+
+  if (
+    shifted
+  ) {
+    state =
+      'STRUCTURE_SHIFT';
+  }
+
+  marketState = {
+
+    state,
+
+    direction:
+      target.side === 'BSL'
+        ? 'BEARISH_REVERSAL_WATCH'
+        : 'BULLISH_REVERSAL_WATCH',
+
+    level:
+      formatLevel(
+        target
+      ),
+
+    side:
+      target.side,
+
+    swept,
+
+    rejected,
+
+    structureShift:
+      shifted,
+
+    updatedAt:
+      iso()
+  };
+}
+
+/* =========================================================
+   DEPTH UPDATE
+========================================================= */
+
+function applyDepth(
+  data
+) {
 
   const U =
     Number(data.U);
@@ -1004,12 +1548,17 @@ function applyDepth(data) {
     return;
   }
 
-  if (!bookInitialized) {
+  if (
+    !bookInitialized
+  ) {
 
-    pending.push(data);
+    pending.push(
+      data
+    );
 
     if (
-      pending.length > 20000
+      pending.length >
+      20000
     ) {
 
       pending =
@@ -1022,7 +1571,8 @@ function applyDepth(data) {
   }
 
   const expected =
-    depthLastUpdateId + 1;
+    depthLastUpdateId +
+    1;
 
   if (
     U > expected
@@ -1034,11 +1584,15 @@ function applyDepth(data) {
     lastGapIncoming =
       U;
 
-    gapDetected = true;
+    gapDetected =
+      true;
 
-    if (!gapRecovery) {
+    if (
+      !gapRecovery
+    ) {
 
-      gapRecovery = true;
+      gapRecovery =
+        true;
 
       gapCount++;
 
@@ -1053,17 +1607,20 @@ function applyDepth(data) {
   }
 
   if (
-    u <= depthLastUpdateId
+    u <=
+    depthLastUpdateId
   ) {
     return;
   }
 
   for (
-    const item of data.b || []
+    const item of
+      data.b || []
   ) {
 
     if (
-      Number(item[1]) === 0
+      Number(item[1]) ===
+      0
     ) {
 
       bids.delete(
@@ -1080,11 +1637,13 @@ function applyDepth(data) {
   }
 
   for (
-    const item of data.a || []
+    const item of
+      data.a || []
   ) {
 
     if (
-      Number(item[1]) === 0
+      Number(item[1]) ===
+      0
     ) {
 
       asks.delete(
@@ -1107,16 +1666,20 @@ function applyDepth(data) {
 }
 
 /* =========================================================
-   CURRENT PRICE
+   PRICE
 ========================================================= */
 
 function updatePrice() {
 
-  let bestBid = null;
-  let bestAsk = null;
+  let bestBid =
+    null;
+
+  let bestAsk =
+    null;
 
   for (
-    const priceText of bids.keys()
+    const priceText of
+      bids.keys()
   ) {
 
     const price =
@@ -1127,12 +1690,14 @@ function updatePrice() {
       price > bestBid
     ) {
 
-      bestBid = price;
+      bestBid =
+        price;
     }
   }
 
   for (
-    const priceText of asks.keys()
+    const priceText of
+      asks.keys()
   ) {
 
     const price =
@@ -1143,7 +1708,8 @@ function updatePrice() {
       price < bestAsk
     ) {
 
-      bestAsk = price;
+      bestAsk =
+        price;
     }
   }
 
@@ -1153,7 +1719,10 @@ function updatePrice() {
   ) {
 
     currentPrice =
-      (bestBid + bestAsk) / 2;
+      (
+        bestBid +
+        bestAsk
+      ) / 2;
   }
 }
 
@@ -1163,15 +1732,17 @@ function updatePrice() {
 
 function requestSnapshot() {
 
-  const timestamp =
+  const now =
     Date.now();
 
-  if (snapshotPending) {
+  if (
+    snapshotPending
+  ) {
     return;
   }
 
   if (
-    timestamp -
+    now -
       lastSnapshotRequest <
     SNAPSHOT_COOLDOWN
   ) {
@@ -1179,20 +1750,18 @@ function requestSnapshot() {
   }
 
   lastSnapshotRequest =
-    timestamp;
+    now;
 
   snapshotPending =
     true;
 
   snapshotRequests++;
 
-  console.log(
-    '[SNAPSHOT] Requesting...'
-  );
-
   try {
 
-    if (snapshotWs) {
+    if (
+      snapshotWs
+    ) {
 
       try {
         snapshotWs.close();
@@ -1246,7 +1815,8 @@ function requestSnapshot() {
 
           if (
             message.status &&
-            message.status !== 200
+            message.status !==
+              200
           ) {
 
             snapshotLastStatus =
@@ -1274,9 +1844,9 @@ function requestSnapshot() {
 
           if (
             !message.result ||
-            !message.result.lastUpdateId
+            !message.result
+              .lastUpdateId
           ) {
-
             return;
           }
 
@@ -1292,7 +1862,8 @@ function requestSnapshot() {
           ) {
 
             if (
-              Number(item[1]) > 0
+              Number(item[1]) >
+              0
             ) {
 
               bids.set(
@@ -1308,7 +1879,8 @@ function requestSnapshot() {
           ) {
 
             if (
-              Number(item[1]) > 0
+              Number(item[1]) >
+              0
             ) {
 
               asks.set(
@@ -1336,7 +1908,8 @@ function requestSnapshot() {
           pending = [];
 
           const target =
-            depthLastUpdateId + 1;
+            depthLastUpdateId +
+            1;
 
           const bridge =
             buffered.findIndex(
@@ -1401,6 +1974,8 @@ function requestSnapshot() {
           snapshotPending =
             false;
 
+          rebuildStructure();
+
           console.log(
             `[SNAPSHOT] Installed ${depthLastUpdateId} bids=${bids.size} asks=${asks.size}`
           );
@@ -1425,11 +2000,6 @@ function requestSnapshot() {
 
         snapshotPending =
           false;
-
-        console.log(
-          '[SNAPSHOT ERROR]',
-          error.message
-        );
       }
     );
 
@@ -1458,7 +2028,9 @@ function requestSnapshot() {
 
 function connectDepth() {
 
-  if (depthWs) {
+  if (
+    depthWs
+  ) {
 
     try {
       depthWs.close();
@@ -1534,10 +2106,6 @@ function connectDepth() {
       depthConnected =
         false;
 
-      console.log(
-        '[DEPTH] Disconnected'
-      );
-
       setTimeout(
         connectDepth,
         5000
@@ -1552,7 +2120,9 @@ function connectDepth() {
 
 function connectKlines() {
 
-  if (klineWs) {
+  if (
+    klineWs
+  ) {
 
     try {
       klineWs.close();
@@ -1594,10 +2164,9 @@ function connectKlines() {
 
         if (
           data.e !==
-          'kline' ||
+            'kline' ||
           !data.k
         ) {
-
           return;
         }
 
@@ -1610,11 +2179,11 @@ function connectKlines() {
         if (
           !TF[tf]
         ) {
-
           return;
         }
 
         const candle = {
+
           openTime:
             Number(k.t),
 
@@ -1671,16 +2240,18 @@ function connectKlines() {
         );
 
         const max =
-          TF[tf].limit + 50;
+          TF[tf].limit +
+          50;
 
         if (
-          list.length > max
+          list.length >
+          max
         ) {
 
-          candles[tf] =
-            list.slice(
-              -max
-            );
+          list.splice(
+            0,
+            list.length - max
+          );
         }
 
         candleSource[tf] =
@@ -1688,6 +2259,8 @@ function connectKlines() {
 
         currentPrice =
           candle.close;
+
+        updateMarketState();
 
         if (
           k.x === true
@@ -1724,10 +2297,6 @@ function connectKlines() {
       klineConnected =
         false;
 
-      console.log(
-        '[KLINE] Disconnected'
-      );
-
       setTimeout(
         connectKlines,
         5000
@@ -1756,8 +2325,7 @@ function rawBook() {
       Number(priceText);
 
     const usd =
-      price *
-      quantity;
+      price * quantity;
 
     if (
       usd >= 50000
@@ -1782,8 +2350,7 @@ function rawBook() {
       Number(priceText);
 
     const usd =
-      price *
-      quantity;
+      price * quantity;
 
     if (
       usd >= 50000
@@ -1808,6 +2375,7 @@ function rawBook() {
   );
 
   return {
+
     largeBids:
       largeBids.slice(
         0,
@@ -1823,73 +2391,16 @@ function rawBook() {
 }
 
 /* =========================================================
-   FORMAT STRUCTURAL LEVEL
-========================================================= */
-
-function formatLevel(level) {
-
-  return {
-
-    side:
-      level.side,
-
-    price:
-      round(level.price),
-
-    priceLow:
-      round(level.priceLow),
-
-    priceHigh:
-      round(level.priceHigh),
-
-    score:
-      level.score,
-
-    timeframes:
-      level.timeframes,
-
-    equalCount:
-      level.equalCount,
-
-    reactions:
-      level.reactions,
-
-    restingUsd:
-      round(level.restingUsd),
-
-    restingLevels:
-      level.restingLevels,
-
-    distancePct:
-      currentPrice === null
-        ? null
-        : Number(
-            (
-              (
-                level.price -
-                currentPrice
-              ) /
-              currentPrice
-            * 100
-            ).toFixed(3)
-          ),
-
-    source:
-      level.source
-  };
-}
-
-/* =========================================================
    LIQUIDITY MAP
 ========================================================= */
 
-function getLiquidityMap() {
+function liquidityMap() {
 
   const bsl =
     structure.majorBSL
       .filter(
         level =>
-          currentPrice === null ||
+          currentPrice == null ||
           level.price >
             currentPrice
       )
@@ -1902,7 +2413,7 @@ function getLiquidityMap() {
     structure.majorSSL
       .filter(
         level =>
-          currentPrice === null ||
+          currentPrice == null ||
           level.price <
             currentPrice
       )
@@ -1925,14 +2436,20 @@ function getLiquidityMap() {
 
     majorResistance:
       bsl
-        .slice(0, 3)
+        .slice(
+          0,
+          3
+        )
         .map(
           formatLevel
         ),
 
     majorSupport:
       ssl
-        .slice(0, 3)
+        .slice(
+          0,
+          3
+        )
         .map(
           formatLevel
         ),
@@ -1958,6 +2475,34 @@ function getLiquidityMap() {
 }
 
 /* =========================================================
+   ROOT
+========================================================= */
+
+app.get(
+  '/',
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      service:
+        'Binance BTCUSDT Major Liquidity Relay V2',
+
+      symbol:
+        SYMBOL,
+
+      endpoints: [
+        '/health',
+        '/structure',
+        '/liquidity',
+        '/book'
+      ]
+    });
+  }
+);
+
+/* =========================================================
    HEALTH
 ========================================================= */
 
@@ -1967,11 +2512,10 @@ app.get(
 
     res.json({
 
-      ok:
-        true,
+      ok: true,
 
       service:
-        'Binance BTCUSDT Major Liquidity Relay',
+        'Binance BTCUSDT Major Liquidity Relay V2',
 
       symbol:
         SYMBOL,
@@ -2002,10 +2546,6 @@ app.get(
 
       candleStats,
 
-      candleLastStatus,
-
-      candleLastError,
-
       structure: {
 
         swingHighs:
@@ -2029,6 +2569,8 @@ app.get(
         updatedAt:
           structure.updatedAt
       },
+
+      marketState,
 
       orderBook: {
 
@@ -2095,7 +2637,7 @@ app.get(
 );
 
 /* =========================================================
-   STRUCTURE ENDPOINT
+   STRUCTURE
 ========================================================= */
 
 app.get(
@@ -2104,8 +2646,7 @@ app.get(
 
     res.json({
 
-      ok:
-        true,
+      ok: true,
 
       symbol:
         SYMBOL,
@@ -2150,6 +2691,8 @@ app.get(
           formatLevel
         ),
 
+      marketState,
+
       updatedAt:
         structure.updatedAt
     });
@@ -2157,7 +2700,7 @@ app.get(
 );
 
 /* =========================================================
-   LIQUIDITY ENDPOINT
+   LIQUIDITY
 ========================================================= */
 
 app.get(
@@ -2166,8 +2709,7 @@ app.get(
 
     res.json({
 
-      ok:
-        true,
+      ok: true,
 
       symbol:
         SYMBOL,
@@ -2175,7 +2717,9 @@ app.get(
       currentPrice,
 
       marketStructure:
-        getLiquidityMap(),
+        liquidityMap(),
+
+      marketState,
 
       rawRestingLiquidity:
         rawBook(),
@@ -2215,7 +2759,7 @@ app.get(
 );
 
 /* =========================================================
-   BOOK ENDPOINT
+   BOOK
 ========================================================= */
 
 app.get(
@@ -2270,8 +2814,7 @@ app.get(
 
     res.json({
 
-      ok:
-        true,
+      ok: true,
 
       symbol:
         SYMBOL,
@@ -2297,42 +2840,16 @@ app.get(
 );
 
 /* =========================================================
-   ROOT
-========================================================= */
-
-app.get(
-  '/',
-  (req, res) => {
-
-    res.json({
-
-      ok:
-        true,
-
-      service:
-        'Binance BTCUSDT Major Liquidity Relay',
-
-      symbol:
-        SYMBOL,
-
-      endpoints: [
-        '/health',
-        '/structure',
-        '/liquidity',
-        '/book'
-      ]
-    });
-  }
-);
-
-/* =========================================================
    RECOVERY
 ========================================================= */
 
 setInterval(
   () => {
 
-    if (gapRecovery) {
+    if (
+      gapRecovery
+    ) {
+
       requestSnapshot();
     }
 
@@ -2365,21 +2882,9 @@ app.listen(
       `Server listening on port ${PORT}`
     );
 
-    console.log(
-      '[START] Loading historical Spot candles'
-    );
-
     await loadAllHistory();
 
-    console.log(
-      '[START] Connecting Futures depth'
-    );
-
     connectDepth();
-
-    console.log(
-      '[START] Connecting Futures klines'
-    );
 
     connectKlines();
   }
