@@ -85,7 +85,34 @@ const SETTINGS = {
 
   orderMinUsd: 500000,
 
-  sweepMs: 15 * 60 * 1000
+  sweepMs: 15 * 60 * 1000,
+
+  /*
+     MAJOR LEVEL FILTER
+     ----------------------------------------------------------
+     Levels closer than this are NOT treated as major.
+     They remain available as nearBSL / nearSSL.
+  */
+
+  majorMinDistancePct: 0.50,
+
+  /*
+     A 15m-only level cannot normally become a major level.
+  */
+
+  majorMinimumTimeframeWeight: 2,
+
+  /*
+     1H-only major levels need additional strength.
+  */
+
+  major1hMinScore: 90,
+
+  /*
+     4H/1D levels can qualify with the normal minimum score.
+  */
+
+  majorHigherTfMinScore: 40
 };
 
 /* ============================================================
@@ -1035,6 +1062,178 @@ function strength(level) {
 }
 
 /* ============================================================
+   MAJOR LEVEL LOGIC
+   THIS IS THE IMPORTANT CHANGE
+============================================================ */
+
+/*
+   Calculate the combined structural weight.
+
+   15m = 1
+   1h  = 2
+   4h  = 3
+   1d  = 4
+*/
+
+function timeframeWeight(level) {
+  return level.timeframes.reduce(
+    (sum, tf) =>
+      sum +
+      (
+        STRUCTURE[tf]?.weight ||
+        0
+      ),
+    0
+  );
+}
+
+/*
+   A level is "major" only when:
+
+   1. It is at least 0.50% away from
+      current price.
+
+   2. It has meaningful timeframe
+      structure.
+
+   3. 15m-only levels are excluded.
+
+   4. A 1H-only level needs stronger
+      score.
+
+   5. 4H/1D levels can qualify using
+      the normal structural score.
+*/
+
+function isMajorLevel(level) {
+  const current =
+    state.currentPrice;
+
+  if (!current) {
+    return false;
+  }
+
+  const distance =
+    Math.abs(
+      pct(
+        level.price,
+        current
+      )
+    );
+
+  /*
+     Too close to current price.
+  */
+
+  if (
+    distance <
+    SETTINGS.majorMinDistancePct
+  ) {
+    return false;
+  }
+
+  /*
+     15m-only is near liquidity,
+     not major liquidity.
+  */
+
+  const has1h =
+    level.timeframes.includes(
+      '1h'
+    );
+
+  const has4h =
+    level.timeframes.includes(
+      '4h'
+    );
+
+  const has1d =
+    level.timeframes.includes(
+      '1d'
+    );
+
+  const weight =
+    timeframeWeight(level);
+
+  if (
+    weight <
+    SETTINGS.majorMinimumTimeframeWeight
+  ) {
+    return false;
+  }
+
+  /*
+     1H-only levels need stronger
+     structural evidence.
+  */
+
+  if (
+    has1h &&
+    !has4h &&
+    !has1d &&
+    level.score <
+      SETTINGS.major1hMinScore
+  ) {
+    return false;
+  }
+
+  /*
+     Higher timeframe levels qualify
+     with normal structural score.
+  */
+
+  if (
+    (has4h || has1d) &&
+    level.score >=
+      SETTINGS.majorHigherTfMinScore
+  ) {
+    return true;
+  }
+
+  /*
+     Multi-timeframe 1H + 15m.
+  */
+
+  if (
+    has1h &&
+    level.score >=
+      SETTINGS.major1hMinScore
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/*
+   Nearby liquidity deliberately keeps
+   levels that are useful tactically but
+   are too close to be called major.
+*/
+
+function isNearLevel(level) {
+  const current =
+    state.currentPrice;
+
+  if (!current) {
+    return false;
+  }
+
+  const distance =
+    Math.abs(
+      pct(
+        level.price,
+        current
+      )
+    );
+
+  return (
+    distance <
+    SETTINGS.majorMinDistancePct
+  );
+}
+
+/* ============================================================
    DECORATE
 ============================================================ */
 
@@ -1090,7 +1289,10 @@ function decorate(level) {
             ),
             3
           )
-        : null
+        : null,
+
+    timeframeWeight:
+      timeframeWeight(level)
   };
 }
 
@@ -1098,13 +1300,41 @@ function decorate(level) {
    STRUCTURAL LEVELS
 ============================================================ */
 
+/*
+   structural(side)
+
+   IMPORTANT:
+   This now means MAJOR structural
+   liquidity only.
+*/
+
 function structural(side) {
   return structure.levels
     .filter(
       level =>
         level.side === side &&
         level.score >=
-          SETTINGS.minScore
+          SETTINGS.minScore &&
+        isMajorLevel(level)
+    )
+    .map(decorate);
+}
+
+/*
+   nearStructural(side)
+
+   These are intentionally separated
+   from major liquidity.
+*/
+
+function nearStructural(side) {
+  return structure.levels
+    .filter(
+      level =>
+        level.side === side &&
+        level.score >=
+          SETTINGS.minScore &&
+        isNearLevel(level)
     )
     .map(decorate);
 }
@@ -1134,7 +1364,7 @@ function bookClusters() {
           row.price -
             last.priceHigh
         ) <=
-          SETTINGS.orderGapUsd
+        SETTINGS.orderGapUsd
       ) {
         last.priceLow =
           Math.min(
@@ -1212,7 +1442,6 @@ function bookClusters() {
 
 /* ============================================================
    LIVE PRICE
-   IMPORTANT FIX
 ============================================================ */
 
 function updatePrice(
@@ -1252,11 +1481,9 @@ function updatePrice(
     iso();
 }
 
-/*
-   NEW:
-   Always derive a live BTC price
-   from the best Futures bid/ask.
-*/
+/* ============================================================
+   LIVE PRICE FROM ORDER BOOK
+============================================================ */
 
 function updatePriceFromBook() {
   if (
@@ -1392,6 +1619,15 @@ function detectSweep(
   previous,
   current
 ) {
+  /*
+     Keep sweep detection based on
+     ALL structural levels, including
+     nearby levels.
+
+     This is intentionally separate
+     from the MAJOR display filter.
+  */
+
   for (
     const level of
       structure.levels
@@ -1451,6 +1687,10 @@ function intelligence() {
 
       nextSSL: [],
 
+      nearBSL: [],
+
+      nearSSL: [],
+
       orderBook:
         bookClusters(),
 
@@ -1460,6 +1700,10 @@ function intelligence() {
           .reverse()
     };
   }
+
+  /*
+     MAJOR LEVELS ONLY
+  */
 
   const bsl =
     structural('BSL')
@@ -1485,15 +1729,49 @@ function intelligence() {
           b.price - a.price
       );
 
+  /*
+     NEAR LIQUIDITY
+  */
+
+  const nearBSL =
+    nearStructural('BSL')
+      .filter(
+        level =>
+          level.price >
+          current
+      )
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      )
+      .slice(0, 5);
+
+  const nearSSL =
+    nearStructural('SSL')
+      .filter(
+        level =>
+          level.price <
+          current
+      )
+      .sort(
+        (a, b) =>
+          b.price - a.price
+      )
+      .slice(0, 5);
+
   return {
     state:
       bsl[0] && ssl[0]
-        ? 'BETWEEN LIQUIDITY'
+        ? 'BETWEEN MAJOR LIQUIDITY'
         : bsl[0]
-        ? 'UPSIDE LIQUIDITY ONLY'
+        ? 'MAJOR UPSIDE LIQUIDITY ONLY'
         : ssl[0]
-        ? 'DOWNSIDE LIQUIDITY ONLY'
-        : 'NO STRUCTURAL LIQUIDITY',
+        ? 'MAJOR DOWNSIDE LIQUIDITY ONLY'
+        : 'NO MAJOR STRUCTURAL LIQUIDITY',
+
+    /*
+       These are now MAJOR levels.
+    */
 
     nearestBSL:
       bsl[0] || null,
@@ -1506,6 +1784,15 @@ function intelligence() {
 
     nextSSL:
       ssl.slice(0, 5),
+
+    /*
+       Tactical nearby levels remain
+       visible separately.
+    */
+
+    nearBSL,
+
+    nearSSL,
 
     orderBook:
       bookClusters(),
@@ -1522,6 +1809,10 @@ function intelligence() {
 ============================================================ */
 
 function publicStructure() {
+  /*
+     MAIN MAP = MAJOR LEVELS ONLY
+  */
+
   const bsl =
     structural('BSL')
       .sort(
@@ -1600,7 +1891,45 @@ function publicStructure() {
       )
       .slice(0, 3);
 
+  /*
+     NEAR LEVELS
+  */
+
+  const nearBSL =
+    nearStructural('BSL')
+      .filter(
+        level =>
+          state.currentPrice
+            ? level.price >
+              state.currentPrice
+            : true
+      )
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      )
+      .slice(0, 5);
+
+  const nearSSL =
+    nearStructural('SSL')
+      .filter(
+        level =>
+          state.currentPrice
+            ? level.price <
+              state.currentPrice
+            : true
+      )
+      .sort(
+        (a, b) =>
+          b.price - a.price
+      )
+      .slice(0, 5);
+
   return {
+    /*
+       Main structural map
+    */
+
     buySideLiquidity:
       bsl,
 
@@ -1623,7 +1952,15 @@ function publicStructure() {
       support.slice(
         0,
         1
-      )
+      ),
+
+    /*
+       Secondary nearby liquidity
+    */
+
+    nearBSL,
+
+    nearSSL
   };
 }
 
@@ -1708,12 +2045,6 @@ function applyDepth(message) {
 
   state.lastDepthMessage =
     iso();
-
-  /*
-     IMPORTANT:
-     Every depth update now refreshes
-     the live BTC price.
-  */
 
   updatePriceFromBook();
 }
@@ -1898,11 +2229,6 @@ function requestSnapshot() {
           state.lastSnapshotResponse =
             iso();
 
-          /*
-             Re-apply buffered
-             depth events.
-          */
-
           const pending =
             [
               ...state.pendingEvents
@@ -1984,12 +2310,6 @@ function requestSnapshot() {
               break;
             }
           }
-
-          /*
-             CRITICAL:
-             Set price from snapshot
-             immediately.
-          */
 
           updatePriceFromBook();
 
@@ -2080,11 +2400,6 @@ function connectDepth() {
             message.u
           );
 
-        /*
-           Before snapshot:
-           buffer events.
-        */
-
         if (
           !state.bookInitialized
         ) {
@@ -2100,20 +2415,12 @@ function connectDepth() {
           return;
         }
 
-        /*
-           Already processed.
-        */
-
         if (
           u <=
           state.lastUpdateId
         ) {
           return;
         }
-
-        /*
-           Real sequence gap.
-        */
 
         if (
           U >
@@ -2271,11 +2578,6 @@ function connectKlines() {
           }
         }
 
-        /*
-           Kline is also a
-           live price source.
-        */
-
         updatePrice(
           candle.close,
           'futures_kline'
@@ -2339,6 +2641,9 @@ function health() {
     liquiditySource:
       'Binance Futures Order Book',
 
+    majorMinDistancePct:
+      SETTINGS.majorMinDistancePct,
+
     candleHistory:
       Object.fromEntries(
         Object.entries(
@@ -2390,6 +2695,16 @@ function health() {
 
       majorSSL:
         structural(
+          'SSL'
+        ).length,
+
+      nearBSL:
+        nearStructural(
+          'BSL'
+        ).length,
+
+      nearSSL:
+        nearStructural(
           'SSL'
         ).length,
 
@@ -2705,11 +3020,6 @@ setInterval(
     if (
       state.bookInitialized
     ) {
-      /*
-         Keep price alive even if
-         no kline message arrives.
-      */
-
       updatePriceFromBook();
 
       applyResting();
