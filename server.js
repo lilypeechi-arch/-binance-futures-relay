@@ -17,24 +17,37 @@ const WS_API =
 // SETTINGS
 // ============================================================
 
+// Snapshot protection
 const SNAPSHOT_MIN_INTERVAL_MS = 65000;
-
 const SNAPSHOT_TIMEOUT_MS = 15000;
 
-const PRICE_BUCKET_SIZE = 1;
-
-const MIN_CLUSTER_USD = 500000;
-const MIN_CLUSTER_LEVELS = 3;
-
-const SEED_LEVEL_USD = 100000;
-
-const MAX_EMPTY_BUCKETS = 1;
-
+// Order-book scanning
 const RANGE_PCT = 0.03;
 
-const MAX_PENDING_EVENTS = 20000;
+// Minimum USD required for an individual liquidity level
+const SEED_LEVEL_USD = 100000;
 
+// Minimum total USD for a cluster
+const MIN_CLUSTER_USD = 500000;
+
+// Minimum number of meaningful levels in a cluster
+const MIN_CLUSTER_LEVELS = 3;
+
+// How far around a strong liquidity level we combine orders
+// Example: 5 means strongest level +/- $5
+const CLUSTER_RADIUS_USD = 5;
+
+// Minimum USD for a level to contribute to a cluster
+const MIN_CLUSTER_LEVEL_USD = 50000;
+
+// Minimum separation between cluster centers
+const MIN_CLUSTER_SEPARATION_USD = 10;
+
+// Maximum clusters returned per side
 const MAX_CLUSTERS = 12;
+
+// Maximum buffered websocket events
+const MAX_PENDING_EVENTS = 20000;
 
 // ============================================================
 // LOCAL ORDER BOOK
@@ -96,10 +109,6 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function toNumber(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
@@ -154,12 +163,12 @@ function resetForSnapshot(reason) {
   resyncs++;
 
   console.log(
-    `[SYNC] Reset for snapshot. Reason: ${lastResetReason}`
+    `[SYNC] Reset for snapshot. Reason=${lastResetReason}`
   );
 }
 
 // ============================================================
-// APPLY SNAPSHOT
+// SNAPSHOT INSTALLATION
 // ============================================================
 
 function installSnapshot(snapshot) {
@@ -203,7 +212,8 @@ function installSnapshot(snapshot) {
   updatedAt = nowIso();
 
   console.log(
-    `[SNAPSHOT] Installed. ID=${snapshotId} bids=${bids.size} asks=${asks.size}`
+    `[SNAPSHOT] Installed. ID=${snapshotId} ` +
+    `bids=${bids.size} asks=${asks.size}`
   );
 
   return true;
@@ -223,12 +233,10 @@ function applyDepthEvent(event) {
     return false;
   }
 
-  // Ignore events already covered by our local book.
   if (u <= lastUpdateId) {
     return true;
   }
 
-  // Apply bids.
   for (const level of event.b || []) {
     const price = toNumber(level[0]);
     const qty = toNumber(level[1]);
@@ -242,7 +250,6 @@ function applyDepthEvent(event) {
     }
   }
 
-  // Apply asks.
   for (const level of event.a || []) {
     const price = toNumber(level[0]);
     const qty = toNumber(level[1]);
@@ -278,7 +285,6 @@ function findBridgeEvent(snapshotId) {
       continue;
     }
 
-    // Event must span snapshotId + 1.
     if (U <= target && u >= target) {
       return event;
     }
@@ -298,20 +304,21 @@ function tryCompleteBridge() {
 
   bridgeAttempts++;
 
-  const bridge = findBridgeEvent(lastSnapshotId);
+  const bridge =
+    findBridgeEvent(lastSnapshotId);
 
   if (!bridge) {
     return false;
   }
 
   console.log(
-    `[SYNC] Bridge found. Snapshot=${lastSnapshotId} ` +
+    `[SYNC] Bridge found. ` +
+    `Snapshot=${lastSnapshotId} ` +
     `Event=${bridge.U}-${bridge.u}`
   );
 
   bridgeFound++;
 
-  // Apply ONLY the bridge event.
   applyDepthEvent(bridge);
 
   initialized = true;
@@ -320,21 +327,15 @@ function tryCompleteBridge() {
   gapRecovery = false;
   gapDetected = false;
 
-  // IMPORTANT:
-  // Do NOT replay the entire old buffer.
-  //
-  // The old implementation replayed every buffered event after
-  // the bridge. If one old event appeared to have a gap, it wiped
-  // the valid book.
-  //
-  // We now start clean from the bridge point.
   pendingDepthEvents = [];
 
   updatedAt = nowIso();
 
   console.log(
-    `[SYNC] LIVE. updateId=${lastUpdateId} ` +
-    `bids=${bids.size} asks=${asks.size}`
+    `[SYNC] LIVE. ` +
+    `updateId=${lastUpdateId} ` +
+    `bids=${bids.size} ` +
+    `asks=${asks.size}`
   );
 
   return true;
@@ -359,20 +360,10 @@ function enterGapRecovery(event) {
     `incoming=${event.U}-${event.u}`
   );
 
-  // IMPORTANT:
-  // Do NOT clear the existing book.
-  //
-  // The old code immediately reset everything here.
-  // That caused:
-  //
-  // bidLevels: 0
-  // askLevels: 0
-  //
-  // while waiting for another snapshot.
-  //
-  // We keep the current book alive while recovery happens.
-
-  if (pendingDepthEvents.length < MAX_PENDING_EVENTS) {
+  if (
+    pendingDepthEvents.length <
+    MAX_PENDING_EVENTS
+  ) {
     pendingDepthEvents.push(event);
   }
 
@@ -380,7 +371,7 @@ function enterGapRecovery(event) {
 }
 
 // ============================================================
-// SCHEDULE SNAPSHOT RECOVERY
+// SNAPSHOT RECOVERY TIMER
 // ============================================================
 
 function scheduleSnapshotRecovery() {
@@ -394,12 +385,17 @@ function scheduleSnapshotRecovery() {
 
   if (lastSnapshotRequest) {
     const elapsed =
-      now - new Date(lastSnapshotRequest).getTime();
+      now -
+      new Date(
+        lastSnapshotRequest
+      ).getTime();
 
-    waitMs = Math.max(
-      0,
-      SNAPSHOT_MIN_INTERVAL_MS - elapsed
-    );
+    waitMs =
+      Math.max(
+        0,
+        SNAPSHOT_MIN_INTERVAL_MS -
+          elapsed
+      );
   }
 
   snapshotTimer = setTimeout(() => {
@@ -428,11 +424,14 @@ function handleDepthEvent(event) {
   }
 
   // ----------------------------------------------------------
-  // Always keep a small history while waiting for bridge.
+  // Waiting for snapshot bridge
   // ----------------------------------------------------------
 
   if (waitingForBridge) {
-    if (pendingDepthEvents.length < MAX_PENDING_EVENTS) {
+    if (
+      pendingDepthEvents.length <
+      MAX_PENDING_EVENTS
+    ) {
       pendingDepthEvents.push(event);
     }
 
@@ -442,21 +441,23 @@ function handleDepthEvent(event) {
   }
 
   // ----------------------------------------------------------
-  // If we are in gap recovery:
-  //
-  // Keep the existing book.
-  // If a later event overlaps the missing update, we can
-  // continue without waiting for another snapshot.
+  // Gap recovery
   // ----------------------------------------------------------
 
   if (gapRecovery) {
-    if (pendingDepthEvents.length < MAX_PENDING_EVENTS) {
+    if (
+      pendingDepthEvents.length <
+      MAX_PENDING_EVENTS
+    ) {
       pendingDepthEvents.push(event);
     }
 
-    // If the incoming event bridges our local next update,
-    // apply it and recover.
-    if (U <= lastUpdateId + 1 && u >= lastUpdateId + 1) {
+    // If the stream eventually gives us an event that
+    // overlaps the next required update, recover immediately.
+    if (
+      U <= lastUpdateId + 1 &&
+      u >= lastUpdateId + 1
+    ) {
       applyDepthEvent(event);
 
       gapRecovery = false;
@@ -474,11 +475,14 @@ function handleDepthEvent(event) {
   }
 
   // ----------------------------------------------------------
-  // Normal live synchronization.
+  // Not initialized
   // ----------------------------------------------------------
 
   if (!initialized) {
-    if (pendingDepthEvents.length < MAX_PENDING_EVENTS) {
+    if (
+      pendingDepthEvents.length <
+      MAX_PENDING_EVENTS
+    ) {
       pendingDepthEvents.push(event);
     }
 
@@ -487,24 +491,34 @@ function handleDepthEvent(event) {
     return;
   }
 
-  // Event is completely old.
+  // ----------------------------------------------------------
+  // Old event
+  // ----------------------------------------------------------
+
   if (u <= lastUpdateId) {
     return;
   }
 
-  // Normal contiguous / overlapping event.
-  if (U <= lastUpdateId + 1 && u >= lastUpdateId + 1) {
+  // ----------------------------------------------------------
+  // Normal contiguous event
+  // ----------------------------------------------------------
+
+  if (
+    U <= lastUpdateId + 1 &&
+    u >= lastUpdateId + 1
+  ) {
     applyDepthEvent(event);
     return;
   }
 
-  // Genuine gap.
+  // ----------------------------------------------------------
+  // Genuine gap
+  // ----------------------------------------------------------
+
   if (U > lastUpdateId + 1) {
     enterGapRecovery(event);
     return;
   }
-
-  // Otherwise ignore.
 }
 
 // ============================================================
@@ -520,21 +534,29 @@ function connectDepthWebSocket() {
 
   safeClose(depthWs);
 
-  depthWs = new WebSocket(DEPTH_WS);
+  depthWs =
+    new WebSocket(DEPTH_WS);
 
   depthWs.on("open", () => {
-    console.log("[WS] Depth WebSocket connected");
+    console.log(
+      "[WS] Depth WebSocket connected"
+    );
 
-    // Do not immediately request snapshots repeatedly.
-    // Initial snapshot is requested only once.
-    if (!initialized && !waitingForBridge && !snapshotPending) {
+    if (
+      !initialized &&
+      !waitingForBridge &&
+      !snapshotPending
+    ) {
       requestSnapshot("startup");
     }
   });
 
   depthWs.on("message", raw => {
     try {
-      const event = JSON.parse(raw.toString());
+      const event =
+        JSON.parse(
+          raw.toString()
+        );
 
       if (
         event &&
@@ -552,7 +574,9 @@ function connectDepthWebSocket() {
   });
 
   depthWs.on("close", () => {
-    console.log("[WS] Depth WebSocket closed");
+    console.log(
+      "[WS] Depth WebSocket closed"
+    );
 
     scheduleDepthReconnect();
   });
@@ -568,11 +592,12 @@ function connectDepthWebSocket() {
 function scheduleDepthReconnect() {
   if (reconnectTimer) return;
 
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
+  reconnectTimer =
+    setTimeout(() => {
+      reconnectTimer = null;
 
-    connectDepthWebSocket();
-  }, 5000);
+      connectDepthWebSocket();
+    }, 5000);
 }
 
 // ============================================================
@@ -586,7 +611,8 @@ function connectSnapshotWebSocket() {
     `[WS] Connecting snapshot API: ${WS_API}`
   );
 
-  snapshotWs = new WebSocket(WS_API);
+  snapshotWs =
+    new WebSocket(WS_API);
 
   snapshotWs.on("open", () => {
     console.log(
@@ -596,7 +622,10 @@ function connectSnapshotWebSocket() {
 
   snapshotWs.on("message", raw => {
     try {
-      const message = JSON.parse(raw.toString());
+      const message =
+        JSON.parse(
+          raw.toString()
+        );
 
       if (
         message &&
@@ -640,8 +669,10 @@ function requestSnapshot(reason) {
     return false;
   }
 
-  // If already live and not recovering, no snapshot needed.
-  if (initialized && !gapRecovery) {
+  if (
+    initialized &&
+    !gapRecovery
+  ) {
     return false;
   }
 
@@ -649,23 +680,31 @@ function requestSnapshot(reason) {
 
   if (lastSnapshotRequest) {
     const elapsed =
-      now - new Date(lastSnapshotRequest).getTime();
+      now -
+      new Date(
+        lastSnapshotRequest
+      ).getTime();
 
-    if (elapsed < SNAPSHOT_MIN_INTERVAL_MS) {
+    if (
+      elapsed <
+      SNAPSHOT_MIN_INTERVAL_MS
+    ) {
       const remaining =
-        SNAPSHOT_MIN_INTERVAL_MS - elapsed;
+        SNAPSHOT_MIN_INTERVAL_MS -
+        elapsed;
 
       console.log(
-        `[SNAPSHOT] Rate-limit cooldown active. ` +
+        `[SNAPSHOT] Cooldown active. ` +
         `Waiting ${remaining}ms`
       );
 
       if (!snapshotTimer) {
-        snapshotTimer = setTimeout(() => {
-          snapshotTimer = null;
+        snapshotTimer =
+          setTimeout(() => {
+            snapshotTimer = null;
 
-          requestSnapshot(reason);
-        }, remaining);
+            requestSnapshot(reason);
+          }, remaining);
       }
 
       return false;
@@ -674,7 +713,8 @@ function requestSnapshot(reason) {
 
   if (
     !snapshotWs ||
-    snapshotWs.readyState !== WebSocket.OPEN
+    snapshotWs.readyState !==
+      WebSocket.OPEN
   ) {
     console.log(
       "[SNAPSHOT] Snapshot WebSocket not connected"
@@ -687,18 +727,24 @@ function requestSnapshot(reason) {
 
   snapshotRequests++;
 
-  lastSnapshotRequest = nowIso();
+  lastSnapshotRequest =
+    nowIso();
 
   console.log(
-    `[SNAPSHOT] Requesting depth snapshot. Reason=${reason}`
+    `[SNAPSHOT] Requesting depth snapshot. ` +
+    `Reason=${reason}`
   );
 
   const requestId =
-    `${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    `${Date.now()}-${Math.floor(
+      Math.random() * 100000
+    )}`;
 
   const request = {
     id: requestId,
+
     method: "depth",
+
     params: {
       symbol: SYMBOL,
       limit: 1000
@@ -706,11 +752,14 @@ function requestSnapshot(reason) {
   };
 
   try {
-    snapshotWs.send(JSON.stringify(request));
+    snapshotWs.send(
+      JSON.stringify(request)
+    );
   } catch (err) {
     snapshotPending = false;
 
-    lastSnapshotError = err.message;
+    lastSnapshotError =
+      err.message;
 
     console.log(
       "[SNAPSHOT] Send error:",
@@ -721,7 +770,9 @@ function requestSnapshot(reason) {
   }
 
   setTimeout(() => {
-    if (!snapshotPending) return;
+    if (!snapshotPending) {
+      return;
+    }
 
     snapshotPending = false;
 
@@ -748,12 +799,16 @@ function handleSnapshotResponse(message) {
 
     lastSnapshotError =
       message.error
-        ? JSON.stringify(message.error)
+        ? JSON.stringify(
+            message.error
+          )
         : `status ${message.status}`;
 
     if (
       message.error &&
-      Number(message.error.code) === -1003
+      Number(
+        message.error.code
+      ) === -1003
     ) {
       snapshot429s++;
 
@@ -785,23 +840,23 @@ function handleSnapshotResponse(message) {
 
   snapshotPending = false;
 
-  lastSnapshotResponse = nowIso();
+  lastSnapshotResponse =
+    nowIso();
 
   lastSnapshotError = null;
 
   const installed =
-    installSnapshot(message.result);
+    installSnapshot(
+      message.result
+    );
 
   if (!installed) {
     scheduleSnapshotRecovery();
     return;
   }
 
-  // Immediately attempt the bridge.
   tryCompleteBridge();
 
-  // If the bridge is not in the current buffer yet,
-  // leave the snapshot installed and wait for more events.
   if (!initialized) {
     console.log(
       "[SNAPSHOT] Waiting for bridge event..."
@@ -818,7 +873,10 @@ function calculateCurrentPrice() {
   let bestAsk = 0;
 
   for (const [price, qty] of bids) {
-    if (qty > 0 && price > bestBid) {
+    if (
+      qty > 0 &&
+      price > bestBid
+    ) {
       bestBid = price;
     }
   }
@@ -826,281 +884,412 @@ function calculateCurrentPrice() {
   for (const [price, qty] of asks) {
     if (
       qty > 0 &&
-      (bestAsk === 0 || price < bestAsk)
+      (
+        bestAsk === 0 ||
+        price < bestAsk
+      )
     ) {
       bestAsk = price;
     }
   }
 
-  if (bestBid > 0 && bestAsk > 0) {
-    return (bestBid + bestAsk) / 2;
+  if (
+    bestBid > 0 &&
+    bestAsk > 0
+  ) {
+    return (
+      bestBid +
+      bestAsk
+    ) / 2;
   }
 
-  if (bestBid > 0) return bestBid;
+  if (bestBid > 0) {
+    return bestBid;
+  }
 
-  if (bestAsk > 0) return bestAsk;
+  if (bestAsk > 0) {
+    return bestAsk;
+  }
 
   return null;
 }
 
 // ============================================================
-// ORDER BOOK LEVELS
+// LEVEL EXTRACTION
 // ============================================================
 
-function getLevels(map, side, price) {
+function getLevels(
+  map,
+  side,
+  referencePrice
+) {
   const output = [];
 
-  for (const [levelPrice, qty] of map) {
-    if (!(qty > 0)) continue;
-
-    const usd = levelPrice * qty;
-
-    if (!(usd > 0)) continue;
-
-    if (side === "bid" && levelPrice >= price) {
-      continue;
-    }
-
-    if (side === "ask" && levelPrice <= price) {
-      continue;
-    }
-
-    output.push({
-      price: levelPrice,
-      qty,
-      usd
-    });
-  }
-
-  output.sort((a, b) => {
-    return side === "bid"
-      ? b.price - a.price
-      : a.price - b.price;
-  });
-
-  return output;
-}
-
-// ============================================================
-// CLUSTERING
-// ============================================================
-
-function buildClusters(levels, side, referencePrice) {
-  if (!referencePrice || !levels.length) {
-    return [];
-  }
-
   const maxDistance =
-    referencePrice * RANGE_PCT;
+    referencePrice *
+    RANGE_PCT;
 
-  const filtered = levels.filter(level => {
-    const distance =
-      Math.abs(level.price - referencePrice);
-
-    return distance <= maxDistance;
-  });
-
-  if (!filtered.length) {
-    return [];
-  }
-
-  const buckets = new Map();
-
-  for (const level of filtered) {
-    const bucket =
-      Math.round(
-        level.price / PRICE_BUCKET_SIZE
-      ) * PRICE_BUCKET_SIZE;
-
-    if (!buckets.has(bucket)) {
-      buckets.set(bucket, {
-        bucket,
-        usd: 0,
-        quantity: 0,
-        levels: 0,
-        strongestPrice: level.price,
-        strongestUsd: level.usd
-      });
+  for (
+    const [price, qty]
+    of map
+  ) {
+    if (!(qty > 0)) {
+      continue;
     }
 
-    const b = buckets.get(bucket);
+    const usd =
+      price * qty;
 
-    b.usd += level.usd;
-    b.quantity += level.qty;
-    b.levels++;
-
-    if (level.usd > b.strongestUsd) {
-      b.strongestUsd = level.usd;
-      b.strongestPrice = level.price;
-    }
-  }
-
-  const sortedBuckets =
-    Array.from(buckets.values()).sort((a, b) => {
-      return a.bucket - b.bucket;
-    });
-
-  const clusters = [];
-
-  let current = null;
-
-  for (const bucket of sortedBuckets) {
-    if (!current) {
-      current = {
-        priceLow: bucket.bucket,
-        priceHigh: bucket.bucket,
-        totalUsd: bucket.usd,
-        totalQuantity: bucket.quantity,
-        levels: bucket.levels,
-        strongestPrice: bucket.strongestPrice,
-        strongestUsd: bucket.strongestUsd,
-        emptyBuckets: 0
-      };
-
+    if (!(usd > 0)) {
       continue;
     }
 
     const distance =
       Math.abs(
-        bucket.bucket -
-        current.priceHigh
+        price -
+        referencePrice
       );
 
-    const expectedGap =
-      PRICE_BUCKET_SIZE;
+    if (
+      distance >
+      maxDistance
+    ) {
+      continue;
+    }
 
-    const emptyCount =
-      Math.max(
-        0,
-        Math.round(
-          distance / expectedGap
-        ) - 1
+    if (
+      side === "bid" &&
+      price >= referencePrice
+    ) {
+      continue;
+    }
+
+    if (
+      side === "ask" &&
+      price <= referencePrice
+    ) {
+      continue;
+    }
+
+    output.push({
+      price,
+      qty,
+      usd
+    });
+  }
+
+  return output;
+}
+
+// ============================================================
+// LOCALIZED CONCENTRATION CLUSTERS
+// ============================================================
+//
+// NEW CLUSTER ENGINE
+//
+// Instead of:
+//   "neighboring levels = same cluster"
+//
+// We now:
+//   1. Find strong liquidity seeds.
+//   2. Build a small zone around each seed.
+//   3. Require enough meaningful levels.
+//   4. Require enough total USD.
+//   5. Remove overlapping areas.
+//   6. Find the next independent concentration.
+//
+// This prevents the entire order book from becoming one cluster.
+// ============================================================
+
+function buildClusters(
+  levels,
+  side,
+  referencePrice
+) {
+  if (
+    !referencePrice ||
+    !levels.length
+  ) {
+    return [];
+  }
+
+  // Only meaningful levels can start a cluster.
+  const seedCandidates =
+    levels
+      .filter(level =>
+        level.usd >=
+        SEED_LEVEL_USD
+      )
+      .sort(
+        (a, b) =>
+          b.usd -
+          a.usd
       );
 
-    if (emptyCount <= MAX_EMPTY_BUCKETS) {
-      current.priceHigh =
-        Math.max(
-          current.priceHigh,
-          bucket.bucket
+  if (!seedCandidates.length) {
+    return [];
+  }
+
+  const clusters = [];
+
+  // Prices already consumed by stronger clusters.
+  const usedPrices = [];
+
+  for (
+    const seed
+    of seedCandidates
+  ) {
+    if (
+      clusters.length >=
+      MAX_CLUSTERS
+    ) {
+      break;
+    }
+
+    // --------------------------------------------------------
+    // Do not create another cluster too close to an existing
+    // stronger concentration.
+    // --------------------------------------------------------
+
+    let tooClose = false;
+
+    for (
+      const existing
+      of clusters
+    ) {
+      const distance =
+        Math.abs(
+          seed.price -
+          existing.strongestPrice
         );
-
-      current.priceLow =
-        Math.min(
-          current.priceLow,
-          bucket.bucket
-        );
-
-      current.totalUsd += bucket.usd;
-
-      current.totalQuantity +=
-        bucket.quantity;
-
-      current.levels += bucket.levels;
-
-      current.emptyBuckets +=
-        emptyCount;
 
       if (
-        bucket.strongestUsd >
-        current.strongestUsd
+        distance <
+        MIN_CLUSTER_SEPARATION_USD
       ) {
-        current.strongestUsd =
-          bucket.strongestUsd;
-
-        current.strongestPrice =
-          bucket.strongestPrice;
+        tooClose = true;
+        break;
       }
-    } else {
-      clusters.push(current);
-
-      current = {
-        priceLow: bucket.bucket,
-        priceHigh: bucket.bucket,
-        totalUsd: bucket.usd,
-        totalQuantity: bucket.quantity,
-        levels: bucket.levels,
-        strongestPrice: bucket.strongestPrice,
-        strongestUsd: bucket.strongestUsd,
-        emptyBuckets: 0
-      };
     }
-  }
 
-  if (current) {
-    clusters.push(current);
-  }
+    if (tooClose) {
+      continue;
+    }
 
-  // Require enough concentration.
-  const qualified =
-    clusters.filter(cluster => {
-      return (
-        cluster.totalUsd >= MIN_CLUSTER_USD &&
-        cluster.levels >= MIN_CLUSTER_LEVELS
-      );
-    });
+    // --------------------------------------------------------
+    // Collect nearby meaningful levels.
+    // --------------------------------------------------------
 
-  // Sort by total USD.
-  qualified.sort((a, b) => {
-    return b.totalUsd - a.totalUsd;
-  });
+    const nearby =
+      levels.filter(level => {
+        const distance =
+          Math.abs(
+            level.price -
+            seed.price
+          );
 
-  const finalClusters =
-    qualified.slice(0, MAX_CLUSTERS);
+        if (
+          distance >
+          CLUSTER_RADIUS_USD
+        ) {
+          return false;
+        }
 
-  return finalClusters.map(cluster => {
+        if (
+          level.usd <
+          MIN_CLUSTER_LEVEL_USD
+        ) {
+          return false;
+        }
+
+        // Do not allow one level to belong to two
+        // strong clusters.
+        if (
+          usedPrices.some(
+            price =>
+              price ===
+              level.price
+          )
+        ) {
+          return false;
+        }
+
+        return true;
+      });
+
+    if (!nearby.length) {
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // Calculate concentration.
+    // --------------------------------------------------------
+
+    let totalUsd = 0;
+    let totalQuantity = 0;
+
+    let strongestPrice =
+      seed.price;
+
+    let strongestUsd =
+      seed.usd;
+
+    for (
+      const level
+      of nearby
+    ) {
+      totalUsd +=
+        level.usd;
+
+      totalQuantity +=
+        level.qty;
+
+      if (
+        level.usd >
+        strongestUsd
+      ) {
+        strongestUsd =
+          level.usd;
+
+        strongestPrice =
+          level.price;
+      }
+    }
+
+    // --------------------------------------------------------
+    // Need enough total liquidity.
+    // --------------------------------------------------------
+
+    if (
+      totalUsd <
+      MIN_CLUSTER_USD
+    ) {
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // Need at least several meaningful levels.
+    // --------------------------------------------------------
+
+    if (
+      nearby.length <
+      MIN_CLUSTER_LEVELS
+    ) {
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // Determine actual range.
+    // --------------------------------------------------------
+
+    let priceLow =
+      nearby[0].price;
+
+    let priceHigh =
+      nearby[0].price;
+
+    for (
+      const level
+      of nearby
+    ) {
+      priceLow =
+        Math.min(
+          priceLow,
+          level.price
+        );
+
+      priceHigh =
+        Math.max(
+          priceHigh,
+          level.price
+        );
+    }
+
     const midpoint =
       (
-        cluster.priceLow +
-        cluster.priceHigh
+        priceLow +
+        priceHigh
       ) / 2;
 
     const distancePct =
       (
-        (midpoint - referencePrice) /
+        (
+          midpoint -
+          referencePrice
+        ) /
         referencePrice
       ) * 100;
 
-    return {
+    const cluster = {
       side,
 
       priceLow:
-        Number(cluster.priceLow.toFixed(2)),
+        Number(
+          priceLow.toFixed(2)
+        ),
 
       priceHigh:
-        Number(cluster.priceHigh.toFixed(2)),
+        Number(
+          priceHigh.toFixed(2)
+        ),
 
       midpoint:
-        Number(midpoint.toFixed(2)),
+        Number(
+          midpoint.toFixed(2)
+        ),
 
       strongestPrice:
         Number(
-          cluster.strongestPrice.toFixed(2)
+          strongestPrice.toFixed(2)
         ),
 
       strongestUsd:
         Number(
-          cluster.strongestUsd.toFixed(2)
+          strongestUsd.toFixed(2)
         ),
 
       totalUsd:
         Number(
-          cluster.totalUsd.toFixed(2)
+          totalUsd.toFixed(2)
         ),
 
       totalQuantity:
         Number(
-          cluster.totalQuantity.toFixed(6)
+          totalQuantity.toFixed(6)
         ),
 
       levels:
-        cluster.levels,
+        nearby.length,
 
       distancePct:
         Number(
           distancePct.toFixed(3)
         )
     };
-  });
+
+    clusters.push(
+      cluster
+    );
+
+    // Mark these prices as consumed.
+    for (
+      const level
+      of nearby
+    ) {
+      usedPrices.push(
+        level.price
+      );
+    }
+  }
+
+  // Strongest concentration first.
+  clusters.sort(
+    (a, b) =>
+      b.totalUsd -
+      a.totalUsd
+  );
+
+  return clusters;
 }
 
 // ============================================================
@@ -1115,16 +1304,34 @@ function buildLiquidity() {
   if (!price) {
     return {
       symbol: SYMBOL,
+
       currentPrice: null,
 
       settings: {
-        minClusterUsd: MIN_CLUSTER_USD,
-        rangePct: RANGE_PCT,
-        priceBucketSize: PRICE_BUCKET_SIZE,
-        minClusterLevels: MIN_CLUSTER_LEVELS
+        minClusterUsd:
+          MIN_CLUSTER_USD,
+
+        rangePct:
+          RANGE_PCT,
+
+        clusterRadiusUsd:
+          CLUSTER_RADIUS_USD,
+
+        minClusterLevels:
+          MIN_CLUSTER_LEVELS,
+
+        seedLevelUsd:
+          SEED_LEVEL_USD,
+
+        minClusterLevelUsd:
+          MIN_CLUSTER_LEVEL_USD,
+
+        minClusterSeparationUsd:
+          MIN_CLUSTER_SEPARATION_USD
       },
 
       buyLiquidity: [],
+
       sellLiquidity: [],
 
       summary: {
@@ -1136,27 +1343,56 @@ function buildLiquidity() {
 
       book: {
         initialized,
-        bidLevels: bids.size,
-        askLevels: asks.size,
+        bidLevels:
+          bids.size,
+        askLevels:
+          asks.size,
         lastUpdateId
       },
 
       sync: {
+        status:
+          initialized
+            ? (
+                gapRecovery
+                  ? "gap_recovery"
+                  : "live"
+              )
+            : (
+                waitingForBridge
+                  ? "waiting_for_bridge"
+                  : "syncing"
+              ),
+
         gapRecovery,
+
         gapDetected,
+
         gapCount,
+
         lastGapLocal,
-        lastGapIncoming
+
+        lastGapIncoming,
+
+        pendingEvents:
+          pendingDepthEvents.length,
+
+        snapshotPending,
+
+        snapshotId:
+          lastSnapshotId
       },
 
       connections: {
         depthWebSocket:
           depthWs &&
-          depthWs.readyState === WebSocket.OPEN,
+          depthWs.readyState ===
+            WebSocket.OPEN,
 
         snapshotWebSocket:
           snapshotWs &&
-          snapshotWs.readyState === WebSocket.OPEN
+          snapshotWs.readyState ===
+            WebSocket.OPEN
       },
 
       updatedAt
@@ -1196,14 +1432,16 @@ function buildLiquidity() {
   const totalBuyUsd =
     buyLiquidity.reduce(
       (sum, cluster) =>
-        sum + cluster.totalUsd,
+        sum +
+        cluster.totalUsd,
       0
     );
 
   const totalSellUsd =
     sellLiquidity.reduce(
       (sum, cluster) =>
-        sum + cluster.totalUsd,
+        sum +
+        cluster.totalUsd,
       0
     );
 
@@ -1211,7 +1449,9 @@ function buildLiquidity() {
     symbol: SYMBOL,
 
     currentPrice:
-      Number(price.toFixed(2)),
+      Number(
+        price.toFixed(2)
+      ),
 
     settings: {
       minClusterUsd:
@@ -1220,8 +1460,8 @@ function buildLiquidity() {
       rangePct:
         RANGE_PCT,
 
-      priceBucketSize:
-        PRICE_BUCKET_SIZE,
+      clusterRadiusUsd:
+        CLUSTER_RADIUS_USD,
 
       minClusterLevels:
         MIN_CLUSTER_LEVELS,
@@ -1229,8 +1469,11 @@ function buildLiquidity() {
       seedLevelUsd:
         SEED_LEVEL_USD,
 
-      maxEmptyBuckets:
-        MAX_EMPTY_BUCKETS
+      minClusterLevelUsd:
+        MIN_CLUSTER_LEVEL_USD,
+
+      minClusterSeparationUsd:
+        MIN_CLUSTER_SEPARATION_USD
     },
 
     buyLiquidity,
@@ -1303,11 +1546,13 @@ function buildLiquidity() {
     connections: {
       depthWebSocket:
         depthWs &&
-        depthWs.readyState === WebSocket.OPEN,
+        depthWs.readyState ===
+          WebSocket.OPEN,
 
       snapshotWebSocket:
         snapshotWs &&
-        snapshotWs.readyState === WebSocket.OPEN
+        snapshotWs.readyState ===
+          WebSocket.OPEN
     },
 
     updatedAt
@@ -1318,221 +1563,266 @@ function buildLiquidity() {
 // HEALTH
 // ============================================================
 
-app.get("/health", (req, res) => {
-  const depthConnected =
-    depthWs &&
-    depthWs.readyState === WebSocket.OPEN;
+app.get(
+  "/health",
+  (req, res) => {
+    const depthConnected =
+      depthWs &&
+      depthWs.readyState ===
+        WebSocket.OPEN;
 
-  const snapshotConnected =
-    snapshotWs &&
-    snapshotWs.readyState === WebSocket.OPEN;
+    const snapshotConnected =
+      snapshotWs &&
+      snapshotWs.readyState ===
+        WebSocket.OPEN;
 
-  let status = "syncing";
+    let status =
+      "syncing";
 
-  if (initialized && !gapRecovery) {
-    status = "live";
-  } else if (initialized && gapRecovery) {
-    status = "gap_recovery";
-  } else if (waitingForBridge) {
-    status = "waiting_for_bridge";
-  }
+    if (
+      initialized &&
+      !gapRecovery
+    ) {
+      status = "live";
+    } else if (
+      initialized &&
+      gapRecovery
+    ) {
+      status =
+        "gap_recovery";
+    } else if (
+      waitingForBridge
+    ) {
+      status =
+        "waiting_for_bridge";
+    }
 
-  res.json({
-    ok: true,
+    res.json({
+      ok: true,
 
-    symbol: SYMBOL,
+      symbol: SYMBOL,
 
-    status,
+      status,
 
-    initialized,
+      initialized,
 
-    waitingForBridge,
+      waitingForBridge,
 
-    snapshotPending,
+      snapshotPending,
 
-    gapRecovery,
+      gapRecovery,
 
-    gapDetected,
+      gapDetected,
 
-    depthConnected,
+      depthConnected,
 
-    snapshotConnected,
+      snapshotConnected,
 
-    currentPrice:
       currentPrice,
 
-    bidLevels:
-      bids.size,
+      bidLevels:
+        bids.size,
 
-    askLevels:
-      asks.size,
+      askLevels:
+        asks.size,
 
-    pendingEvents:
-      pendingDepthEvents.length,
+      pendingEvents:
+        pendingDepthEvents.length,
 
-    lastUpdateId,
+      lastUpdateId,
 
-    resyncs,
+      resyncs,
 
-    snapshotRequests,
+      snapshotRequests,
 
-    snapshot429s,
+      snapshot429s,
 
-    bridgeAttempts,
+      bridgeAttempts,
 
-    bridgeFound,
+      bridgeFound,
 
-    gapCount,
+      gapCount,
 
-    lastGapLocal,
+      lastGapLocal,
 
-    lastGapIncoming,
+      lastGapIncoming,
 
-    lastSnapshotRequest,
+      lastSnapshotRequest,
 
-    lastSnapshotResponse,
+      lastSnapshotResponse,
 
-    lastSnapshotError,
+      lastSnapshotError,
 
-    lastResetReason,
+      lastResetReason,
 
-    updatedAt
-  });
-});
+      updatedAt
+    });
+  }
+);
 
 // ============================================================
 // LIQUIDITY ENDPOINT
 // ============================================================
 
-app.get("/liquidity", (req, res) => {
-  try {
-    res.json(
-      buildLiquidity()
-    );
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err.message
+app.get(
+  "/liquidity",
+  (req, res) => {
+    try {
+      res.json(
+        buildLiquidity()
+      );
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err.message
+      });
+    }
+  }
+);
+
+// ============================================================
+// FULL BOOK ENDPOINT
+// ============================================================
+
+app.get(
+  "/book",
+  (req, res) => {
+    const price =
+      currentPrice ||
+      calculateCurrentPrice();
+
+    const bidsArray =
+      Array.from(
+        bids.entries()
+      )
+        .map(
+          ([price, qty]) => ({
+            price,
+            qty,
+            usd:
+              price * qty
+          })
+        )
+        .sort(
+          (a, b) =>
+            b.price -
+            a.price
+        );
+
+    const asksArray =
+      Array.from(
+        asks.entries()
+      )
+        .map(
+          ([price, qty]) => ({
+            price,
+            qty,
+            usd:
+              price * qty
+          })
+        )
+        .sort(
+          (a, b) =>
+            a.price -
+            b.price
+        );
+
+    res.json({
+      symbol: SYMBOL,
+
+      currentPrice:
+        price,
+
+      initialized,
+
+      gapRecovery,
+
+      lastUpdateId,
+
+      bids:
+        bidsArray,
+
+      asks:
+        asksArray,
+
+      bidLevels:
+        bids.size,
+
+      askLevels:
+        asks.size,
+
+      updatedAt
     });
   }
-});
-
-// ============================================================
-// BOOK ENDPOINT
-// ============================================================
-
-app.get("/book", (req, res) => {
-  const price =
-    currentPrice ||
-    calculateCurrentPrice();
-
-  const bidsArray =
-    Array.from(bids.entries())
-      .map(([price, qty]) => ({
-        price,
-        qty,
-        usd:
-          price * qty
-      }))
-      .sort(
-        (a, b) =>
-          b.price - a.price
-      );
-
-  const asksArray =
-    Array.from(asks.entries())
-      .map(([price, qty]) => ({
-        price,
-        qty,
-        usd:
-          price * qty
-      }))
-      .sort(
-        (a, b) =>
-          a.price - b.price
-      );
-
-  res.json({
-    symbol: SYMBOL,
-
-    currentPrice:
-      price,
-
-    initialized,
-
-    gapRecovery,
-
-    lastUpdateId,
-
-    bids:
-      bidsArray,
-
-    asks:
-      asksArray,
-
-    bidLevels:
-      bids.size,
-
-    askLevels:
-      asks.size,
-
-    updatedAt
-  });
-});
+);
 
 // ============================================================
 // ROOT
 // ============================================================
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
+app.get(
+  "/",
+  (req, res) => {
+    res.json({
+      ok: true,
 
-    service:
-      "Binance Futures Liquidity Relay",
+      service:
+        "Binance Futures Liquidity Relay",
 
-    symbol:
-      SYMBOL,
+      symbol:
+        SYMBOL,
 
-    endpoints: {
-      health:
-        "/health",
+      endpoints: {
+        health:
+          "/health",
 
-      liquidity:
-        "/liquidity",
+        liquidity:
+          "/liquidity",
 
-      book:
-        "/book"
-    }
-  });
-});
+        book:
+          "/book"
+      }
+    });
+  }
+);
 
 // ============================================================
 // START SERVER
 // ============================================================
 
-app.listen(PORT, () => {
-  console.log(
-    `Server listening on port ${PORT}`
-  );
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `Server listening on port ${PORT}`
+    );
 
-  console.log(
-    `[CONFIG] Symbol=${SYMBOL}`
-  );
+    console.log(
+      `[CONFIG] Symbol=${SYMBOL}`
+    );
 
-  console.log(
-    `[CONFIG] Snapshot cooldown=${SNAPSHOT_MIN_INTERVAL_MS}ms`
-  );
+    console.log(
+      `[CONFIG] Range=${RANGE_PCT * 100}%`
+    );
 
-  console.log(
-    `[CONFIG] Cluster minimum=$${MIN_CLUSTER_USD}`
-  );
+    console.log(
+      `[CONFIG] Seed level=$${SEED_LEVEL_USD}`
+    );
 
-  console.log(
-    `[CONFIG] Range=${RANGE_PCT * 100}%`
-  );
+    console.log(
+      `[CONFIG] Minimum cluster=$${MIN_CLUSTER_USD}`
+    );
 
-  connectSnapshotWebSocket();
+    console.log(
+      `[CONFIG] Cluster radius=$${CLUSTER_RADIUS_USD}`
+    );
 
-  connectDepthWebSocket();
-});
+    console.log(
+      `[CONFIG] Cluster separation=$${MIN_CLUSTER_SEPARATION_USD}`
+    );
+
+    connectSnapshotWebSocket();
+
+    connectDepthWebSocket();
+  }
+);
