@@ -1,56 +1,31 @@
 /* ============================================================
-   BINANCE BTCUSDT MAJOR LIQUIDITY RELAY
-   Render + Binance Futures WebSocket
+   BINANCE BTCUSDT LIQUIDITY / MARKET STRUCTURE RELAY
+   V10 - STABLE SNAPSHOT + CONCENTRATED WALL DETECTOR
+
+   DATA SOURCES
    ------------------------------------------------------------
-   VERSION: 10.0
+   Historical structure:
+     Binance Spot data-api.binance.vision
 
-   MAJOR CHANGES
+   Live order book:
+     Binance Futures depth websocket
+
+   Live candles:
+     Binance Futures kline websocket
+
+   Snapshot:
+     Binance Futures WebSocket API
+
+   IMPORTANT
    ------------------------------------------------------------
-   1. ORDER BOOK CONCENTRATION MODEL
-      - Stops treating dense normal book levels as one huge wall.
-      - Uses fixed USD buckets.
-      - Calculates local/overall bucket baseline.
-      - Requires unusually concentrated liquidity.
-      - Genuine single walls can still qualify.
+   BSL = structural highs ABOVE current price
+   SSL = structural lows BELOW current price
 
-   2. MAXIMUM BOOK ZONE WIDTH
-      - Prevents giant $100-$200+ zones from swallowing the book.
-
-   3. PERSISTENCE CLEANUP
-      - One-observation clusters are not reported as meaningful
-        REMOVED liquidity.
-      - Meaningful removals require multiple observations or
-        sufficient lifetime.
-
-   4. STRICTER STRUCTURAL CONFLUENCE
-      - Prefers actual overlap with structural zones.
-      - Otherwise requires a much tighter distance.
-      - Only major structural levels can create confluence.
-
-   5. PERSISTENCE STATE FIX
-      - Correctly compares previous USD vs current USD.
-
-   6. STABLE STRUCTURE CACHE
-      - Prevents temporary rebuilds from erasing good structure.
-
-   7. TRUE CLOSED-CANDLE SWEEP DETECTION
-      - Uses the previously accepted structural map before rebuild.
-
-   8. SAME API ENDPOINTS
-      - /health
-      - /book
-      - /liquidity
-      - /structure
-      - /intelligence
-      - /events
-============================================================ */
+   Resting bids/asks are kept separate from structural liquidity.
+   ============================================================ */
 
 const express = require("express");
 const WebSocket = require("ws");
-
-/* ============================================================
-   APP
-============================================================ */
 
 const app = express();
 app.use(express.json());
@@ -70,89 +45,80 @@ const KLINE_WS =
   "btcusdt@kline_4h/" +
   "btcusdt@kline_1d";
 
-const WS_API =
+const FUTURES_API_WS =
   "wss://ws-fapi.binance.com/ws-fapi/v1";
 
 /* ============================================================
    SETTINGS
-============================================================ */
+   ============================================================ */
 
 const SETTINGS = {
 
   /* ----------------------------------------------------------
      RAW ORDER BOOK
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
   rawMinUsd: 50000,
 
-  /* Price distance used when attaching resting liquidity
-     to structural levels. */
   restingRadiusUsd: 35,
-
-  /* Minimum resting USD for structural confirmation. */
   restingConfirmUsd: 250000,
 
-
   /* ----------------------------------------------------------
-     STRUCTURAL ZONES
-  ---------------------------------------------------------- */
+     STRUCTURE
+     ---------------------------------------------------------- */
 
   mergeUsd: 35,
-
   zonePct: 0.0015,
-
   reactionPct: 0.003,
 
-
-  /* ----------------------------------------------------------
-     STRUCTURAL LEVEL LIMITS
-  ---------------------------------------------------------- */
-
   minScore: 40,
-
-  maxLevels: 8,
-
+  maxLevels: 12,
 
   /* ----------------------------------------------------------
      ORDER BOOK CONCENTRATION
-     
-     IMPORTANT:
-     We no longer simply connect every adjacent order.
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
-  bookBucketUsd: 10,
+  bookBucketUsd: 5,
 
-  /* Absolute minimum bucket size. */
   orderBucketMinUsd: 250000,
 
-  /* A single bucket can qualify if it is this large. */
-  orderSingleBucketMinUsd: 1000000,
-
-  /* Total concentrated liquidity required. */
-  orderMinUsd: 750000,
-
-  /* Minimum number of strong buckets for a cluster. */
-  minStrongBuckets: 2,
-
-  /* Maximum physical width of one book cluster. */
-  orderMaxClusterWidthUsd: 150,
-
-  /* Maximum bucket gap while clustering. */
-  orderMaxBucketGapUsd: 10,
-
-  /* Concentration multiplier over median bucket. */
   orderConcentrationMultiple: 2.5,
 
-  /* Percentile floor used as a second concentration filter. */
-  orderPercentile: 0.75,
+  orderMinUsd: 750000,
 
-  /* Only return strongest book zones. */
-  maxBookClusters: 8,
+  orderSingleBucketMinUsd: 1000000,
 
+  minStrongBuckets: 2,
+
+  /*
+     HARD WIDTH LIMIT.
+
+     A cluster cannot become a huge 120-200 USD
+     ladder simply because many neighboring buckets
+     are individually large.
+  */
+  orderMaxClusterWidthUsd: 50,
+
+  /*
+     If concentration drops sharply between adjacent
+     strong buckets, split the cluster.
+  */
+  orderSplitRatio: 0.45,
+
+  /*
+     Do not allow more than this many strong buckets
+     in a single wall cluster.
+  */
+  orderMaxStrongBucketsPerCluster: 6,
+
+  /*
+     A single giant wall can stand by itself.
+  */
+  orderGiantWallUsd: 1500000,
 
   /* ----------------------------------------------------------
      PERSISTENCE
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
   persistencePollMs: 5000,
 
@@ -162,30 +128,27 @@ const SETTINGS = {
 
   persistenceTolerancePct: 0.0005,
 
-  persistenceMinObservationsForRemoval: 2,
+  persistenceRemovedMinObservations: 2,
 
-  persistenceMinLifetimeMs: 10000,
-
+  persistenceRemovedMinLifetimeMs: 10000,
 
   /* ----------------------------------------------------------
      EVENTS
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
   eventMax: 100,
 
-
   /* ----------------------------------------------------------
      SWEEPS
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
   sweepLookbackMs: 24 * 60 * 60 * 1000,
 
   sweepMinPenetrationPct: 0.00015,
 
-
   /* ----------------------------------------------------------
      MAJOR STRUCTURE
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
   majorMinDistancePct: 0.50,
 
@@ -195,36 +158,47 @@ const SETTINGS = {
 
   majorHigherTfMinScore: 40,
 
-
   /* ----------------------------------------------------------
      STRUCTURE CACHE
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
   structureCacheMaxAgeMs: 30 * 60 * 1000,
 
-
   /* ----------------------------------------------------------
      CONFLUENCE
-  ---------------------------------------------------------- */
+     ---------------------------------------------------------- */
 
-  confluenceMaxDistanceUsd: 100,
+  confluenceMaxDistancePct: 0.001,
 
-  confluenceMaxDistancePct: 0.0012,
+  confluenceMaxDistanceUsd: 75,
 
+  confluenceMinOverlapRatio: 0.20,
 
   /* ----------------------------------------------------------
-     BOOK EVENT FILTERS
-  ---------------------------------------------------------- */
+     DEPTH SYNC
+     ---------------------------------------------------------- */
 
-  eventMinPersistentUsd: 750000,
+  snapshotCooldownMs: 5000,
 
-  eventStrengthChangePct: 0.20
+  maxPendingDepthEvents: 5000,
+
+  depthReconnectMs: 3000,
+
+  snapshotReconnectMs: 3000,
+
+  klineReconnectMs: 3000,
+
+  /* ----------------------------------------------------------
+     REST
+     ---------------------------------------------------------- */
+
+  requestTimeoutMs: 15000
 };
 
 
 /* ============================================================
-   STRUCTURE SETTINGS
-============================================================ */
+   STRUCTURE TIMEFRAMES
+   ============================================================ */
 
 const STRUCTURE = {
 
@@ -263,166 +237,154 @@ const STRUCTURE = {
     right: 5,
     eq: 0.0025
   }
-
 };
 
 
 /* ============================================================
-   STATE
-============================================================ */
+   GLOBAL STATE
+   ============================================================ */
 
 const state = {
+
+  symbol: SYMBOL,
 
   currentPrice: null,
 
   priceSource: null,
 
+  /* ----------------------------------------------------------
+     ORDER BOOK
+     ---------------------------------------------------------- */
+
   bids: new Map(),
 
   asks: new Map(),
+
+  initialized: false,
+
+  lastUpdateId: 0,
+
+  pendingDepthEvents: [],
+
+  waitingForBridge: false,
+
+  snapshotPending: false,
+
+  snapshotInFlight: false,
+
+  lastSnapshotRequestAt: 0,
+
+  /* ----------------------------------------------------------
+     CONNECTIONS
+     ---------------------------------------------------------- */
+
+  depthWs: null,
 
   depthConnected: false,
 
-  depthInitialized: false,
+  snapshotWs: null,
 
-  depthLastUpdateId: 0,
+  snapshotConnected: false,
 
-  depthPendingEvents: [],
+  klineWs: null,
 
-  depthSnapshotPending: false,
+  klineConnected: false,
 
-  depthSnapshotRequests: 0,
+  /* ----------------------------------------------------------
+     SNAPSHOT STATS
+     ---------------------------------------------------------- */
 
-  depthSnapshot429s: 0,
+  snapshotRequests: 0,
 
-  depthBridgeAttempts: 0,
+  snapshot429s: 0,
 
-  depthBridgeFound: 0,
+  bridgeAttempts: 0,
 
-  depthResyncs: 0,
+  bridgeFound: 0,
 
-  depthSequenceGaps: 0,
+  resyncs: 0,
 
-  lastDepthEventAt: null,
+  sequenceGaps: 0,
 
-  lastSnapshotAt: null,
+  /* ----------------------------------------------------------
+     CANDLES
+     ---------------------------------------------------------- */
+
+  candles: {
+    "15m": [],
+    "1h": [],
+    "4h": [],
+    "1d": []
+  },
+
+  /* ----------------------------------------------------------
+     STRUCTURE
+     ---------------------------------------------------------- */
+
+  structure: {
+
+    swingHighs: [],
+    swingLows: [],
+
+    levels: [],
+    majorLevels: [],
+    nearLevels: [],
+
+    lastGoodRebuildAt: null,
+    lastAttemptAt: null,
+
+    rebuildCount: 0,
+    rejectedRebuilds: 0,
+
+    status: "INITIALIZING",
+
+    lastRebuildAccepted: false,
+
+    lastRebuildReason: null,
+
+    lastCandidateLevels: 0,
+
+    lastCandidateMajor: 0,
+
+    retainedPrevious: false,
+
+    lastGoodLevels: [],
+    lastGoodMajorLevels: [],
+
+    lastGoodAt: null
+  },
+
+  /* ----------------------------------------------------------
+     PERSISTENCE
+     ---------------------------------------------------------- */
+
+  persistence: {
+    bids: [],
+    asks: [],
+    removed: []
+  },
+
+  /* ----------------------------------------------------------
+     EVENTS
+     ---------------------------------------------------------- */
+
+  liquidityEvents: [],
+
+  recentSweeps: [],
+
+  /* ----------------------------------------------------------
+     ERRORS
+     ---------------------------------------------------------- */
 
   lastError: null,
 
-  lastBookUpdateAt: null
-
+  updatedAt: null
 };
 
 
 /* ============================================================
-   CANDLE STATE
-============================================================ */
-
-const candles = {
-
-  "15m": [],
-
-  "1h": [],
-
-  "4h": [],
-
-  "1d": []
-
-};
-
-
-/* ============================================================
-   STRUCTURE STATE
-============================================================ */
-
-const structure = {
-
-  swingHighs: [],
-
-  swingLows: [],
-
-  equalHighs: [],
-
-  equalLows: [],
-
-  levels: [],
-
-  majorLevels: [],
-
-  nearLevels: [],
-
-  lastGoodLevels: [],
-
-  lastGoodMajorLevels: [],
-
-  lastAttemptAt: null,
-
-  lastGoodAt: null,
-
-  lastRebuildAt: null,
-
-  lastRebuildAccepted: false,
-
-  lastRebuildReason: null,
-
-  lastCandidateLevels: 0,
-
-  lastCandidateMajor: 0,
-
-  rebuildCount: 0,
-
-  rejectedRebuilds: 0,
-
-  retainedPrevious: false,
-
-  status: "INITIALIZING"
-
-};
-
-
-/* ============================================================
-   PERSISTENCE
-============================================================ */
-
-const persistence = {
-
-  bids: new Map(),
-
-  asks: new Map(),
-
-  lastPollAt: null
-
-};
-
-
-/* ============================================================
-   EVENTS
-============================================================ */
-
-const liquidityEvents = [];
-
-const sweepEvents = [];
-
-
-/* ============================================================
-   KLINE CONNECTION
-============================================================ */
-
-let klineSocket = null;
-
-
-/* ============================================================
-   DEPTH CONNECTION
-============================================================ */
-
-let depthSocket = null;
-
-let depthReconnectTimer = null;
-
-
-/* ============================================================
-   UTILITY
-============================================================ */
+   BASIC HELPERS
+   ============================================================ */
 
 function now() {
   return Date.now();
@@ -441,217 +403,253 @@ function round(value, decimals = 2) {
 }
 
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function clamp(value, min, max) {
+
+  return Math.max(min, Math.min(max, value));
 }
 
 
-function safeJson(value) {
+function absPct(a, b) {
 
-  try {
-    return JSON.parse(JSON.stringify(value));
-  } catch {
-    return value;
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) {
+    return Infinity;
   }
 
+  return Math.abs(a - b) / Math.abs(b);
 }
 
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
+function distancePct(price, currentPrice) {
+
+  if (!Number.isFinite(price) || !Number.isFinite(currentPrice) || currentPrice === 0) {
+    return 0;
+  }
+
+  return ((price - currentPrice) / currentPrice) * 100;
+}
+
+
+function weightedMid(items) {
+
+  if (!items || !items.length) {
+    return null;
+  }
+
+  let usd = 0;
+  let value = 0;
+
+  for (const item of items) {
+
+    const amount = Number(item.usd) || 0;
+    const price = Number(item.price) || 0;
+
+    usd += amount;
+    value += price * amount;
+  }
+
+  if (!usd) {
+    return null;
+  }
+
+  return value / usd;
 }
 
 
 function median(values) {
 
-  if (!values.length) {
+  const arr = values
+    .filter(Number.isFinite)
+    .slice()
+    .sort((a, b) => a - b);
+
+  if (!arr.length) {
     return 0;
   }
 
-  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(arr.length / 2);
 
-  const middle = Math.floor(sorted.length / 2);
-
-  if (sorted.length % 2) {
-    return sorted[middle];
+  if (arr.length % 2) {
+    return arr[middle];
   }
 
-  return (sorted[middle - 1] + sorted[middle]) / 2;
-}
-
-
-function percentile(values, p) {
-
-  if (!values.length) {
-    return 0;
-  }
-
-  const sorted = [...values].sort((a, b) => a - b);
-
-  const index = (sorted.length - 1) * p;
-
-  const lower = Math.floor(index);
-
-  const upper = Math.ceil(index);
-
-  if (lower === upper) {
-    return sorted[lower];
-  }
-
-  const weight = index - lower;
-
-  return (
-    sorted[lower] * (1 - weight) +
-    sorted[upper] * weight
-  );
-}
-
-
-function normalizeSide(side) {
-
-  if (side === "bid" || side === "bids" || side === "SSL") {
-    return "bid";
-  }
-
-  return "ask";
-}
-
-
-function structuralSideToBookSide(side) {
-
-  return side === "BSL" ? "ask" : "bid";
-}
-
-
-function bookSideToStructuralSide(side) {
-
-  return side === "ask" ? "BSL" : "SSL";
+  return (arr[middle - 1] + arr[middle]) / 2;
 }
 
 
 /* ============================================================
-   HTTP FETCH
-============================================================ */
+   PRICE
+   ============================================================ */
+
+function updateCurrentPrice() {
+
+  const bids = [...state.bids.keys()]
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((a, b) => b - a);
+
+  const asks = [...state.asks.keys()]
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+
+  if (bids.length && asks.length) {
+
+    state.currentPrice = (bids[0] + asks[0]) / 2;
+
+    state.priceSource = "futures_orderbook_mid";
+
+    return state.currentPrice;
+  }
+
+  if (state.currentPrice) {
+    return state.currentPrice;
+  }
+
+  return null;
+}
+
+
+/* ============================================================
+   HTTP FETCH WITH TIMEOUT
+   ============================================================ */
 
 async function fetchJson(url) {
 
-  const response = await fetch(url);
+  const controller = new AbortController();
 
-  if (!response.ok) {
+  const timer = setTimeout(
+    () => controller.abort(),
+    SETTINGS.requestTimeoutMs
+  );
 
-    const text = await response.text();
+  try {
 
-    throw new Error(
-      `HTTP ${response.status}: ${text.slice(0, 300)}`
-    );
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "BTCUSDT-Liquidity-Relay/10.0"
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+
+      const text = await response.text();
+
+      throw new Error(
+        `HTTP ${response.status}: ${text.slice(0, 300)}`
+      );
+    }
+
+    return await response.json();
+
+  } finally {
+
+    clearTimeout(timer);
   }
-
-  return response.json();
 }
 
 
 /* ============================================================
-   SPOT HISTORICAL CANDLES
-============================================================ */
+   HISTORICAL SPOT CANDLES
+   ============================================================ */
 
-async function fetchSpotKlines(interval, limit) {
+async function loadHistoricalCandles(tf) {
+
+  const config = STRUCTURE[tf];
+
+  if (!config) {
+    return;
+  }
 
   const url =
     `${SPOT_API}/api/v3/klines` +
     `?symbol=${SYMBOL}` +
-    `&interval=${interval}` +
-    `&limit=${limit}`;
+    `&interval=${config.interval}` +
+    `&limit=${config.candles}`;
 
-  const data = await fetchJson(url);
+  try {
 
-  return data.map(k => ({
+    const data = await fetchJson(url);
 
-    openTime: Number(k[0]),
+    const candles = data
+      .map(row => ({
 
-    open: Number(k[1]),
+        time: Number(row[0]),
 
-    high: Number(k[2]),
+        open: Number(row[1]),
 
-    low: Number(k[3]),
+        high: Number(row[2]),
 
-    close: Number(k[4]),
+        low: Number(row[3]),
 
-    volume: Number(k[5]),
+        close: Number(row[4]),
 
-    closeTime: Number(k[6])
+        volume: Number(row[5]),
 
-  }));
+        closeTime: Number(row[6])
+
+      }))
+      .filter(c =>
+        Number.isFinite(c.high) &&
+        Number.isFinite(c.low) &&
+        Number.isFinite(c.close)
+      );
+
+    state.candles[tf] = candles;
+
+    console.log(
+      `Historical ${tf}: ${candles.length} candles`
+    );
+
+  } catch (error) {
+
+    state.lastError = `Historical ${tf}: ${error.message}`;
+
+    console.error(
+      `Historical ${tf} failed:`,
+      error.message
+    );
+  }
 }
 
 
-/* ============================================================
-   LOAD HISTORY
-============================================================ */
+async function loadAllHistoricalCandles() {
 
-async function loadHistory() {
+  await Promise.all(
+    Object.keys(STRUCTURE).map(loadHistoricalCandles)
+  );
 
-  for (const [tf, cfg] of Object.entries(STRUCTURE)) {
-
-    try {
-
-      const data = await fetchSpotKlines(
-        cfg.interval,
-        cfg.candles
-      );
-
-      candles[tf] = data;
-
-    } catch (error) {
-
-      state.lastError =
-        `History ${tf}: ${error.message}`;
-
-      console.error(
-        `[HISTORY ${tf}]`,
-        error.message
-      );
-
-    }
-
-  }
-
-  rebuildStructure("history");
-
+  rebuildStructure();
 }
 
 
 /* ============================================================
    PIVOT DETECTION
-============================================================ */
+   ============================================================ */
 
-function detectPivots(data, left, right) {
+function detectPivots(candles, left, right) {
 
   const highs = [];
-
   const lows = [];
 
-  if (!data || data.length < left + right + 1) {
-
+  if (!candles || candles.length < left + right + 5) {
     return {
       highs,
       lows
     };
-
   }
-
 
   for (
     let i = left;
-    i < data.length - right;
+    i < candles.length - right;
     i++
   ) {
 
-    const candle = data[i];
+    const candle = candles[i];
 
     let isHigh = true;
-
     let isLow = true;
-
 
     for (
       let j = i - left;
@@ -663,443 +661,352 @@ function detectPivots(data, left, right) {
         continue;
       }
 
-      if (data[j].high >= candle.high) {
+      if (candles[j].high >= candle.high) {
         isHigh = false;
       }
 
-      if (data[j].low <= candle.low) {
+      if (candles[j].low <= candle.low) {
         isLow = false;
       }
 
+      if (!isHigh && !isLow) {
+        break;
+      }
     }
-
 
     if (isHigh) {
 
       highs.push({
-
         price: candle.high,
-
-        time: candle.openTime,
-
+        time: candle.time,
         index: i
-
       });
-
     }
-
 
     if (isLow) {
 
       lows.push({
-
         price: candle.low,
-
-        time: candle.openTime,
-
+        time: candle.time,
         index: i
-
       });
-
     }
-
   }
-
 
   return {
     highs,
     lows
   };
-
 }
 
 
 /* ============================================================
-   EQUAL CLUSTERING
-============================================================ */
+   CLUSTER STRUCTURAL PIVOTS
+   ============================================================ */
 
 function clusterPivots(pivots, tolerancePct) {
 
-  if (!pivots.length) {
-    return [];
-  }
-
-  const sorted = [...pivots]
-    .sort((a, b) => a.price - b.price);
-
   const clusters = [];
 
+  const sorted = pivots
+    .slice()
+    .sort((a, b) => a.price - b.price);
 
   for (const pivot of sorted) {
 
-    let target = null;
+    let best = null;
+    let bestDistance = Infinity;
 
     for (const cluster of clusters) {
 
-      const midpoint =
-        (
-          cluster.min +
-          cluster.max
-        ) / 2;
-
-      const tolerance =
-        midpoint * tolerancePct;
+      const distance = absPct(
+        pivot.price,
+        cluster.price
+      );
 
       if (
-        Math.abs(
-          pivot.price - midpoint
-        ) <= tolerance
+        distance <= tolerancePct &&
+        distance < bestDistance
       ) {
 
-        target = cluster;
-
-        break;
-
+        best = cluster;
+        bestDistance = distance;
       }
-
     }
 
+    if (!best) {
 
-    if (!target) {
+      clusters.push({
 
-      target = {
+        price: pivot.price,
 
-        min: pivot.price,
+        priceLow: pivot.price,
 
-        max: pivot.price,
+        priceHigh: pivot.price,
 
-        prices: [],
+        members: [pivot],
 
-        pivots: []
+        times: [pivot.time]
+      });
 
-      };
+    } else {
 
-      clusters.push(target);
+      best.members.push(pivot);
 
-    }
+      best.times.push(pivot.time);
 
-
-    target.min =
-      Math.min(
-        target.min,
+      best.priceLow = Math.min(
+        best.priceLow,
         pivot.price
       );
 
-    target.max =
-      Math.max(
-        target.max,
+      best.priceHigh = Math.max(
+        best.priceHigh,
         pivot.price
       );
 
-    target.prices.push(pivot.price);
-
-    target.pivots.push(pivot);
-
+      best.price =
+        best.members.reduce(
+          (sum, item) => sum + item.price,
+          0
+        ) / best.members.length;
+    }
   }
 
-
-  return clusters.map(cluster => ({
-
-    price:
-      cluster.prices.reduce(
-        (a, b) => a + b,
-        0
-      ) / cluster.prices.length,
-
-    priceLow: cluster.min,
-
-    priceHigh: cluster.max,
-
-    equalCount: cluster.prices.length,
-
-    pivots: cluster.pivots
-
-  }));
-
+  return clusters;
 }
 
 
 /* ============================================================
    REACTION COUNT
-============================================================ */
+   ============================================================ */
 
-function reactionCount(data, pivotIndex, side) {
-
-  if (!data || !data.length) {
-    return 0;
-  }
-
-  const pivot = data[pivotIndex];
-
-  if (!pivot) {
-    return 0;
-  }
-
-  const reactionWindow = 8;
-
-  const start =
-    Math.min(
-      data.length - 1,
-      pivotIndex + 1
-    );
-
-  const end =
-    Math.min(
-      data.length - 1,
-      pivotIndex + reactionWindow
-    );
+function countReactions(candles, cluster, side) {
 
   let reactions = 0;
 
-
-  if (side === "high") {
-
-    for (let i = start; i <= end; i++) {
-
-      if (
-        data[i].close <
-        pivot.high *
-        (1 - SETTINGS.reactionPct)
-      ) {
-
-        reactions++;
-
-      }
-
-    }
-
-  } else {
-
-    for (let i = start; i <= end; i++) {
-
-      if (
-        data[i].close >
-        pivot.low *
-        (1 + SETTINGS.reactionPct)
-      ) {
-
-        reactions++;
-
-      }
-
-    }
-
+  if (!candles || !candles.length) {
+    return reactions;
   }
 
+  const zoneLow =
+    cluster.priceLow *
+    (1 - SETTINGS.reactionPct);
 
-  return reactions;
+  const zoneHigh =
+    cluster.priceHigh *
+    (1 + SETTINGS.reactionPct);
 
-}
+  for (let i = 0; i < candles.length; i++) {
 
+    const candle = candles[i];
 
-/* ============================================================
-   BUILD STRUCTURAL LEVELS
-============================================================ */
+    let touched = false;
 
-function buildStructureLevels() {
+    if (side === "BSL") {
 
-  const highs = [];
+      touched =
+        candle.high >= zoneLow &&
+        candle.high <= zoneHigh;
 
-  const lows = [];
+    } else {
 
-  const equalHighs = [];
+      touched =
+        candle.low >= zoneLow &&
+        candle.low <= zoneHigh;
+    }
 
-  const equalLows = [];
-
-
-  for (const [tf, cfg] of Object.entries(STRUCTURE)) {
-
-    const data = candles[tf];
-
-    if (!data || data.length < 20) {
+    if (!touched) {
       continue;
     }
 
-
-    const pivots =
-      detectPivots(
-        data,
-        cfg.left,
-        cfg.right
+    const end =
+      Math.min(
+        candles.length - 1,
+        i + 8
       );
 
+    for (let j = i + 1; j <= end; j++) {
 
-    const highClusters =
-      clusterPivots(
-        pivots.highs,
-        cfg.eq
-      );
+      const future = candles[j];
 
+      if (side === "BSL") {
 
-    const lowClusters =
-      clusterPivots(
-        pivots.lows,
-        cfg.eq
-      );
+        if (
+          future.low <=
+          cluster.price *
+          (1 - SETTINGS.reactionPct)
+        ) {
 
+          reactions++;
+          break;
+        }
 
-    for (const cluster of highClusters) {
+      } else {
 
-      let reactions = 0;
+        if (
+          future.high >=
+          cluster.price *
+          (1 + SETTINGS.reactionPct)
+        ) {
 
-      for (const pivot of cluster.pivots) {
-
-        reactions +=
-          reactionCount(
-            data,
-            pivot.index,
-            "high"
-          );
-
+          reactions++;
+          break;
+        }
       }
-
-
-      highs.push({
-
-        side: "BSL",
-
-        price: cluster.price,
-
-        priceLow: cluster.priceLow,
-
-        priceHigh: cluster.priceHigh,
-
-        equalCount: cluster.equalCount,
-
-        reactions,
-
-        timeframe: tf,
-
-        timeframeWeight: cfg.weight
-
-      });
-
-
-      equalHighs.push({
-
-        ...cluster,
-
-        timeframe: tf
-
-      });
-
     }
-
-
-    for (const cluster of lowClusters) {
-
-      let reactions = 0;
-
-      for (const pivot of cluster.pivots) {
-
-        reactions +=
-          reactionCount(
-            data,
-            pivot.index,
-            "low"
-          );
-
-      }
-
-
-      lows.push({
-
-        side: "SSL",
-
-        price: cluster.price,
-
-        priceLow: cluster.priceLow,
-
-        priceHigh: cluster.priceHigh,
-
-        equalCount: cluster.equalCount,
-
-        reactions,
-
-        timeframe: tf,
-
-        timeframeWeight: cfg.weight
-
-      });
-
-
-      equalLows.push({
-
-        ...cluster,
-
-        timeframe: tf
-
-      });
-
-    }
-
   }
 
-
-  return {
-
-    highs,
-
-    lows,
-
-    equalHighs,
-
-    equalLows
-
-  };
-
+  return reactions;
 }
 
 
 /* ============================================================
-   MERGE ACROSS TIMEFRAMES
-============================================================ */
+   BUILD TIMEFRAME STRUCTURE
+   ============================================================ */
 
-function mergeAcrossTimeframes(levels) {
+function buildTFStructure(tf) {
 
-  const sorted =
-    [...levels]
-      .sort(
-        (a, b) =>
-          a.price -
-          b.price
-      );
+  const config = STRUCTURE[tf];
 
+  const candles = state.candles[tf];
+
+  if (!config || !candles || candles.length < 20) {
+
+    return {
+      highs: [],
+      lows: []
+    };
+  }
+
+  const pivots = detectPivots(
+    candles,
+    config.left,
+    config.right
+  );
+
+  const highClusters =
+    clusterPivots(
+      pivots.highs,
+      config.eq
+    );
+
+  const lowClusters =
+    clusterPivots(
+      pivots.lows,
+      config.eq
+    );
+
+  const highs = highClusters.map(cluster => ({
+
+    side: "BSL",
+
+    price: cluster.price,
+
+    priceLow: cluster.priceLow,
+
+    priceHigh: cluster.priceHigh,
+
+    equalCount: cluster.members.length,
+
+    reactions:
+      countReactions(
+        candles,
+        cluster,
+        "BSL"
+      ),
+
+    timeframe: tf,
+
+    timeframeWeight: config.weight,
+
+    lastTime:
+      Math.max(...cluster.times)
+  }));
+
+  const lows = lowClusters.map(cluster => ({
+
+    side: "SSL",
+
+    price: cluster.price,
+
+    priceLow: cluster.priceLow,
+
+    priceHigh: cluster.priceHigh,
+
+    equalCount: cluster.members.length,
+
+    reactions:
+      countReactions(
+        candles,
+        cluster,
+        "SSL"
+      ),
+
+    timeframe: tf,
+
+    timeframeWeight: config.weight,
+
+    lastTime:
+      Math.max(...cluster.times)
+  }));
+
+  return {
+    highs,
+    lows
+  };
+}
+
+
+/* ============================================================
+   MERGE STRUCTURE ACROSS TIMEFRAMES
+   ============================================================ */
+
+function mergeStructureLevels(levels) {
 
   const merged = [];
 
+  const sorted = levels
+    .slice()
+    .sort((a, b) => a.price - b.price);
 
   for (const level of sorted) {
 
-    let target = null;
-
+    let best = null;
+    let bestDistance = Infinity;
 
     for (const existing of merged) {
 
+      if (existing.side !== level.side) {
+        continue;
+      }
+
       const distance =
-        Math.abs(
-          level.price -
+        absPct(
+          level.price,
           existing.price
         );
 
+      const tolerance =
+        Math.max(
+          SETTINGS.zonePct,
+          SETTINGS.mergeUsd /
+          Math.max(level.price, 1)
+        );
 
       if (
-        distance <=
-        SETTINGS.mergeUsd
+        distance <= tolerance &&
+        distance < bestDistance
       ) {
 
-        target = existing;
-
-        break;
-
+        best = existing;
+        bestDistance = distance;
       }
-
     }
 
+    if (!best) {
 
-    if (!target) {
-
-      target = {
+      merged.push({
 
         side: level.side,
 
@@ -1124,747 +1031,756 @@ function mergeAcrossTimeframes(levels) {
 
         score: 0,
 
-        strength: "LOW",
-
         restingUsd: 0,
 
         restingConfirmed: false,
 
         restingLevels: []
-
-      };
-
-      merged.push(target);
-
-      continue;
-
-    }
-
-
-    target.price =
-      (
-        target.price +
-        level.price
-      ) / 2;
-
-
-    target.priceLow =
-      Math.min(
-        target.priceLow,
-        level.priceLow
-      );
-
-
-    target.priceHigh =
-      Math.max(
-        target.priceHigh,
-        level.priceHigh
-      );
-
-
-    target.equalCount +=
-      level.equalCount;
-
-
-    target.reactions +=
-      level.reactions;
-
-
-    if (
-      !target.timeframes.includes(
-        level.timeframe
-      )
-    ) {
-
-      target.timeframes.push(
-        level.timeframe
-      );
-
-    }
-
-
-    target.timeframeWeight +=
-      level.timeframeWeight;
-
-  }
-
-
-  for (const level of merged) {
-
-    level.scoreBase =
-      level.timeframeWeight * 10 +
-      Math.min(
-        level.equalCount,
-        30
-      ) * 5 +
-      Math.min(
-        level.reactions,
-        40
-      ) * 2;
-
-    level.score =
-      level.scoreBase;
-
-
-    if (
-      level.score >= 125 ||
-      (
-        level.timeframes.length >= 3 &&
-        level.equalCount >= 4
-      )
-    ) {
-
-      level.strength = "HIGH";
-
-    } else if (
-      level.score >= 90 ||
-      level.timeframes.length >= 2 ||
-      level.equalCount >= 3
-    ) {
-
-      level.strength = "MEDIUM";
+      });
 
     } else {
 
-      level.strength = "LOW";
+      best.price =
+        (
+          best.price +
+          level.price
+        ) / 2;
 
+      best.priceLow =
+        Math.min(
+          best.priceLow,
+          level.priceLow
+        );
+
+      best.priceHigh =
+        Math.max(
+          best.priceHigh,
+          level.priceHigh
+        );
+
+      best.equalCount +=
+        level.equalCount;
+
+      best.reactions +=
+        level.reactions;
+
+      if (
+        !best.timeframes.includes(
+          level.timeframe
+        )
+      ) {
+
+        best.timeframes.push(
+          level.timeframe
+        );
+      }
+
+      best.timeframeWeight +=
+        level.timeframeWeight;
     }
-
   }
 
-
   return merged;
-
 }
 
 
 /* ============================================================
-   TIMEFRAME WEIGHT
-============================================================ */
+   STRUCTURAL SCORE
+   ============================================================ */
 
-function timeframeWeight(level) {
+function scoreStructureLevel(level) {
+
+  const timeframeScore =
+    level.timeframeWeight * 10;
+
+  const equalScore =
+    Math.min(
+      level.equalCount,
+      30
+    ) * 5;
+
+  const reactionScore =
+    Math.min(
+      level.reactions,
+      40
+    ) * 2;
+
+  const score =
+    timeframeScore +
+    equalScore +
+    reactionScore;
+
+  level.scoreBase = score;
+
+  level.score = score;
 
   if (
-    Number.isFinite(
-      level.timeframeWeight
+    score >= 125 ||
+    (
+      level.timeframes.length >= 3 &&
+      level.equalCount >= 4
     )
   ) {
 
-    return level.timeframeWeight;
+    level.strength = "HIGH";
 
+  } else if (
+    score >= 90 ||
+    level.timeframes.length >= 2 ||
+    level.equalCount >= 3
+  ) {
+
+    level.strength = "MEDIUM";
+
+  } else {
+
+    level.strength = "LOW";
   }
 
-
-  return (
-    level.timeframes || []
-  ).reduce(
-    (sum, tf) =>
-      sum +
-      (
-        STRUCTURE[tf]?.weight ||
-        0
-      ),
-    0
-  );
-
+  return level;
 }
 
 
 /* ============================================================
-   MAJOR LEVEL TEST
-============================================================ */
+   PRICE DIRECTION FILTER
+   ============================================================ */
+
+function isDirectionalLevel(level, currentPrice) {
+
+  if (!Number.isFinite(currentPrice)) {
+    return false;
+  }
+
+  /*
+     BSL MUST BE ABOVE PRICE.
+  */
+
+  if (
+    level.side === "BSL" &&
+    level.price <= currentPrice
+  ) {
+
+    return false;
+  }
+
+  /*
+     SSL MUST BE BELOW PRICE.
+  */
+
+  if (
+    level.side === "SSL" &&
+    level.price >= currentPrice
+  ) {
+
+    return false;
+  }
+
+  return true;
+}
+
+
+/* ============================================================
+   MAJOR LEVEL FILTER
+   ============================================================ */
 
 function isMajorLevel(level) {
 
+  const currentPrice =
+    state.currentPrice;
+
+  if (!Number.isFinite(currentPrice)) {
+    return false;
+  }
+
   if (
-    !state.currentPrice ||
-    !Number.isFinite(
-      state.currentPrice
+    !isDirectionalLevel(
+      level,
+      currentPrice
     )
   ) {
 
     return false;
-
   }
 
-
-  const distancePct =
+  const distance =
     Math.abs(
-      level.price -
-      state.currentPrice
-    ) /
-    state.currentPrice *
-    100;
-
+      level.price - currentPrice
+    ) / currentPrice;
 
   if (
-    distancePct <
-    SETTINGS.majorMinDistancePct
+    distance <
+    SETTINGS.majorMinDistancePct / 100
   ) {
 
     return false;
-
   }
 
-
-  const weight =
-    timeframeWeight(level);
-
-
   if (
-    weight <
+    level.timeframeWeight <
     SETTINGS.majorMinimumTimeframeWeight
   ) {
 
     return false;
-
   }
 
-
-  const tfs =
-    level.timeframes || [];
-
-
-  const only15m =
-    tfs.length === 1 &&
-    tfs[0] === "15m";
-
-
-  if (only15m) {
-    return false;
-  }
-
-
-  const hasHigherTF =
-    tfs.includes("4h") ||
-    tfs.includes("1d");
-
-
-  const has1h =
-    tfs.includes("1h");
-
+  /*
+     A lone 1H level needs stronger evidence.
+  */
 
   if (
-    has1h &&
-    !hasHigherTF &&
-    level.score <
-    SETTINGS.major1hMinScore
+    level.timeframes.length === 1 &&
+    level.timeframes.includes("1h") &&
+    level.score < SETTINGS.major1hMinScore
   ) {
 
     return false;
-
   }
 
+  /*
+     Higher timeframe single levels can qualify
+     with a lower score.
+  */
 
   if (
-    hasHigherTF &&
+    level.timeframes.length === 1 &&
+    (
+      level.timeframes.includes("4h") ||
+      level.timeframes.includes("1d")
+    ) &&
     level.score <
     SETTINGS.majorHigherTfMinScore
   ) {
 
     return false;
-
   }
-
 
   return true;
-
 }
 
 
 /* ============================================================
-   CLONE LEVELS
-============================================================ */
-
-function cloneLevels(levels) {
-
-  return safeJson(
-    levels || []
-  );
-
-}
-
-
-/* ============================================================
-   APPLY RESTING LIQUIDITY
-============================================================ */
-
-function applyRestingToLevels(levels) {
-
-  if (!levels.length) {
-    return levels;
-  }
-
-
-  for (const level of levels) {
-
-    level.restingUsd = 0;
-
-    level.restingConfirmed = false;
-
-    level.restingLevels = [];
-
-
-    const bookSide =
-      structuralSideToBookSide(
-        level.side
-      );
-
-
-    const rows =
-      bookRows(
-        bookSide
-      );
-
-
-    for (const row of rows) {
-
-      const distance =
-        Math.min(
-          Math.abs(
-            row.price -
-            level.priceLow
-          ),
-          Math.abs(
-            row.price -
-            level.priceHigh
-          ),
-          Math.abs(
-            row.price -
-            level.price
-          )
-        );
-
-
-      if (
-        distance <=
-        SETTINGS.restingRadiusUsd
-      ) {
-
-        level.restingUsd +=
-          row.usd;
-
-        level.restingLevels.push(
-          row
-        );
-
-      }
-
-    }
-
-
-    if (
-      level.restingUsd >=
-      SETTINGS.restingConfirmUsd
-    ) {
-
-      level.restingConfirmed = true;
-
-      level.score =
-        level.scoreBase +
-        Math.min(
-          25,
-          Math.round(
-            level.restingUsd /
-            500000
-          ) * 5
-        );
-
-    } else {
-
-      level.score =
-        level.scoreBase;
-
-    }
-
-  }
-
-
-  return levels;
-
-}
-
-
-/* ============================================================
-   MAJOR / NEAR
-============================================================ */
+   NEAR LEVEL
+   ============================================================ */
 
 function isNearLevel(level) {
 
+  const currentPrice =
+    state.currentPrice;
+
+  if (!Number.isFinite(currentPrice)) {
+    return false;
+  }
+
   if (
-    !state.currentPrice ||
-    !Number.isFinite(
-      state.currentPrice
+    !isDirectionalLevel(
+      level,
+      currentPrice
     )
   ) {
 
     return false;
-
   }
 
-
-  const distancePct =
+  const distance =
     Math.abs(
-      level.price -
-      state.currentPrice
-    ) /
-    state.currentPrice *
-    100;
+      level.price - currentPrice
+    ) / currentPrice;
 
-
-  return (
-    distancePct <
-    SETTINGS.majorMinDistancePct
-  );
-
+  return distance < 0.005;
 }
 
 
 /* ============================================================
-   STRUCTURAL REBUILD
-============================================================ */
+   RESTING LIQUIDITY NEAR STRUCTURAL LEVEL
+   ============================================================ */
 
-function rebuildStructure(reason = "manual") {
+function getRestingLiquidity(level) {
+
+  const map =
+    level.side === "BSL"
+      ? state.asks
+      : state.bids;
+
+  const rows = [];
+
+  let usd = 0;
+
+  for (
+    const [
+      priceString,
+      quantity
+    ] of map.entries()
+  ) {
+
+    const price =
+      Number(priceString);
+
+    const qty =
+      Number(quantity);
+
+    if (
+      !Number.isFinite(price) ||
+      !Number.isFinite(qty)
+    ) {
+      continue;
+    }
+
+    const value =
+      price * qty;
+
+    if (
+      value <
+      SETTINGS.rawMinUsd
+    ) {
+      continue;
+    }
+
+    if (
+      Math.abs(
+        price - level.price
+      ) <=
+      SETTINGS.restingRadiusUsd
+    ) {
+
+      usd += value;
+
+      rows.push({
+
+        price,
+
+        quantity: qty,
+
+        usd: value
+      });
+    }
+  }
+
+  rows.sort(
+    (a, b) => b.usd - a.usd
+  );
+
+  level.restingUsd = usd;
+
+  level.restingConfirmed =
+    usd >= SETTINGS.restingConfirmUsd;
+
+  level.restingLevels =
+    rows.slice(0, 100);
+
+  /*
+     Resting liquidity adds evidence,
+     but does not create structural liquidity.
+  */
+
+  level.score =
+    level.scoreBase +
+    clamp(
+      usd / 100000,
+      0,
+      25
+    );
+
+  if (level.score >= 125) {
+    level.strength = "HIGH";
+  } else if (level.score >= 90) {
+    level.strength = "MEDIUM";
+  } else {
+    level.strength = "LOW";
+  }
+
+  return level;
+}
+
+
+/* ============================================================
+   REBUILD STRUCTURE
+   ============================================================ */
+
+function rebuildStructure() {
+
+  const structure =
+    state.structure;
 
   structure.lastAttemptAt =
     new Date().toISOString();
 
-  structure.lastRebuildAt =
-    structure.lastAttemptAt;
-
   structure.rebuildCount++;
 
+  const allHighs = [];
+  const allLows = [];
 
-  const raw =
-    buildStructureLevels();
+  for (
+    const tf of Object.keys(STRUCTURE)
+  ) {
 
+    const tfStructure =
+      buildTFStructure(tf);
 
-  let levels =
-    mergeAcrossTimeframes(
-      [
-        ...raw.highs,
-        ...raw.lows
-      ]
+    allHighs.push(
+      ...tfStructure.highs
     );
 
+    allLows.push(
+      ...tfStructure.lows
+    );
+  }
 
-  structure.swingHighs =
-    raw.highs;
-
-  structure.swingLows =
-    raw.lows;
-
-  structure.equalHighs =
-    raw.equalHighs;
-
-  structure.equalLows =
-    raw.equalLows;
-
-
-  structure.lastCandidateLevels =
-    levels.length;
-
-
-  /* ----------------------------------------------------------
-     Apply current order-book confirmation
-  ---------------------------------------------------------- */
-
-  levels =
-    applyRestingToLevels(
-      levels
+  const mergedHighs =
+    mergeStructureLevels(
+      allHighs
     );
 
+  const mergedLows =
+    mergeStructureLevels(
+      allLows
+    );
 
-  const candidateMajor =
-    levels.filter(
+  const candidateLevels =
+    [
+      ...mergedHighs,
+      ...mergedLows
+    ]
+    .map(scoreStructureLevel);
+
+  /*
+     VERY IMPORTANT:
+     directional filtering happens AFTER
+     current price is known.
+  */
+
+  const directional =
+    candidateLevels.filter(level =>
+      isDirectionalLevel(
+        level,
+        state.currentPrice
+      )
+    );
+
+  const major =
+    directional.filter(
       isMajorLevel
     );
 
+  const near =
+    directional.filter(
+      isNearLevel
+    );
+
+  structure.lastCandidateLevels =
+    directional.length;
 
   structure.lastCandidateMajor =
-    candidateMajor.length;
+    major.length;
 
+  structure.lastRebuildAt =
+    new Date().toISOString();
 
-  /* ----------------------------------------------------------
-     Decide whether this rebuild is acceptable.
-  ---------------------------------------------------------- */
-
-  const previousAge =
-    structure.lastGoodAt
-      ? now() -
-        new Date(
-          structure.lastGoodAt
-        ).getTime()
-      : Infinity;
-
-
-  let accepted = true;
-
-  let acceptedLevels = levels;
-
-  let acceptedMajor =
-    candidateMajor;
-
-
-  let rebuildReason =
-    "valid_structure";
-
+  /*
+     Reject only genuinely broken candidates.
+  */
 
   if (
-    state.currentPrice &&
-    candidateMajor.length === 0 &&
-    structure.lastGoodLevels.length &&
-    previousAge <
-      SETTINGS.structureCacheMaxAgeMs
+    !directional.length
   ) {
 
-    const stillRelevant =
-      structure.lastGoodLevels.filter(
-        isMajorLevel
-      );
-
-
-    if (stillRelevant.length) {
-
-      accepted = false;
-
-      structure.rejectedRebuilds++;
-
-      structure.retainedPrevious = true;
-
-      rebuildReason =
-        "retained_previous_major_structure";
-
-
-      acceptedLevels =
-        cloneLevels(
-          structure.lastGoodLevels
-        );
-
-
-      acceptedLevels =
-        applyRestingToLevels(
-          acceptedLevels
-        );
-
-
-      acceptedMajor =
-        acceptedLevels.filter(
-          isMajorLevel
-        );
-
-    }
-
-  }
-
-
-  if (accepted) {
-
-    structure.retainedPrevious = false;
-
-    structure.lastGoodAt =
-      new Date().toISOString();
-
-    structure.lastGoodLevels =
-      cloneLevels(
-        acceptedLevels
-      );
-
-    structure.lastGoodMajorLevels =
-      cloneLevels(
-        acceptedMajor
-      );
-
-    structure.lastRebuildAccepted =
-      true;
-
-    structure.status =
-      acceptedMajor.length
-        ? "HEALTHY"
-        : "VALID_NO_MAJOR_STRUCTURE";
-
-  } else {
+    structure.rejectedRebuilds++;
 
     structure.lastRebuildAccepted =
       false;
 
-    structure.status =
-      "STALE_FALLBACK";
+    structure.lastRebuildReason =
+      "rejected_empty_directional_structure";
 
+    const oldAge =
+      structure.lastGoodAt
+        ? now() -
+          new Date(
+            structure.lastGoodAt
+          ).getTime()
+        : Infinity;
+
+    if (
+      structure.lastGoodLevels.length &&
+      oldAge <
+      SETTINGS.structureCacheMaxAgeMs
+    ) {
+
+      structure.levels =
+        structure.lastGoodLevels.map(
+          x => ({ ...x })
+        );
+
+      structure.majorLevels =
+        structure.lastGoodMajorLevels.map(
+          x => ({ ...x })
+        );
+
+      structure.nearLevels =
+        structure.levels.filter(
+          isNearLevel
+        );
+
+      structure.retainedPrevious = true;
+
+      structure.status =
+        "STALE_FALLBACK";
+
+      structure.lastRebuildReason =
+        "retained_previous_major_structure";
+
+      return;
+    }
+
+    structure.levels = [];
+    structure.majorLevels = [];
+    structure.nearLevels = [];
+
+    structure.retainedPrevious = false;
+
+    structure.status =
+      "NO_STRUCTURE";
+
+    return;
   }
 
-
-  structure.lastRebuildReason =
-    rebuildReason;
-
+  /*
+     Candidate accepted.
+  */
 
   structure.levels =
-    acceptedLevels;
-
-
-  structure.majorLevels =
-    acceptedMajor;
-
-
-  structure.nearLevels =
-    acceptedLevels.filter(
-      isNearLevel
+    directional.map(level =>
+      getRestingLiquidity(level)
     );
 
+  structure.majorLevels =
+    structure.levels
+      .filter(isMajorLevel)
+      .sort(
+        (a, b) =>
+          Math.abs(
+            a.price - state.currentPrice
+          ) -
+          Math.abs(
+            b.price - state.currentPrice
+          )
+      );
 
-  /* ----------------------------------------------------------
-     If accepted structure has no major levels and no previous
-     cache, this is still a valid structural state.
-  ---------------------------------------------------------- */
+  structure.nearLevels =
+    structure.levels
+      .filter(isNearLevel)
+      .sort(
+        (a, b) =>
+          Math.abs(
+            a.price - state.currentPrice
+          ) -
+          Math.abs(
+            b.price - state.currentPrice
+          )
+      );
 
-  if (
-    acceptedMajor.length === 0 &&
-    !structure.lastGoodMajorLevels.length
-  ) {
+  structure.lastGoodLevels =
+    structure.levels.map(
+      x => ({ ...x })
+    );
 
-    structure.status =
-      "VALID_NO_MAJOR_STRUCTURE";
+  structure.lastGoodMajorLevels =
+    structure.majorLevels.map(
+      x => ({ ...x })
+    );
 
-  }
+  structure.lastGoodAt =
+    new Date().toISOString();
 
+  structure.lastGoodRebuildAt =
+    structure.lastGoodAt;
 
-  return structure;
+  structure.lastRebuildAccepted =
+    true;
 
+  structure.retainedPrevious =
+    false;
+
+  structure.lastRebuildReason =
+    structure.majorLevels.length
+      ? "accepted_with_major_structure"
+      : "accepted_without_major_structure";
+
+  structure.status =
+    structure.majorLevels.length
+      ? "HEALTHY"
+      : "HEALTHY_NO_MAJOR";
 }
 
 
 /* ============================================================
-   RAW BOOK ROWS
-============================================================ */
+   STRUCTURE LEVEL HELPERS
+   ============================================================ */
 
-function bookRows(side) {
+function getMajorLevels(side) {
 
-  const source =
-    normalizeSide(side) === "bid"
+  return state.structure.majorLevels
+    .filter(level =>
+      level.side === side &&
+      isDirectionalLevel(
+        level,
+        state.currentPrice
+      )
+    )
+    .sort((a, b) => {
+
+      if (side === "BSL") {
+        return a.price - b.price;
+      }
+
+      return b.price - a.price;
+    });
+}
+
+
+function getNearLevels(side) {
+
+  return state.structure.nearLevels
+    .filter(level =>
+      level.side === side &&
+      isDirectionalLevel(
+        level,
+        state.currentPrice
+      )
+    )
+    .sort(
+      (a, b) =>
+        Math.abs(
+          a.price -
+          state.currentPrice
+        ) -
+        Math.abs(
+          b.price -
+          state.currentPrice
+        )
+    );
+}
+
+
+/* ============================================================
+   ORDER BOOK ROWS
+   ============================================================ */
+
+function getBookRows(side) {
+
+  const map =
+    side === "bid"
       ? state.bids
       : state.asks;
 
-
   const rows = [];
-
 
   for (
     const [
-      price,
+      priceString,
       quantity
-    ] of source.entries()
+    ] of map.entries()
   ) {
 
-    const usd =
-      price *
-      quantity;
+    const price =
+      Number(priceString);
 
+    const qty =
+      Number(quantity);
+
+    if (
+      !Number.isFinite(price) ||
+      !Number.isFinite(qty) ||
+      qty <= 0
+    ) {
+      continue;
+    }
+
+    const usd =
+      price * qty;
 
     if (
       usd <
       SETTINGS.rawMinUsd
     ) {
-
       continue;
-
     }
-
 
     rows.push({
 
       price,
 
-      quantity,
+      quantity: qty,
 
       usd
-
     });
-
   }
 
-
-  rows.sort(
-    (a, b) =>
-      a.price -
-      b.price
-  );
-
-
   return rows;
-
 }
 
 
 /* ============================================================
    ORDER BOOK BUCKETS
-============================================================ */
+   ============================================================ */
 
-function buildBookBuckets(side) {
+function makeBookBuckets(side) {
 
   const rows =
-    bookRows(side);
-
+    getBookRows(side);
 
   const bucketSize =
     SETTINGS.bookBucketUsd;
 
-
-  const buckets =
-    new Map();
-
+  const buckets = new Map();
 
   for (const row of rows) {
 
     const bucketPrice =
       Math.floor(
-        row.price /
-        bucketSize
-      ) *
-      bucketSize;
-
+        row.price / bucketSize
+      ) * bucketSize;
 
     const key =
       bucketPrice.toFixed(2);
 
+    let bucket =
+      buckets.get(key);
 
-    if (!buckets.has(key)) {
+    if (!bucket) {
+
+      bucket = {
+
+        priceLow:
+          bucketPrice,
+
+        priceHigh:
+          bucketPrice +
+          bucketSize,
+
+        center:
+          bucketPrice +
+          bucketSize / 2,
+
+        usd: 0,
+
+        rawLevels: 0,
+
+        strongestPrice:
+          row.price,
+
+        strongestUsd:
+          row.usd
+      };
 
       buckets.set(
         key,
-        {
-          priceLow: bucketPrice,
-          priceHigh:
-            bucketPrice +
-            bucketSize,
-          midpoint:
-            bucketPrice +
-            bucketSize / 2,
-          usd: 0,
-          levels: 0,
-          strongestPrice:
-            row.price,
-          strongestUsd:
-            row.usd,
-          rows: []
-        }
+        bucket
       );
-
     }
 
+    bucket.usd += row.usd;
 
-    const bucket =
-      buckets.get(key);
-
-
-    bucket.usd +=
-      row.usd;
-
-    bucket.levels++;
-
-    bucket.rows.push(
-      row
-    );
-
+    bucket.rawLevels++;
 
     if (
       row.usd >
@@ -1876,1695 +1792,1357 @@ function buildBookBuckets(side) {
 
       bucket.strongestPrice =
         row.price;
-
     }
-
   }
-
 
   return [...buckets.values()]
     .sort(
       (a, b) =>
-        a.midpoint -
-        b.midpoint
+        a.priceLow -
+        b.priceLow
     );
-
 }
 
 
 /* ============================================================
-   ORDER BOOK CONCENTRATION CLUSTERS
-============================================================ */
+   ORDER BOOK CONCENTRATED WALL DETECTOR
+   ============================================================ */
 
-function concentratedBookClusters(side) {
+function buildBookClusters(side) {
 
   const buckets =
-    buildBookBuckets(side);
-
+    makeBookBuckets(side);
 
   if (!buckets.length) {
     return [];
   }
 
-
-  const bucketValues =
-    buckets.map(
-      bucket =>
-        bucket.usd
+  const medianBucketUsd =
+    median(
+      buckets.map(
+        b => b.usd
+      )
     );
-
-
-  const medianUsd =
-    median(bucketValues);
-
-
-  const percentileUsd =
-    percentile(
-      bucketValues,
-      SETTINGS.orderPercentile
-    );
-
 
   const concentrationThreshold =
     Math.max(
       SETTINGS.orderBucketMinUsd,
-      medianUsd *
-        SETTINGS.orderConcentrationMultiple,
-      percentileUsd
+      medianBucketUsd *
+      SETTINGS.orderConcentrationMultiple
     );
 
+  /*
+     Strong bucket means genuinely concentrated
+     compared with the current side of the book.
+  */
 
-  /* ----------------------------------------------------------
-     Strong bucket definition.
+  const marked =
+    buckets.map(bucket => ({
 
-     A bucket is strong when:
-       - it exceeds the absolute floor
-       - AND it is unusually concentrated
+      ...bucket,
 
-     A genuine single wall can bypass the relative test.
-  ---------------------------------------------------------- */
+      strong:
+        bucket.usd >=
+        concentrationThreshold,
 
-  const strongBuckets =
-    buckets.filter(
-      bucket => {
+      giant:
+        bucket.usd >=
+        SETTINGS.orderGiantWallUsd
+    }));
 
-        const relativeStrong =
-          bucket.usd >=
-          concentrationThreshold;
+  const clusters = [];
 
-        const absoluteWall =
-          bucket.usd >=
-          SETTINGS.orderSingleBucketMinUsd;
+  let current = [];
 
-        return (
-          relativeStrong ||
-          absoluteWall
-        );
+  function flush() {
 
+    if (!current.length) {
+      return;
+    }
+
+    const strongBuckets =
+      current.filter(
+        b => b.strong
+      );
+
+    if (!strongBuckets.length) {
+
+      current = [];
+
+      return;
+    }
+
+    /*
+       A cluster is accepted when:
+       - it has enough strong buckets, OR
+       - it contains one genuine giant wall.
+    */
+
+    const totalUsd =
+      strongBuckets.reduce(
+        (sum, b) =>
+          sum + b.usd,
+        0
+      );
+
+    const hasGiant =
+      strongBuckets.some(
+        b => b.giant
+      );
+
+    if (
+      strongBuckets.length <
+      SETTINGS.minStrongBuckets &&
+      !hasGiant
+    ) {
+
+      current = [];
+
+      return;
+    }
+
+    if (
+      totalUsd <
+      SETTINGS.orderMinUsd &&
+      !hasGiant
+    ) {
+
+      current = [];
+
+      return;
+    }
+
+    /*
+       Only strong buckets contribute to cluster USD.
+       This is the important fix that prevents a
+       normal dense ladder from becoming a $30M wall.
+    */
+
+    const first =
+      strongBuckets[0];
+
+    const last =
+      strongBuckets[
+        strongBuckets.length - 1
+      ];
+
+    const priceLow =
+      first.priceLow;
+
+    const priceHigh =
+      last.priceHigh;
+
+    const width =
+      priceHigh -
+      priceLow;
+
+    if (
+      width >
+      SETTINGS.orderMaxClusterWidthUsd
+    ) {
+
+      /*
+         Split oversized runs into smaller
+         independent clusters.
+      */
+
+      let segment = [];
+
+      for (
+        const bucket of strongBuckets
+      ) {
+
+        if (!segment.length) {
+
+          segment = [bucket];
+
+          continue;
+        }
+
+        const segmentLow =
+          segment[0].priceLow;
+
+        const candidateWidth =
+          bucket.priceHigh -
+          segmentLow;
+
+        if (
+          candidateWidth <=
+          SETTINGS.orderMaxClusterWidthUsd &&
+          segment.length <
+          SETTINGS.orderMaxStrongBucketsPerCluster
+        ) {
+
+          segment.push(bucket);
+
+        } else {
+
+          addStrongSegment(
+            segment,
+            medianBucketUsd,
+            concentrationThreshold,
+            side,
+            clusters
+          );
+
+          segment = [bucket];
+        }
       }
-    );
 
+      if (segment.length) {
 
-  if (!strongBuckets.length) {
-    return [];
+        addStrongSegment(
+          segment,
+          medianBucketUsd,
+          concentrationThreshold,
+          side,
+          clusters
+        );
+      }
+
+    } else {
+
+      addStrongSegment(
+        strongBuckets,
+        medianBucketUsd,
+        concentrationThreshold,
+        side,
+        clusters
+      );
+    }
+
+    current = [];
   }
 
 
-  /* ----------------------------------------------------------
-     Group only adjacent strong buckets.
+  function processBucket(bucket) {
 
-     Normal book buckets that are not strong are NOT included.
-     This is the key fix for the old giant clusters.
-  ---------------------------------------------------------- */
+    if (!bucket.strong) {
 
-  const groups = [];
+      /*
+         Weak bucket creates a concentration valley.
+         It therefore breaks the cluster.
+      */
 
-  let current = null;
+      flush();
 
+      return;
+    }
 
-  for (const bucket of strongBuckets) {
-
-    if (!current) {
+    if (!current.length) {
 
       current = [bucket];
 
-      continue;
-
+      return;
     }
-
 
     const previous =
       current[
         current.length - 1
       ];
 
-
     const gap =
       bucket.priceLow -
       previous.priceHigh;
 
-
-    const newWidth =
+    const currentWidth =
       bucket.priceHigh -
       current[0].priceLow;
 
+    /*
+       Hard physical gap.
+    */
 
     if (
-      gap <=
-      SETTINGS.orderMaxBucketGapUsd &&
-      newWidth <=
-      SETTINGS.orderMaxClusterWidthUsd
+      gap >
+      SETTINGS.bookBucketUsd * 1.5
     ) {
 
-      current.push(bucket);
-
-    } else {
-
-      groups.push(
-        current
-      );
+      flush();
 
       current = [bucket];
 
+      return;
     }
 
-  }
+    /*
+       Width limit.
+    */
 
+    if (
+      currentWidth >
+      SETTINGS.orderMaxClusterWidthUsd
+    ) {
 
-  if (current) {
+      flush();
 
-    groups.push(
-      current
-    );
+      current = [bucket];
 
-  }
-
-
-  /* ----------------------------------------------------------
-     Convert groups into liquidity zones.
-  ---------------------------------------------------------- */
-
-  const clusters = [];
-
-
-  for (const group of groups) {
-
-    const usd =
-      group.reduce(
-        (sum, bucket) =>
-          sum +
-          bucket.usd,
-        0
-      );
-
-
-    const strongest =
-      group.reduce(
-        (best, bucket) =>
-          bucket.strongestUsd >
-          best.strongestUsd
-            ? bucket
-            : best
-      );
-
-
-    const strongBucketCount =
-      group.length;
-
-
-    const width =
-      group[group.length - 1]
-        .priceHigh -
-      group[0]
-        .priceLow;
-
-
-    const qualifies =
-      usd >=
-        SETTINGS.orderMinUsd &&
-      (
-        strongBucketCount >=
-          SETTINGS.minStrongBuckets ||
-        strongest.strongestUsd >=
-          SETTINGS.orderSingleBucketMinUsd
-      );
-
-
-    if (!qualifies) {
-      continue;
+      return;
     }
 
+    /*
+       Concentration valley.
 
-    clusters.push({
+       If current bucket is much weaker than the
+       previous strong bucket, split it.
+    */
 
-      side,
+    if (
+      bucket.usd <
+      previous.usd *
+      SETTINGS.orderSplitRatio
+    ) {
 
-      priceLow:
-        group[0].priceLow,
+      flush();
 
-      priceHigh:
-        group[group.length - 1]
-          .priceHigh,
+      current = [bucket];
 
-      midpoint:
-        group.reduce(
-          (sum, bucket) =>
-            sum +
-            bucket.midpoint *
-            bucket.usd,
-          0
-        ) /
-        usd,
+      return;
+    }
 
-      usd,
+    if (
+      current.length >=
+      SETTINGS.orderMaxStrongBucketsPerCluster
+    ) {
 
-      levels:
-        group.reduce(
-          (sum, bucket) =>
-            sum +
-            bucket.levels,
-          0
-        ),
+      flush();
 
-      strongBuckets:
-        strongBucketCount,
+      current = [bucket];
 
-      strongestPrice:
-        strongest.strongestPrice,
+      return;
+    }
 
-      strongestBucketUsd:
-        strongest.strongestUsd,
-
-      medianBucketUsd:
-        medianUsd,
-
-      concentrationThreshold,
-
-      width
-
-    });
-
+    current.push(bucket);
   }
 
 
-  clusters.sort(
-    (a, b) =>
-      b.usd -
-      a.usd
-  );
+  for (
+    const bucket of marked
+  ) {
 
+    processBucket(bucket);
+  }
 
-  return clusters.slice(
-    0,
-    SETTINGS.maxBookClusters
-  );
+  flush();
 
+  return clusters
+    .sort(
+      (a, b) =>
+        b.usd - a.usd
+    )
+    .slice(0, 20);
 }
 
 
 /* ============================================================
-   ORDER BOOK
-============================================================ */
+   ADD STRONG BOOK SEGMENT
+   ============================================================ */
 
-function getBook() {
+function addStrongSegment(
+  segment,
+  medianBucketUsd,
+  concentrationThreshold,
+  side,
+  output
+) {
+
+  if (!segment.length) {
+    return;
+  }
+
+  const usd =
+    segment.reduce(
+      (sum, bucket) =>
+        sum + bucket.usd,
+      0
+    );
+
+  const giant =
+    segment.some(
+      bucket =>
+        bucket.usd >=
+        SETTINGS.orderGiantWallUsd
+    );
+
+  if (
+    segment.length <
+    SETTINGS.minStrongBuckets &&
+    !giant
+  ) {
+
+    if (
+      !segment.some(
+        bucket =>
+          bucket.usd >=
+          SETTINGS.orderSingleBucketMinUsd
+      )
+    ) {
+
+      return;
+    }
+  }
+
+  if (
+    usd <
+    SETTINGS.orderMinUsd &&
+    !giant
+  ) {
+
+    return;
+  }
+
+  const priceLow =
+    segment[0].priceLow;
+
+  const priceHigh =
+    segment[
+      segment.length - 1
+    ].priceHigh;
+
+  const width =
+    priceHigh - priceLow;
+
+  if (
+    width >
+    SETTINGS.orderMaxClusterWidthUsd
+  ) {
+
+    return;
+  }
+
+  const weighted =
+    weightedMid(
+      segment.map(
+        bucket => ({
+          price:
+            bucket.center,
+
+          usd:
+            bucket.usd
+        })
+      )
+    );
+
+  let strongest =
+    segment[0];
+
+  for (
+    const bucket of segment
+  ) {
+
+    if (
+      bucket.usd >
+      strongest.usd
+    ) {
+
+      strongest =
+        bucket;
+    }
+  }
+
+  /*
+     Concentration ratio:
+
+     cluster USD divided by all book liquidity
+     represented by the same bucket span.
+
+     Higher = more concentrated.
+  */
+
+  const concentrationRatio =
+    usd /
+    Math.max(
+      usd,
+      medianBucketUsd *
+      Math.max(
+        segment.length,
+        1
+      )
+    );
+
+  output.push({
+
+    side,
+
+    priceLow,
+
+    priceHigh,
+
+    midpoint:
+      weighted ||
+      (
+        priceLow +
+        priceHigh
+      ) / 2,
+
+    usd,
+
+    levels:
+      segment.length,
+
+    rawLevels:
+      segment.reduce(
+        (sum, b) =>
+          sum + b.rawLevels,
+        0
+      ),
+
+    strongBuckets:
+      segment.length,
+
+    strongestPrice:
+      strongest.strongestPrice,
+
+    strongestBucketUsd:
+      strongest.usd,
+
+    strongestRawOrderUsd:
+      strongest.strongestUsd,
+
+    medianBucketUsd,
+
+    concentrationThreshold,
+
+    concentrationRatio,
+
+    width,
+
+    giantWall:
+      giant
+  });
+}
+
+
+/* ============================================================
+   STRUCTURAL CONFLUENCE
+   ============================================================ */
+
+function findStructuralConfluence(cluster) {
+
+  const major =
+    state.structure.majorLevels
+      .filter(level =>
+        isMajorLevel(level)
+      );
+
+  let best = null;
+
+  for (const level of major) {
+
+    if (
+      level.side === "BSL" &&
+      cluster.side !== "ask"
+    ) {
+      continue;
+    }
+
+    if (
+      level.side === "SSL" &&
+      cluster.side !== "bid"
+    ) {
+      continue;
+    }
+
+    const overlapLow =
+      Math.max(
+        cluster.priceLow,
+        level.priceLow
+      );
+
+    const overlapHigh =
+      Math.min(
+        cluster.priceHigh,
+        level.priceHigh
+      );
+
+    const overlap =
+      Math.max(
+        0,
+        overlapHigh -
+        overlapLow
+      );
+
+    const clusterWidth =
+      Math.max(
+        1,
+        cluster.priceHigh -
+        cluster.priceLow
+      );
+
+    const overlapRatio =
+      overlap /
+      clusterWidth;
+
+    const strongestInside =
+      cluster.strongestPrice >=
+        level.priceLow &&
+      cluster.strongestPrice <=
+        level.priceHigh;
+
+    const distance =
+      Math.abs(
+        cluster.midpoint -
+        level.price
+      );
+
+    const allowedDistance =
+      Math.max(
+        SETTINGS.confluenceMaxDistanceUsd,
+        level.price *
+        SETTINGS.confluenceMaxDistancePct
+      );
+
+    const qualified =
+      strongestInside ||
+      overlapRatio >=
+        SETTINGS.confluenceMinOverlapRatio ||
+      distance <=
+        allowedDistance;
+
+    if (!qualified) {
+      continue;
+    }
+
+    const quality =
+      (
+        strongestInside
+          ? 100
+          : 0
+      ) +
+      overlapRatio * 50 +
+      Math.max(
+        0,
+        1 -
+        distance /
+        Math.max(
+          allowedDistance,
+          1
+        )
+      ) * 25 +
+      level.score / 20;
+
+    if (
+      !best ||
+      quality > best.quality
+    ) {
+
+      best = {
+
+        structuralConfluence:
+          true,
+
+        structuralLevel:
+          level.price,
+
+        structuralZoneLow:
+          level.priceLow,
+
+        structuralZoneHigh:
+          level.priceHigh,
+
+        structuralTimeframes:
+          level.timeframes,
+
+        structuralStrength:
+          level.strength,
+
+        structuralScore:
+          level.score,
+
+        structuralOverlap:
+          overlap > 0,
+
+        structuralOverlapRatio:
+          overlapRatio,
+
+        structuralDistance:
+          distance,
+
+        quality
+      };
+    }
+  }
+
+  if (!best) {
+
+    return {
+
+      structuralConfluence: false,
+
+      structuralLevel: null,
+
+      structuralZoneLow: null,
+
+      structuralZoneHigh: null,
+
+      structuralTimeframes: [],
+
+      structuralStrength: null,
+
+      structuralScore: null,
+
+      structuralOverlap: false,
+
+      structuralOverlapRatio: 0,
+
+      structuralDistance: null
+    };
+  }
+
+  return best;
+}
+
+
+/* ============================================================
+   ORDER BOOK OUTPUT
+   ============================================================ */
+
+function buildOrderBookIntelligence() {
+
+  const bids =
+    buildBookClusters("bid");
+
+  const asks =
+    buildBookClusters("ask");
+
+  for (const cluster of bids) {
+
+    Object.assign(
+      cluster,
+      findStructuralConfluence(
+        cluster
+      )
+    );
+  }
+
+  for (const cluster of asks) {
+
+    Object.assign(
+      cluster,
+      findStructuralConfluence(
+        cluster
+      )
+    );
+  }
+
+  /*
+     Only return the most meaningful walls.
+
+     Sorting by concentration + USD rather than
+     simply USD prevents a giant ladder from
+     dominating the output.
+  */
+
+  const sortWalls =
+    list =>
+      list
+        .sort((a, b) => {
+
+          const scoreA =
+            a.usd *
+            (
+              1 +
+              Math.min(
+                a.concentrationRatio,
+                3
+              ) * 0.25
+            );
+
+          const scoreB =
+            b.usd *
+            (
+              1 +
+              Math.min(
+                b.concentrationRatio,
+                3
+              ) * 0.25
+            );
+
+          return scoreB - scoreA;
+        })
+        .slice(0, 8);
 
   return {
 
     bids:
-      concentratedBookClusters(
-        "bid"
-      ),
+      sortWalls(bids),
 
     asks:
-      concentratedBookClusters(
-        "ask"
-      )
-
+      sortWalls(asks)
   };
-
 }
 
 
 /* ============================================================
-   MAJOR STRUCTURAL LEVELS
-============================================================ */
+   PERSISTENCE MATCHING
+   ============================================================ */
 
-function structural(side) {
-
-  return structure.levels
-
-    .filter(
-      level =>
-        level.side === side
-    )
-
-    .filter(
-      isMajorLevel
-    )
-
-    .sort(
-      (a, b) => {
-
-        if (
-          side === "BSL"
-        ) {
-
-          return (
-            a.price -
-            b.price
-          );
-
-        }
-
-        return (
-          b.price -
-          a.price
-        );
-
-      }
-
-    );
-
-}
-
-
-/* ============================================================
-   NEAR STRUCTURAL LEVELS
-============================================================ */
-
-function nearStructural(side) {
-
-  return structure.levels
-
-    .filter(
-      level =>
-        level.side === side
-    )
-
-    .filter(
-      isNearLevel
-    )
-
-    .sort(
-      (a, b) => {
-
-        const da =
-          Math.abs(
-            a.price -
-            state.currentPrice
-          );
-
-        const db =
-          Math.abs(
-            b.price -
-            state.currentPrice
-          );
-
-        return da - db;
-
-      }
-
-    );
-
-}
-
-
-/* ============================================================
-   STRICT BOOK / STRUCTURAL CONFLUENCE
-============================================================ */
-
-function structuralNearBookCluster(
-  cluster
-) {
+function clustersMatch(a, b) {
 
   if (
-    !state.currentPrice
+    !a ||
+    !b ||
+    a.side !== b.side
   ) {
 
-    return null;
-
+    return false;
   }
 
-
-  const bookLow =
-    cluster.priceLow;
-
-  const bookHigh =
-    cluster.priceHigh;
-
-
-  const majors =
-    structure.levels.filter(
-      isMajorLevel
+  const overlapLow =
+    Math.max(
+      a.priceLow,
+      b.priceLow
     );
 
+  const overlapHigh =
+    Math.min(
+      a.priceHigh,
+      b.priceHigh
+    );
 
-  let best = null;
+  if (
+    overlapHigh >=
+    overlapLow
+  ) {
 
-
-  for (const level of majors) {
-
-    if (
-      structuralSideToBookSide(
-        level.side
-      ) !==
-      cluster.side
-    ) {
-
-      continue;
-
-    }
-
-
-    /* --------------------------------------------------------
-       BEST CASE:
-       Actual zone overlap.
-    -------------------------------------------------------- */
-
-    const overlap =
-      bookHigh >=
-        level.priceLow &&
-      bookLow <=
-        level.priceHigh;
-
-
-    if (overlap) {
-
-      const overlapLow =
-        Math.max(
-          bookLow,
-          level.priceLow
-        );
-
-      const overlapHigh =
-        Math.min(
-          bookHigh,
-          level.priceHigh
-        );
-
-
-      const overlapWidth =
-        Math.max(
-          0,
-          overlapHigh -
-          overlapLow
-        );
-
-
-      const levelWidth =
-        Math.max(
-          1,
-          level.priceHigh -
-          level.priceLow
-        );
-
-
-      const overlapRatio =
-        overlapWidth /
-        levelWidth;
-
-
-      const candidate = {
-
-        level,
-
-        overlap: true,
-
-        overlapRatio,
-
-        distance: 0
-
-      };
-
-
-      if (
-        !best ||
-        candidate.overlapRatio >
-          best.overlapRatio
-      ) {
-
-        best = candidate;
-
-      }
-
-      continue;
-
-    }
-
-
-    /* --------------------------------------------------------
-       NON-OVERLAP:
-       Require tight distance.
-    -------------------------------------------------------- */
-
-    let distance = Infinity;
-
-
-    if (
-      bookHigh <
-      level.priceLow
-    ) {
-
-      distance =
-        level.priceLow -
-        bookHigh;
-
-    } else if (
-      bookLow >
-      level.priceHigh
-    ) {
-
-      distance =
-        bookLow -
-        level.priceHigh;
-
-    }
-
-
-    const maxDistance =
-      Math.min(
-        SETTINGS.confluenceMaxDistanceUsd,
-        level.price *
-          SETTINGS.confluenceMaxDistancePct
-      );
-
-
-    if (
-      distance <=
-      maxDistance
-    ) {
-
-      const candidate = {
-
-        level,
-
-        overlap: false,
-
-        overlapRatio: 0,
-
-        distance
-
-      };
-
-
-      if (
-        !best ||
-        candidate.distance <
-          best.distance
-      ) {
-
-        best = candidate;
-
-      }
-
-    }
-
+    return true;
   }
-
-
-  return best;
-
-}
-
-
-/* ============================================================
-   APPLY BOOK TO INTELLIGENCE
-============================================================ */
-
-function enrichBookClusters(
-  clusters
-) {
-
-  return clusters.map(
-    cluster => {
-
-      const confluence =
-        structuralNearBookCluster(
-          cluster
-        );
-
-
-      return {
-
-        ...cluster,
-
-        structuralConfluence:
-          Boolean(confluence),
-
-        structuralLevel:
-          confluence
-            ? confluence.level.price
-            : null,
-
-        structuralZoneLow:
-          confluence
-            ? confluence.level.priceLow
-            : null,
-
-        structuralZoneHigh:
-          confluence
-            ? confluence.level.priceHigh
-            : null,
-
-        structuralTimeframes:
-          confluence
-            ? confluence.level.timeframes
-            : [],
-
-        structuralOverlap:
-          confluence
-            ? confluence.overlap
-            : false,
-
-        structuralOverlapRatio:
-          confluence
-            ? round(
-                confluence.overlapRatio,
-                3
-              )
-            : 0
-
-      };
-
-    }
-  );
-
-}
-
-
-/* ============================================================
-   PERSISTENCE CLUSTER MATCH
-============================================================ */
-
-function clustersStillNear(
-  oldCluster,
-  newCluster
-) {
 
   const tolerance =
     Math.max(
       20,
-      state.currentPrice *
-        SETTINGS.persistenceTolerancePct
+      (
+        state.currentPrice ||
+        0
+      ) *
+      SETTINGS.persistenceTolerancePct
     );
-
-
-  const oldLow =
-    oldCluster.priceLow;
-
-  const oldHigh =
-    oldCluster.priceHigh;
-
-
-  const newLow =
-    newCluster.priceLow;
-
-  const newHigh =
-    newCluster.priceHigh;
-
-
-  const overlap =
-    newHigh >= oldLow &&
-    newLow <= oldHigh;
-
-
-  if (overlap) {
-    return true;
-  }
-
 
   return (
     Math.abs(
-      oldCluster.midpoint -
-      newCluster.midpoint
-    ) <=
-    tolerance
+      a.midpoint -
+      b.midpoint
+    ) <= tolerance
   );
-
 }
 
 
 /* ============================================================
-   PERSISTENCE STATE
-============================================================ */
+   EVENT
+   ============================================================ */
 
-function getPersistenceStatus(
-  previousUsd,
-  currentUsd,
-  ageMs
-) {
+function addLiquidityEvent(event) {
 
-  if (
-    ageMs <
-    SETTINGS.persistenceConfirmMs
-  ) {
+  state.liquidityEvents.unshift({
 
-    return "NEW";
+    ...event,
 
-  }
-
+    eventTime:
+      new Date().toISOString()
+  });
 
   if (
-    previousUsd > 0 &&
-    currentUsd >
-      previousUsd *
-      (1 +
-        SETTINGS.eventStrengthChangePct)
-  ) {
-
-    return "STRENGTHENING";
-
-  }
-
-
-  if (
-    previousUsd > 0 &&
-    currentUsd <
-      previousUsd *
-      (1 -
-        SETTINGS.eventStrengthChangePct)
-  ) {
-
-    return "WEAKENING";
-
-  }
-
-
-  return "HOLDING";
-
-}
-
-
-/* ============================================================
-   EVENT PUSH
-============================================================ */
-
-function pushLiquidityEvent(event) {
-
-  liquidityEvents.unshift(
-    event
-  );
-
-
-  while (
-    liquidityEvents.length >
+    state.liquidityEvents.length >
     SETTINGS.eventMax
   ) {
 
-    liquidityEvents.pop();
-
+    state.liquidityEvents =
+      state.liquidityEvents.slice(
+        0,
+        SETTINGS.eventMax
+      );
   }
-
 }
 
 
 /* ============================================================
-   EVENT SIDE
-============================================================ */
+   PERSISTENCE UPDATE
+   ============================================================ */
 
-function eventSide(
-  bookSide
-) {
+function updatePersistence() {
 
-  return bookSide === "ask"
-    ? "BSL"
-    : "SSL";
-
-}
-
-
-/* ============================================================
-   CREATE PERSISTENCE ITEM
-============================================================ */
-
-function createPersistenceItem(
-  cluster
-) {
+  const orderBook =
+    buildOrderBookIntelligence();
 
   const timestamp =
     now();
 
+  for (
+    const side of ["bid", "ask"]
+  ) {
 
-  return {
+    const current =
+      side === "bid"
+        ? orderBook.bids
+        : orderBook.asks;
 
-    ...safeJson(cluster),
+    const previous =
+      state.persistence[
+        side === "bid"
+          ? "bids"
+          : "asks"
+      ];
 
-    firstSeen:
-      new Date(
-        timestamp
-      ).toISOString(),
+    const matched =
+      new Set();
 
-    lastSeen:
-      new Date(
-        timestamp
-      ).toISOString(),
-
-    durationMs: 0,
-
-    durationSec: 0,
-
-    observations: 1,
-
-    maxUsd:
-      cluster.usd,
-
-    previousUsd: 0,
-
-    changeUsd: 0,
-
-    status: "NEW",
-
-    removed: false,
-
-    persistent: false,
-
-    structuralConfluence:
-      Boolean(
-        cluster.structuralConfluence
-      ),
-
-    structuralLevel:
-      cluster.structuralLevel ||
-      null,
-
-    structuralZoneLow:
-      cluster.structuralZoneLow ||
-      null,
-
-    structuralZoneHigh:
-      cluster.structuralZoneHigh ||
-      null,
-
-    structuralTimeframes:
-      cluster.structuralTimeframes ||
-      [],
-
-    persistentEventSent: false,
-
-    confluenceEventSent: false,
-
-    strengthEventAt: 0,
-
-    removedEventSent: false
-
-  };
-
-}
-
-
-/* ============================================================
-   UPDATE PERSISTENCE
-============================================================ */
-
-function updatePersistenceSide(
-  side,
-  clusters
-) {
-
-  const map =
-    side === "bid"
-      ? persistence.bids
-      : persistence.asks;
-
-
-  const matchedIds =
-    new Set();
-
-
-  /* ----------------------------------------------------------
-     MATCH EXISTING CLUSTERS
-  ---------------------------------------------------------- */
-
-  for (const cluster of clusters) {
-
-    let matchId = null;
-
-    let bestDistance =
-      Infinity;
-
+    const next = [];
 
     for (
-      const [
-        id,
-        existing
-      ] of map.entries()
+      const cluster of current
     ) {
 
-      if (
-        existing.removed
-      ) {
-
-        continue;
-
-      }
-
-
-      if (
-        !clustersStillNear(
-          existing,
-          cluster
-        )
-      ) {
-
-        continue;
-
-      }
-
-
-      const distance =
-        Math.abs(
-          existing.midpoint -
-          cluster.midpoint
-        );
-
-
-      if (
-        distance <
-        bestDistance
-      ) {
-
-        bestDistance =
-          distance;
-
-        matchId =
-          id;
-
-      }
-
-    }
-
-
-    if (matchId) {
-
-      const item =
-        map.get(
-          matchId
-        );
-
-
-      const previousUsd =
-        item.usd;
-
-
-      item.previousUsd =
-        previousUsd;
-
-
-      item.usd =
-        cluster.usd;
-
-
-      item.priceLow =
-        cluster.priceLow;
-
-
-      item.priceHigh =
-        cluster.priceHigh;
-
-
-      item.midpoint =
-        cluster.midpoint;
-
-
-      item.strongestPrice =
-        cluster.strongestPrice;
-
-
-      item.strongestBucketUsd =
-        cluster.strongestBucketUsd;
-
-
-      item.levels =
-        cluster.levels;
-
-
-      item.strongBuckets =
-        cluster.strongBuckets;
-
-
-      item.medianBucketUsd =
-        cluster.medianBucketUsd;
-
-
-      item.concentrationThreshold =
-        cluster.concentrationThreshold;
-
-
-      item.lastSeen =
-        new Date(
-          now()
-        ).toISOString();
-
-
-      item.durationMs =
-        now() -
-        new Date(
-          item.firstSeen
-        ).getTime();
-
-
-      item.durationSec =
-        Math.floor(
-          item.durationMs /
-          1000
-        );
-
-
-      item.observations++;
-
-
-      item.maxUsd =
-        Math.max(
-          item.maxUsd,
-          item.usd
-        );
-
-
-      item.changeUsd =
-        item.usd -
-        previousUsd;
-
-
-      item.status =
-        getPersistenceStatus(
-          previousUsd,
-          item.usd,
-          item.durationMs
-        );
-
-
-      item.persistent =
-        item.durationMs >=
-        SETTINGS.persistenceConfirmMs;
-
-
-      const newConfluence =
-        structuralNearBookCluster(
-          cluster
-        );
-
-
-      if (newConfluence) {
-
-        item.structuralConfluence =
-          true;
-
-        item.structuralLevel =
-          newConfluence.level.price;
-
-        item.structuralZoneLow =
-          newConfluence.level.priceLow;
-
-        item.structuralZoneHigh =
-          newConfluence.level.priceHigh;
-
-        item.structuralTimeframes =
-          newConfluence.level.timeframes;
-
-      } else {
-
-        item.structuralConfluence =
-          false;
-
-        item.structuralLevel =
-          null;
-
-        item.structuralZoneLow =
-          null;
-
-        item.structuralZoneHigh =
-          null;
-
-        item.structuralTimeframes =
-          [];
-
-      }
-
-
-      matchedIds.add(
-        matchId
-      );
-
-
-      /* ------------------------------------------------------
-         Persistent event
-      ------------------------------------------------------ */
-
-      if (
-        item.persistent &&
-        !item.persistentEventSent &&
-        item.usd >=
-          SETTINGS.eventMinPersistentUsd
-      ) {
-
-        item.persistentEventSent =
-          true;
-
-
-        pushLiquidityEvent({
-
-          key:
-            `PERSISTENT|${matchId}`,
-
-          type:
-            "PERSISTENT",
-
-          time:
-            now(),
-
-          side:
-            eventSide(side),
-
-          bookPriceLow:
-            item.priceLow,
-
-          bookPriceHigh:
-            item.priceHigh,
-
-          currentUsd:
-            item.usd,
-
-          maxUsd:
-            item.maxUsd,
-
-          durationMs:
-            item.durationMs,
-
-          lifetimeSec:
-            item.durationSec,
-
-          observations:
-            item.observations,
-
-          structuralLevel:
-            item.structuralLevel,
-
-          structuralZoneLow:
-            item.structuralZoneLow,
-
-          structuralZoneHigh:
-            item.structuralZoneHigh,
-
-          timeframes:
-            item.structuralTimeframes,
-
-          message:
-            "PERSISTENT LIQUIDITY"
-
-        });
-
-      }
-
-
-      /* ------------------------------------------------------
-         Structural confluence event
-      ------------------------------------------------------ */
-
-      if (
-        item.persistent &&
-        item.structuralConfluence &&
-        !item.confluenceEventSent
-      ) {
-
-        item.confluenceEventSent =
-          true;
-
-
-        pushLiquidityEvent({
-
-          key:
-            `CONFLUENCE|${matchId}`,
-
-          type:
-            "CONFLUENCE",
-
-          time:
-            now(),
-
-          side:
-            eventSide(side),
-
-          bookPriceLow:
-            item.priceLow,
-
-          bookPriceHigh:
-            item.priceHigh,
-
-          currentUsd:
-            item.usd,
-
-          maxUsd:
-            item.maxUsd,
-
-          durationMs:
-            item.durationMs,
-
-          lifetimeSec:
-            item.durationSec,
-
-          observations:
-            item.observations,
-
-          structuralLevel:
-            item.structuralLevel,
-
-          structuralZoneLow:
-            item.structuralZoneLow,
-
-          structuralZoneHigh:
-            item.structuralZoneHigh,
-
-          timeframes:
-            item.structuralTimeframes,
-
-          message:
-            "STRUCTURAL + RESTING LIQUIDITY CONFLUENCE"
-
-        });
-
-      }
-
-
-      /* ------------------------------------------------------
-         Strength change events
-      ------------------------------------------------------ */
-
-      const enoughForStrengthEvent =
-        item.persistent &&
-        previousUsd > 0 &&
-        item.usd >=
-          SETTINGS.eventMinPersistentUsd;
-
-
-      const changePct =
-        previousUsd > 0
-          ? Math.abs(
-              item.changeUsd
-            ) /
-            previousUsd
-          : 0;
-
-
-      if (
-        enoughForStrengthEvent &&
-        changePct >=
-          SETTINGS.eventStrengthChangePct &&
-        now() -
-          item.strengthEventAt >
-          60000
+      let matchIndex = -1;
+
+      for (
+        let i = 0;
+        i < previous.length;
+        i++
       ) {
 
         if (
-          item.changeUsd > 0
+          matched.has(i)
         ) {
-
-          pushLiquidityEvent({
-
-            key:
-              `STRENGTHENING|${matchId}|${Math.floor(now() / 60000)}`,
-
-            type:
-              "STRENGTHENING",
-
-            time:
-              now(),
-
-            side:
-              eventSide(side),
-
-            bookPriceLow:
-              item.priceLow,
-
-            bookPriceHigh:
-              item.priceHigh,
-
-            currentUsd:
-              item.usd,
-
-            maxUsd:
-              item.maxUsd,
-
-            durationMs:
-              item.durationMs,
-
-            lifetimeSec:
-              item.durationSec,
-
-            observations:
-              item.observations,
-
-            structuralLevel:
-              item.structuralLevel,
-
-            structuralZoneLow:
-              item.structuralZoneLow,
-
-            structuralZoneHigh:
-              item.structuralZoneHigh,
-
-            timeframes:
-              item.structuralTimeframes,
-
-            message:
-              "LIQUIDITY STRENGTHENING"
-
-          });
-
-        } else {
-
-          pushLiquidityEvent({
-
-            key:
-              `WEAKENING|${matchId}|${Math.floor(now() / 60000)}`,
-
-            type:
-              "WEAKENING",
-
-            time:
-              now(),
-
-            side:
-              eventSide(side),
-
-            bookPriceLow:
-              item.priceLow,
-
-            bookPriceHigh:
-              item.priceHigh,
-
-            currentUsd:
-              item.usd,
-
-            maxUsd:
-              item.maxUsd,
-
-            durationMs:
-              item.durationMs,
-
-            lifetimeSec:
-              item.durationSec,
-
-            observations:
-              item.observations,
-
-            structuralLevel:
-              item.structuralLevel,
-
-            structuralZoneLow:
-              item.structuralZoneLow,
-
-            structuralZoneHigh:
-              item.structuralZoneHigh,
-
-            timeframes:
-              item.structuralTimeframes,
-
-            message:
-              "LIQUIDITY WEAKENING"
-
-          });
-
+          continue;
         }
 
+        if (
+          clustersMatch(
+            previous[i],
+            cluster
+          )
+        ) {
 
-        item.strengthEventAt =
-          now();
+          matchIndex = i;
 
+          break;
+        }
       }
 
-    } else {
+      if (
+        matchIndex >= 0
+      ) {
 
-      /* ------------------------------------------------------
-         NEW CLUSTER
-      ------------------------------------------------------ */
-
-      const id =
-        `${side}-${Math.round(
-          cluster.midpoint
-        )}-${now()}`;
-
-
-      const item =
-        createPersistenceItem(
-          cluster
+        matched.add(
+          matchIndex
         );
 
+        const old =
+          previous[matchIndex];
 
-      map.set(
-        id,
-        item
-      );
+        const previousUsd =
+          Number(
+            old.usd
+          ) || 0;
 
+        const currentUsd =
+          Number(
+            cluster.usd
+          ) || 0;
 
-      matchedIds.add(
-        id
-      );
+        const firstSeen =
+          old.firstSeen ||
+          timestamp;
 
+        const durationMs =
+          timestamp -
+          firstSeen;
+
+        const observations =
+          (
+            old.observations ||
+            0
+          ) + 1;
+
+        const updated = {
+
+          ...cluster,
+
+          firstSeen,
+
+          lastSeen:
+            timestamp,
+
+          durationMs,
+
+          durationSec:
+            Math.floor(
+              durationMs / 1000
+            ),
+
+          observations,
+
+          maxUsd:
+            Math.max(
+              old.maxUsd || 0,
+              currentUsd
+            ),
+
+          previousUsd,
+
+          changeUsd:
+            currentUsd -
+            previousUsd,
+
+          status:
+            durationMs >=
+            SETTINGS.persistenceConfirmMs
+              ? "HOLDING"
+              : "BUILDING",
+
+          persistent:
+            durationMs >=
+            SETTINGS.persistenceConfirmMs,
+
+          persistentEventSent:
+            !!old.persistentEventSent,
+
+          confluenceEventSent:
+            !!old.confluenceEventSent,
+
+          strengthEventAt:
+            old.strengthEventAt || 0,
+
+          removedEventSent:
+            !!old.removedEventSent,
+
+          removed: false
+        };
+
+        const confluence =
+          findStructuralConfluence(
+            updated
+          );
+
+        Object.assign(
+          updated,
+          confluence
+        );
+
+        /*
+           First persistent event.
+        */
+
+        if (
+          updated.persistent &&
+          !updated.persistentEventSent
+        ) {
+
+          addLiquidityEvent({
+
+            type: "PERSISTENT",
+
+            side:
+              updated.side,
+
+            midpoint:
+              updated.midpoint,
+
+            priceLow:
+              updated.priceLow,
+
+            priceHigh:
+              updated.priceHigh,
+
+            usd:
+              updated.usd,
+
+            durationSec:
+              updated.durationSec,
+
+            strongestPrice:
+              updated.strongestPrice,
+
+            strongestBucketUsd:
+              updated.strongestBucketUsd
+          });
+
+          updated.persistentEventSent =
+            true;
+        }
+
+        /*
+           First structural confluence.
+        */
+
+        if (
+          updated.persistent &&
+          updated.structuralConfluence &&
+          !updated.confluenceEventSent
+        ) {
+
+          addLiquidityEvent({
+
+            type: "CONFLUENCE",
+
+            side:
+              updated.side,
+
+            midpoint:
+              updated.midpoint,
+
+            usd:
+              updated.usd,
+
+            structuralLevel:
+              updated.structuralLevel,
+
+            structuralZoneLow:
+              updated.structuralZoneLow,
+
+            structuralZoneHigh:
+              updated.structuralZoneHigh,
+
+            structuralTimeframes:
+              updated.structuralTimeframes
+          });
+
+          updated.confluenceEventSent =
+            true;
+        }
+
+        /*
+           Meaningful strengthening / weakening.
+
+           Do not spam events every 5 seconds.
+        */
+
+        const changePct =
+          previousUsd > 0
+            ? (
+                Math.abs(
+                  currentUsd -
+                  previousUsd
+                ) /
+                previousUsd
+              )
+            : 0;
+
+        if (
+          updated.persistent &&
+          changePct >= 0.10 &&
+          timestamp -
+            updated.strengthEventAt >=
+            15000
+        ) {
+
+          addLiquidityEvent({
+
+            type:
+              currentUsd >
+              previousUsd
+                ? "STRENGTHENING"
+                : "WEAKENING",
+
+            side:
+              updated.side,
+
+            midpoint:
+              updated.midpoint,
+
+            usd:
+              updated.usd,
+
+            previousUsd,
+
+            changeUsd:
+              currentUsd -
+              previousUsd,
+
+            changePct:
+              changePct * 100
+          });
+
+          updated.strengthEventAt =
+            timestamp;
+        }
+
+        next.push(updated);
+
+      } else {
+
+        const confluence =
+          findStructuralConfluence(
+            cluster
+          );
+
+        next.push({
+
+          ...cluster,
+
+          ...confluence,
+
+          firstSeen:
+            timestamp,
+
+          lastSeen:
+            timestamp,
+
+          durationMs: 0,
+
+          durationSec: 0,
+
+          observations: 1,
+
+          maxUsd:
+            cluster.usd,
+
+          previousUsd: 0,
+
+          changeUsd:
+            cluster.usd,
+
+          status: "NEW",
+
+          persistent: false,
+
+          persistentEventSent: false,
+
+          confluenceEventSent: false,
+
+          strengthEventAt: 0,
+
+          removedEventSent: false,
+
+          removed: false
+        });
+      }
     }
 
-  }
+    /*
+       Detect meaningful removals.
+    */
 
-
-  /* ----------------------------------------------------------
-     DETECT REMOVED CLUSTERS
-  ---------------------------------------------------------- */
-
-  for (
-    const [
-      id,
-      item
-    ] of map.entries()
-  ) {
-
-    if (
-      matchedIds.has(id) ||
-      item.removed
+    for (
+      let i = 0;
+      i < previous.length;
+      i++
     ) {
 
-      continue;
+      if (
+        matched.has(i)
+      ) {
+        continue;
+      }
 
+      const old =
+        previous[i];
+
+      const lifetime =
+        timestamp -
+        (
+          old.firstSeen ||
+          timestamp
+        );
+
+      const observations =
+        old.observations || 0;
+
+      const meaningfulRemoval =
+        observations >=
+          SETTINGS.persistenceRemovedMinObservations ||
+        lifetime >=
+          SETTINGS.persistenceRemovedMinLifetimeMs;
+
+      if (
+        meaningfulRemoval &&
+        !old.removedEventSent
+      ) {
+
+        addLiquidityEvent({
+
+          type: "REMOVED",
+
+          side:
+            old.side,
+
+          midpoint:
+            old.midpoint,
+
+          priceLow:
+            old.priceLow,
+
+          priceHigh:
+            old.priceHigh,
+
+          usd:
+            old.usd,
+
+          lifetimeSec:
+            Math.floor(
+              lifetime / 1000
+            ),
+
+          observations,
+
+          persistent:
+            !!old.persistent
+        });
+
+        old.removedEventSent =
+          true;
+      }
+
+      /*
+         Keep removed entries briefly for diagnostics,
+         but never keep one-observation noise.
+      */
+
+      if (
+        meaningfulRemoval
+      ) {
+
+        state.persistence.removed.push({
+
+          ...old,
+
+          removed: true,
+
+          removedAt:
+            timestamp,
+
+          lifetimeMs:
+            lifetime,
+
+          lifetimeSec:
+            Math.floor(
+              lifetime / 1000
+            )
+        });
+      }
     }
 
-
-    const lifetime =
-      now() -
-      new Date(
-        item.firstSeen
-      ).getTime();
-
-
-    const meaningfulRemoval =
-      item.observations >=
-        SETTINGS.persistenceMinObservationsForRemoval ||
-      lifetime >=
-        SETTINGS.persistenceMinLifetimeMs;
-
-
-    item.removed = true;
-
-    item.persistent = false;
-
-    item.currentUsd = 0;
-
-    item.usd = 0;
-
-    item.previousUsd =
-      item.previousUsd ||
-      item.maxUsd;
-
-
-    item.changeUsd =
-      -item.previousUsd;
-
-
-    item.durationMs =
-      lifetime;
-
-
-    item.durationSec =
-      Math.floor(
-        lifetime / 1000
-      );
-
-
-    item.status =
-      "REMOVED";
-
-
-    item.lastSeen =
-      new Date(
-        now()
-      ).toISOString();
-
-
-    /* --------------------------------------------------------
-       Only meaningful removals become events.
-    -------------------------------------------------------- */
-
-    if (
-      meaningfulRemoval &&
-      !item.removedEventSent &&
-      item.maxUsd >=
-        SETTINGS.eventMinPersistentUsd
-    ) {
-
-      item.removedEventSent =
-        true;
-
-
-      pushLiquidityEvent({
-
-        key:
-          `REMOVED|${id}|${now()}`,
-
-        type:
-          "REMOVED",
-
-        time:
-          now(),
-
-        side:
-          eventSide(side),
-
-        bookPriceLow:
-          item.priceLow,
-
-        bookPriceHigh:
-          item.priceHigh,
-
-        currentUsd: 0,
-
-        maxUsd:
-          item.maxUsd,
-
-        durationMs:
-          item.durationMs,
-
-        lifetimeSec:
-          item.durationSec,
-
-        observations:
-          item.observations,
-
-        structuralLevel:
-          item.structuralLevel,
-
-        structuralZoneLow:
-          item.structuralZoneLow,
-
-        structuralZoneHigh:
-          item.structuralZoneHigh,
-
-        timeframes:
-          item.structuralTimeframes,
-
-        message:
-          "LIQUIDITY REMOVED"
-
-      });
-
-    }
-
+    state.persistence[
+      side === "bid"
+        ? "bids"
+        : "asks"
+    ] = next;
   }
 
+  /*
+     Cleanup removed records.
+  */
 
-  /* ----------------------------------------------------------
-     Remove very old persistence records.
-  ---------------------------------------------------------- */
-
-  for (
-    const [
-      id,
-      item
-    ] of map.entries()
-  ) {
-
-    const age =
-      now() -
-      new Date(
-        item.lastSeen
-      ).getTime();
-
-
-    if (
-      item.removed &&
-      age >
+  state.persistence.removed =
+    state.persistence.removed
+      .filter(item =>
+        timestamp -
+        (
+          item.removedAt ||
+          timestamp
+        ) <
         SETTINGS.persistenceMaxAgeMs
-    ) {
-
-      map.delete(
-        id
       );
 
-    }
-
-  }
-
-}
-
-
-/* ============================================================
-   UPDATE PERSISTENCE
-============================================================ */
-
-function updatePersistence() {
-
-  const book =
-    getBook();
-
-
-  const enrichedBids =
-    enrichBookClusters(
-      book.bids
-    );
-
-
-  const enrichedAsks =
-    enrichBookClusters(
-      book.asks
-    );
-
-
-  updatePersistenceSide(
-    "bid",
-    enrichedBids
-  );
-
-
-  updatePersistenceSide(
-    "ask",
-    enrichedAsks
-  );
-
-
-  persistence.lastPollAt =
+  state.updatedAt =
     new Date().toISOString();
-
 }
 
 
 /* ============================================================
-   PERSISTENT LIQUIDITY OUTPUT
-============================================================ */
-
-function getPersistentLiquidity() {
-
-  const collect =
-    map =>
-      [...map.values()]
-        .filter(
-          item =>
-            !item.removed ||
-            item.maxUsd >=
-              SETTINGS.eventMinPersistentUsd
-        )
-        .sort(
-          (a, b) =>
-            b.maxUsd -
-            a.maxUsd
-        );
-
-
-  return {
-
-    bids:
-      collect(
-        persistence.bids
-      ),
-
-    asks:
-      collect(
-        persistence.asks
-      )
-
-  };
-
-}
-
-
-/* ============================================================
-   SWEEP DETECTION
-============================================================ */
+   TRUE LIQUIDITY SWEEPS
+   ============================================================ */
 
 function detectCandleSweeps(
   tf,
@@ -3573,331 +3151,204 @@ function detectCandleSweeps(
 
   if (
     !candle ||
-    !candle.close
+    !Number.isFinite(
+      candle.high
+    ) ||
+    !Number.isFinite(
+      candle.low
+    )
   ) {
 
     return;
-
   }
 
-
-  const cutoff =
+  const candleAge =
     now() -
-    SETTINGS.sweepLookbackMs;
+    candle.closeTime;
 
-
-  for (
-    const level of structure.levels
+  if (
+    candleAge >
+    SETTINGS.sweepLookbackMs
   ) {
 
-    if (
-      !isMajorLevel(level)
-    ) {
+    return;
+  }
 
-      continue;
+  /*
+     IMPORTANT:
+     use structure existing BEFORE the rebuild.
+  */
 
-    }
+  const majorLevels =
+    state.structure.majorLevels
+      .slice();
 
+  for (
+    const level of majorLevels
+  ) {
+
+    /*
+       BUY-SIDE LIQUIDITY SWEEP
+
+       Price trades above the complete
+       structural zone and closes back below it.
+    */
 
     if (
       level.side === "BSL"
     ) {
 
-      if (
-        candle.high <=
-        level.priceHigh
-      ) {
+      const penetration =
+        level.price *
+        SETTINGS.sweepMinPenetrationPct;
 
-        continue;
+      const swept =
+        candle.high >=
+        level.priceHigh +
+        penetration;
 
-      }
-
-
-      const penetrationPct =
-        (
-          candle.high -
-          level.priceHigh
-        ) /
+      const reclaimed =
+        candle.close <
         level.priceHigh;
 
-
       if (
-        penetrationPct <
-        SETTINGS.sweepMinPenetrationPct
+        swept &&
+        reclaimed
       ) {
 
-        continue;
+        registerSweep({
 
+          side: "BSL",
+
+          level,
+
+          tf,
+
+          candle,
+
+          sweepPrice:
+            candle.high
+        });
       }
-
-
-      if (
-        candle.close >=
-        level.priceHigh
-      ) {
-
-        continue;
-
-      }
-
-
-      if (
-        candle.openTime <
-        cutoff
-      ) {
-
-        continue;
-
-      }
-
-
-      addSweep({
-
-        side: "BSL",
-
-        level:
-          level.price,
-
-        zoneLow:
-          level.priceLow,
-
-        zoneHigh:
-          level.priceHigh,
-
-        sweepPrice:
-          candle.high,
-
-        timeframe: tf,
-
-        candleTime:
-          candle.openTime,
-
-        status:
-          "SWEPT",
-
-        reclaimed:
-          true,
-
-        detectedAt:
-          now(),
-
-        timeframes:
-          level.timeframes
-
-      });
-
     }
 
+    /*
+       SELL-SIDE LIQUIDITY SWEEP
+    */
 
     if (
       level.side === "SSL"
     ) {
 
-      if (
-        candle.low >=
-        level.priceLow
-      ) {
+      const penetration =
+        level.price *
+        SETTINGS.sweepMinPenetrationPct;
 
-        continue;
+      const swept =
+        candle.low <=
+        level.priceLow -
+        penetration;
 
-      }
-
-
-      const penetrationPct =
-        (
-          level.priceLow -
-          candle.low
-        ) /
+      const reclaimed =
+        candle.close >
         level.priceLow;
 
-
       if (
-        penetrationPct <
-        SETTINGS.sweepMinPenetrationPct
+        swept &&
+        reclaimed
       ) {
 
-        continue;
+        registerSweep({
 
+          side: "SSL",
+
+          level,
+
+          tf,
+
+          candle,
+
+          sweepPrice:
+            candle.low
+        });
       }
-
-
-      if (
-        candle.close <=
-        level.priceLow
-      ) {
-
-        continue;
-
-      }
-
-
-      if (
-        candle.openTime <
-        cutoff
-      ) {
-
-        continue;
-
-      }
-
-
-      addSweep({
-
-        side: "SSL",
-
-        level:
-          level.price,
-
-        zoneLow:
-          level.priceLow,
-
-        zoneHigh:
-          level.priceHigh,
-
-        sweepPrice:
-          candle.low,
-
-        timeframe: tf,
-
-        candleTime:
-          candle.openTime,
-
-        status:
-          "SWEPT",
-
-        reclaimed:
-          true,
-
-        detectedAt:
-          now(),
-
-        timeframes:
-          level.timeframes
-
-      });
-
     }
-
   }
-
 }
 
 
 /* ============================================================
-   ADD SWEEP
-============================================================ */
+   REGISTER SWEEP
+   ============================================================ */
 
-function addSweep(sweep) {
-
-  const key =
-    `${sweep.side}|${Math.round(
-      sweep.level
-    )}|${sweep.candleTime}`;
-
+function registerSweep({
+  side,
+  level,
+  tf,
+  candle,
+  sweepPrice
+}) {
 
   const existing =
-    sweepEvents.find(
-      event =>
-        event.key === key
+    state.recentSweeps.find(
+      item =>
+        item.side === side &&
+        item.level === level.price &&
+        item.timeframe === tf &&
+        item.candleTime === candle.time
     );
 
-
   if (existing) {
-
-    if (
-      !existing.timeframes.includes(
-        sweep.timeframe
-      )
-    ) {
-
-      existing.timeframes.push(
-        sweep.timeframe
-      );
-
-    }
-
     return;
-
   }
 
+  const sweep = {
 
-  const item = {
+    side,
 
-    key,
+    level:
+      level.price,
 
-    ...sweep
+    zoneLow:
+      level.priceLow,
 
-  };
+    zoneHigh:
+      level.priceHigh,
 
+    sweepPrice,
 
-  sweepEvents.unshift(
-    item
-  );
+    timeframe:
+      tf,
 
+    candleTime:
+      candle.time,
 
-  while (
-    sweepEvents.length >
-    SETTINGS.eventMax
-  ) {
+    status: "SWEPT",
 
-    sweepEvents.pop();
+    reclaimed: true,
 
-  }
-
-
-  pushLiquidityEvent({
-
-    key:
-      `SWEEP|${key}`,
-
-    type:
-      "SWEEP",
-
-    time:
-      now(),
-
-    side:
-      sweep.side,
-
-    bookPriceLow:
-      sweep.zoneLow,
-
-    bookPriceHigh:
-      sweep.zoneHigh,
-
-    currentUsd: 0,
-
-    maxUsd: 0,
-
-    durationMs: 0,
-
-    lifetimeSec: 0,
-
-    observations: 1,
-
-    structuralLevel:
-      sweep.level,
-
-    structuralZoneLow:
-      sweep.zoneLow,
-
-    structuralZoneHigh:
-      sweep.zoneHigh,
+    detectedAt:
+      new Date().toISOString(),
 
     timeframes:
-      sweep.timeframes,
+      level.timeframes
+  };
 
-    message:
-      `${sweep.side} LIQUIDITY SWEPT AND RECLAIMED`
+  state.recentSweeps.unshift(
+    sweep
+  );
 
-  });
-
+  state.recentSweeps =
+    state.recentSweeps.slice(
+      0,
+      50
+    );
 }
 
 
 /* ============================================================
-   CANDLE UPDATE
-============================================================ */
+   LIVE CANDLE UPDATE
+   ============================================================ */
 
 function upsertCandle(
   tf,
@@ -3905,172 +3356,138 @@ function upsertCandle(
 ) {
 
   if (
-    !candles[tf]
+    !state.candles[tf]
   ) {
-
-    candles[tf] = [];
-
+    return;
   }
 
+  const candles =
+    state.candles[tf];
 
-  const data =
-    candles[tf];
-
-
-  const existingIndex =
-    data.findIndex(
-      item =>
-        item.openTime ===
-        candle.openTime
+  const index =
+    candles.findIndex(
+      c =>
+        c.time === candle.time
     );
 
+  if (index >= 0) {
 
-  if (
-    existingIndex >= 0
-  ) {
-
-    data[
-      existingIndex
-    ] = candle;
+    candles[index] =
+      candle;
 
   } else {
 
-    data.push(
+    candles.push(
+      candle
+    );
+  }
+
+  const max =
+    STRUCTURE[tf].candles +
+    20;
+
+  if (
+    candles.length >
+    max
+  ) {
+
+    state.candles[tf] =
+      candles.slice(
+        -max
+      );
+  }
+
+  /*
+     Only detect sweeps on closed candles.
+  */
+
+  if (
+    candle.closed
+  ) {
+
+    detectCandleSweeps(
+      tf,
       candle
     );
 
+    rebuildStructure();
   }
-
-
-  while (
-    data.length >
-    STRUCTURE[tf].candles
-  ) {
-
-    data.shift();
-
-  }
-
 }
 
 
 /* ============================================================
-   PROCESS CLOSED CANDLE
-============================================================ */
+   FUTURES KLINE WEBSOCKET
+   ============================================================ */
 
-function processClosedCandle(
-  tf,
-  candle
-) {
-
-  /* ----------------------------------------------------------
-     IMPORTANT:
-     Detect sweep BEFORE rebuilding structure.
-     This means the sweep is checked against the previously
-     accepted/stable structure.
-  ---------------------------------------------------------- */
-
-  detectCandleSweeps(
-    tf,
-    candle
-  );
-
-
-  upsertCandle(
-    tf,
-    candle
-  );
-
-
-  rebuildStructure(
-    `closed_${tf}`
-  );
-
-}
-
-
-/* ============================================================
-   KLINE SOCKET
-============================================================ */
-
-function connectKlineSocket() {
+function connectKlineWs() {
 
   if (
-    klineSocket
+    state.klineWs &&
+    (
+      state.klineWs.readyState ===
+      WebSocket.OPEN ||
+      state.klineWs.readyState ===
+      WebSocket.CONNECTING
+    )
   ) {
 
-    try {
-      klineSocket.close();
-    } catch {}
-
+    return;
   }
 
-
-  klineSocket =
+  const ws =
     new WebSocket(
       KLINE_WS
     );
 
+  state.klineWs =
+    ws;
 
-  klineSocket.on(
-    "open",
-    () => {
+  ws.on("open", () => {
 
-      console.log(
-        "[KLINE] connected"
-      );
+    state.klineConnected =
+      true;
 
-    }
-  );
+    console.log(
+      "Futures kline websocket connected"
+    );
+  });
 
+  ws.on("message", raw => {
 
-  klineSocket.on(
-    "message",
-    raw => {
+    try {
 
-      try {
+      const msg =
+        JSON.parse(
+          raw.toString()
+        );
 
-        const packet =
-          JSON.parse(
-            raw.toString()
-          );
+      const data =
+        msg.data;
 
+      if (
+        !data ||
+        data.e !== "kline"
+      ) {
+        return;
+      }
 
-        const payload =
-          packet.data;
+      const k =
+        data.k;
 
+      const tf =
+        k.i;
 
-        if (
-          !payload ||
-          payload.e !==
-            "kline"
-        ) {
+      if (
+        !STRUCTURE[tf]
+      ) {
+        return;
+      }
 
-          return;
+      upsertCandle(
+        tf,
+        {
 
-        }
-
-
-        const k =
-          payload.k;
-
-
-        const tf =
-          k.i;
-
-
-        if (
-          !STRUCTURE[tf]
-        ) {
-
-          return;
-
-        }
-
-
-        const candle = {
-
-          openTime:
+          time:
             Number(k.t),
 
           open:
@@ -4089,1334 +3506,1073 @@ function connectKlineSocket() {
             Number(k.v),
 
           closeTime:
-            Number(k.T)
+            Number(k.T),
 
-        };
-
-
-        upsertCandle(
-          tf,
-          candle
-        );
-
-
-        if (
-          k.x
-        ) {
-
-          processClosedCandle(
-            tf,
-            candle
-          );
-
+          closed:
+            !!k.x
         }
-
-      } catch (error) {
-
-        state.lastError =
-          `Kline parse: ${error.message}`;
-
-      }
-
-    }
-  );
-
-
-  klineSocket.on(
-    "close",
-    () => {
-
-      console.log(
-        "[KLINE] disconnected"
       );
 
+      updateCurrentPrice();
 
-      setTimeout(
-        connectKlineSocket,
-        3000
-      );
-
-    }
-  );
-
-
-  klineSocket.on(
-    "error",
-    error => {
+    } catch (error) {
 
       state.lastError =
-        `Kline WS: ${error.message}`;
-
-      console.error(
-        "[KLINE]",
-        error.message
-      );
-
+        `Kline parse: ${error.message}`;
     }
-  );
+  });
 
-}
+  ws.on("error", error => {
 
+    state.lastError =
+      `Kline WS: ${error.message}`;
 
-/* ============================================================
-   SNAPSHOT REQUEST
-============================================================ */
-
-function requestDepthSnapshot() {
-
-  if (
-    state.depthSnapshotPending
-  ) {
-
-    return;
-
-  }
-
-
-  state.depthSnapshotPending =
-    true;
-
-
-  state.depthSnapshotRequests++;
-
-
-  const requestId =
-    `depth-${now()}-${Math.random()
-      .toString(16)
-      .slice(2)}`;
-
-
-  const ws =
-    new WebSocket(
-      WS_API
+    console.error(
+      "Kline websocket error:",
+      error.message
     );
+  });
 
+  ws.on("close", () => {
 
-  ws.on(
-    "open",
-    () => {
-
-      const request = {
-
-        id: requestId,
-
-        method: "depth",
-
-        params: {
-
-          symbol: SYMBOL,
-
-          limit: 1000
-
-        }
-
-      };
-
-
-      ws.send(
-        JSON.stringify(
-          request
-        )
-      );
-
-    }
-  );
-
-
-  ws.on(
-    "message",
-    raw => {
-
-      try {
-
-        const data =
-          JSON.parse(
-            raw.toString()
-          );
-
-
-        if (
-          data.status ===
-          429
-        ) {
-
-          state.depthSnapshot429s++;
-
-          throw new Error(
-            "Snapshot HTTP 429"
-          );
-
-        }
-
-
-        if (
-          data.status !==
-          200 ||
-          !data.result
-        ) {
-
-          throw new Error(
-            `Snapshot failed: ${
-              JSON.stringify(
-                data
-              )
-            }`
-          );
-
-        }
-
-
-        applySnapshot(
-          data.result
-        );
-
-
-        state.depthSnapshotPending =
-          false;
-
-
-        state.lastSnapshotAt =
-          new Date().toISOString();
-
-
-        try {
-          ws.close();
-        } catch {}
-
-      } catch (error) {
-
-        state.depthSnapshotPending =
-          false;
-
-        state.lastError =
-          error.message;
-
-        try {
-          ws.close();
-        } catch {}
-
-      }
-
-    }
-  );
-
-
-  ws.on(
-    "error",
-    error => {
-
-      state.depthSnapshotPending =
-        false;
-
-      state.lastError =
-        `Snapshot WS: ${error.message}`;
-
-      try {
-        ws.close();
-      } catch {}
-
-    }
-  );
-
-}
-
-
-/* ============================================================
-   APPLY SNAPSHOT
-============================================================ */
-
-function applySnapshot(
-  snapshot
-) {
-
-  const snapshotId =
-    Number(
-      snapshot.lastUpdateId
-    );
-
-
-  if (
-    !Number.isFinite(
-      snapshotId
-    )
-  ) {
-
-    throw new Error(
-      "Invalid snapshot update ID"
-    );
-
-  }
-
-
-  const newBids =
-    new Map();
-
-
-  const newAsks =
-    new Map();
-
-
-  for (
-    const row of
-    snapshot.bids || []
-  ) {
-
-    const price =
-      Number(row[0]);
-
-    const qty =
-      Number(row[1]);
-
-
-    if (
-      qty > 0
-    ) {
-
-      newBids.set(
-        price,
-        qty
-      );
-
-    }
-
-  }
-
-
-  for (
-    const row of
-    snapshot.asks || []
-  ) {
-
-    const price =
-      Number(row[0]);
-
-    const qty =
-      Number(row[1]);
-
-
-    if (
-      qty > 0
-    ) {
-
-      newAsks.set(
-        price,
-        qty
-      );
-
-    }
-
-  }
-
-
-  state.bids =
-    newBids;
-
-  state.asks =
-    newAsks;
-
-
-  state.depthLastUpdateId =
-    snapshotId;
-
-
-  state.depthInitialized =
-    false;
-
-
-  state.depthBridgeAttempts++;
-
-
-  /* ----------------------------------------------------------
-     Find the event that bridges snapshot to stream.
-  ---------------------------------------------------------- */
-
-  const required =
-    snapshotId + 1;
-
-
-  let bridgeIndex = -1;
-
-
-  for (
-    let i = 0;
-    i <
-      state.depthPendingEvents.length;
-    i++
-  ) {
-
-    const event =
-      state.depthPendingEvents[i];
-
-
-    if (
-      event.U <= required &&
-      event.u >= required
-    ) {
-
-      bridgeIndex = i;
-
-      break;
-
-    }
-
-  }
-
-
-  if (
-    bridgeIndex < 0
-  ) {
-
-    if (
-      state.depthPendingEvents.length
-    ) {
-
-      const latest =
-        state.depthPendingEvents[
-          state.depthPendingEvents.length - 1
-        ];
-
-
-      if (
-        latest.u <
-        required
-      ) {
-
-        state.depthSnapshotPending =
-          false;
-
-        setTimeout(
-          requestDepthSnapshot,
-          250
-        );
-
-        return;
-
-      }
-
-    }
-
-
-    state.depthSnapshotPending =
+    state.klineConnected =
       false;
 
-    return;
-
-  }
-
-
-  state.depthBridgeFound++;
-
-
-  for (
-    let i = bridgeIndex;
-    i <
-      state.depthPendingEvents.length;
-    i++
-  ) {
-
-    applyDepthEvent(
-      state.depthPendingEvents[i],
-      true
+    console.log(
+      "Kline websocket closed"
     );
 
-  }
-
-
-  state.depthPendingEvents =
-    [];
-
-
-  state.depthInitialized =
-    true;
-
-
-  state.depthSnapshotPending =
-    false;
-
-
-  updatePriceFromBook();
-
+    setTimeout(
+      connectKlineWs,
+      SETTINGS.klineReconnectMs
+    );
+  });
 }
 
 
 /* ============================================================
    APPLY DEPTH EVENT
-============================================================ */
+   ============================================================ */
 
-function applyDepthEvent(
-  event,
-  bridging = false
-) {
+function applyDepthEvent(event) {
 
-  if (
-    !state.depthInitialized &&
-    !bridging
-  ) {
-
-    state.depthPendingEvents.push(
-      event
-    );
-
-    return;
-
+  if (!event) {
+    return false;
   }
 
+  const U =
+    Number(event.U);
 
-  const previous =
-    state.depthLastUpdateId;
-
+  const u =
+    Number(event.u);
 
   if (
-    !bridging &&
-    previous &&
-    event.U >
-      previous + 1
+    !Number.isFinite(U) ||
+    !Number.isFinite(u)
   ) {
-
-    state.depthSequenceGaps++;
-
-    state.depthResyncs++;
-
-    state.depthInitialized =
-      false;
-
-
-    state.depthPendingEvents =
-      [];
-
-
-    requestDepthSnapshot();
-
-    return;
-
+    return false;
   }
 
+  /*
+     Once synchronized, this event must either:
+       U <= lastUpdateId + 1 <= u
+
+     or it is a genuine gap.
+  */
+
+  if (
+    state.initialized
+  ) {
+
+    const expected =
+      state.lastUpdateId + 1;
+
+    if (
+      u < expected
+    ) {
+
+      /*
+         Old duplicate event.
+      */
+
+      return true;
+    }
+
+    if (
+      U > expected
+    ) {
+
+      state.sequenceGaps++;
+
+      console.warn(
+        `Depth sequence gap: expected ${expected}, got U=${U}`
+      );
+
+      state.initialized =
+        false;
+
+      state.waitingForBridge =
+        true;
+
+      requestSnapshot(
+        true
+      );
+
+      return false;
+    }
+  }
 
   for (
-    const row of
+    const item of
     event.b || []
   ) {
 
     const price =
-      Number(row[0]);
+      Number(item[0]);
 
-    const qty =
-      Number(row[1]);
-
+    const quantity =
+      Number(item[1]);
 
     if (
-      qty === 0
+      !Number.isFinite(price) ||
+      !Number.isFinite(quantity)
+    ) {
+      continue;
+    }
+
+    if (
+      quantity === 0
     ) {
 
       state.bids.delete(
-        price
+        String(price)
       );
 
     } else {
 
       state.bids.set(
-        price,
-        qty
+        String(price),
+        quantity
       );
-
     }
-
   }
 
-
   for (
-    const row of
+    const item of
     event.a || []
   ) {
 
     const price =
-      Number(row[0]);
+      Number(item[0]);
 
-    const qty =
-      Number(row[1]);
-
+    const quantity =
+      Number(item[1]);
 
     if (
-      qty === 0
+      !Number.isFinite(price) ||
+      !Number.isFinite(quantity)
+    ) {
+      continue;
+    }
+
+    if (
+      quantity === 0
     ) {
 
       state.asks.delete(
-        price
+        String(price)
       );
 
     } else {
 
       state.asks.set(
-        price,
-        qty
+        String(price),
+        quantity
       );
-
     }
-
   }
 
+  state.lastUpdateId =
+    u;
 
-  state.depthLastUpdateId =
-    event.u;
+  updateCurrentPrice();
 
-
-  state.lastDepthEventAt =
+  state.updatedAt =
     new Date().toISOString();
 
-
-  state.lastBookUpdateAt =
-    state.lastDepthEventAt;
-
-
-  updatePriceFromBook();
-
+  return true;
 }
 
 
 /* ============================================================
-   PRICE FROM BOOK
-============================================================ */
+   DEPTH SNAPSHOT REQUEST
+   ============================================================ */
 
-function updatePriceFromBook() {
+function requestSnapshot(force = false) {
+
+  const timestamp =
+    now();
 
   if (
-    !state.bids.size ||
-    !state.asks.size
+    state.snapshotInFlight
+  ) {
+    return;
+  }
+
+  if (
+    !force &&
+    timestamp -
+      state.lastSnapshotRequestAt <
+      SETTINGS.snapshotCooldownMs
   ) {
 
     return;
-
   }
 
+  state.lastSnapshotRequestAt =
+    timestamp;
 
-  let bestBid = 0;
+  state.snapshotPending =
+    true;
 
-  let bestAsk = Infinity;
+  state.waitingForBridge =
+    true;
 
+  state.snapshotInFlight =
+    true;
 
-  for (
-    const price of
-    state.bids.keys()
-  ) {
-
-    if (
-      price >
-      bestBid
-    ) {
-
-      bestBid =
-        price;
-
-    }
-
-  }
-
-
-  for (
-    const price of
-    state.asks.keys()
-  ) {
-
-    if (
-      price <
-      bestAsk
-    ) {
-
-      bestAsk =
-        price;
-
-    }
-
-  }
-
+  state.snapshotRequests++;
 
   if (
-    bestBid > 0 &&
-    Number.isFinite(bestAsk)
+    !state.snapshotWs ||
+    state.snapshotWs.readyState !==
+    WebSocket.OPEN
   ) {
 
-    state.currentPrice =
-      (
-        bestBid +
-        bestAsk
-      ) / 2;
+    connectSnapshotWs();
 
-    state.priceSource =
-      "futures_orderbook_mid";
+    state.snapshotInFlight =
+      false;
 
+    return;
   }
 
+  const id =
+    `depth-${timestamp}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+
+  const request = {
+
+    id,
+
+    method: "depth",
+
+    params: {
+
+      symbol:
+        SYMBOL,
+
+      limit: 1000
+    }
+  };
+
+  try {
+
+    state.snapshotWs.send(
+      JSON.stringify(
+        request
+      )
+    );
+
+  } catch (error) {
+
+    state.lastError =
+      `Snapshot send: ${error.message}`;
+
+    state.snapshotInFlight =
+      false;
+  }
 }
 
 
 /* ============================================================
-   DEPTH SOCKET
-============================================================ */
+   PROCESS SNAPSHOT
+   ============================================================ */
 
-function connectDepthSocket() {
+function processSnapshot(result) {
+
+  state.snapshotInFlight =
+    false;
 
   if (
-    depthSocket
+    !result ||
+    !Number.isFinite(
+      Number(
+        result.lastUpdateId
+      )
+    )
   ) {
 
-    try {
-      depthSocket.close();
-    } catch {}
+    state.lastError =
+      "Invalid Futures depth snapshot";
 
+    return;
   }
 
+  const snapshotId =
+    Number(
+      result.lastUpdateId
+    );
 
-  depthSocket =
+  const bids =
+    result.bids || [];
+
+  const asks =
+    result.asks || [];
+
+  /*
+     IMPORTANT:
+     Do NOT apply the snapshot until we have found
+     a buffered event bridging snapshotId + 1.
+
+     This prevents a stale snapshot from creating
+     a false synchronized book.
+  */
+
+  state.bridgeAttempts++;
+
+  const bridgeIndex =
+    state.pendingDepthEvents.findIndex(
+      event => {
+
+        const U =
+          Number(event.U);
+
+        const u =
+          Number(event.u);
+
+        return (
+          U <= snapshotId + 1 &&
+          u >= snapshotId + 1
+        );
+      }
+    );
+
+  if (
+    bridgeIndex < 0
+  ) {
+
+    /*
+       Snapshot arrived before the matching
+       buffered event.
+
+       Keep buffering and request another snapshot
+       later rather than pretending synchronization
+       succeeded.
+    */
+
+    state.waitingForBridge =
+      true;
+
+    state.snapshotPending =
+      true;
+
+    state.resyncs++;
+
+    console.warn(
+      `Snapshot ${snapshotId}: bridge not found`
+    );
+
+    return;
+  }
+
+  state.bridgeFound++;
+
+  /*
+     Replace local book with snapshot.
+  */
+
+  state.bids.clear();
+  state.asks.clear();
+
+  for (
+    const item of bids
+  ) {
+
+    const price =
+      Number(item[0]);
+
+    const quantity =
+      Number(item[1]);
+
+    if (
+      Number.isFinite(price) &&
+      Number.isFinite(quantity) &&
+      quantity > 0
+    ) {
+
+      state.bids.set(
+        String(price),
+        quantity
+      );
+    }
+  }
+
+  for (
+    const item of asks
+  ) {
+
+    const price =
+      Number(item[0]);
+
+    const quantity =
+      Number(item[1]);
+
+    if (
+      Number.isFinite(price) &&
+      Number.isFinite(quantity) &&
+      quantity > 0
+    ) {
+
+      state.asks.set(
+        String(price),
+        quantity
+      );
+    }
+  }
+
+  /*
+     Apply bridge event.
+  */
+
+  const bridge =
+    state.pendingDepthEvents[
+      bridgeIndex
+    ];
+
+  applyDepthEventDirect(
+    bridge
+  );
+
+  /*
+     Apply all events after bridge.
+  */
+
+  const remaining =
+    state.pendingDepthEvents
+      .slice(
+        bridgeIndex + 1
+      );
+
+  state.pendingDepthEvents =
+    [];
+
+  state.lastUpdateId =
+    Number(bridge.u);
+
+  for (
+    const event of remaining
+  ) {
+
+    const U =
+      Number(event.U);
+
+    const u =
+      Number(event.u);
+
+    const expected =
+      state.lastUpdateId + 1;
+
+    if (
+      u < expected
+    ) {
+
+      continue;
+    }
+
+    if (
+      U > expected
+    ) {
+
+      /*
+         Gap occurred while replaying.
+
+         Keep current book temporarily but
+         force a clean resync.
+      */
+
+      state.sequenceGaps++;
+
+      state.initialized =
+        false;
+
+      state.waitingForBridge =
+        true;
+
+      state.resyncs++;
+
+      console.warn(
+        `Gap during snapshot replay: expected ${expected}, U=${U}`
+      );
+
+      requestSnapshot(
+        true
+      );
+
+      return;
+    }
+
+    applyDepthEventDirect(
+      event
+    );
+  }
+
+  state.initialized =
+    true;
+
+  state.waitingForBridge =
+    false;
+
+  state.snapshotPending =
+    false;
+
+  state.lastUpdateId =
+    state.lastUpdateId ||
+    snapshotId;
+
+  updateCurrentPrice();
+
+  state.updatedAt =
+    new Date().toISOString();
+
+  console.log(
+    `Depth synchronized at update ${state.lastUpdateId}`
+  );
+}
+
+
+/* ============================================================
+   DIRECT DEPTH APPLY
+   ============================================================ */
+
+function applyDepthEventDirect(event) {
+
+  for (
+    const item of
+    event.b || []
+  ) {
+
+    const price =
+      Number(item[0]);
+
+    const quantity =
+      Number(item[1]);
+
+    if (
+      !Number.isFinite(price) ||
+      !Number.isFinite(quantity)
+    ) {
+      continue;
+    }
+
+    if (
+      quantity === 0
+    ) {
+
+      state.bids.delete(
+        String(price)
+      );
+
+    } else {
+
+      state.bids.set(
+        String(price),
+        quantity
+      );
+    }
+  }
+
+  for (
+    const item of
+    event.a || []
+  ) {
+
+    const price =
+      Number(item[0]);
+
+    const quantity =
+      Number(item[1]);
+
+    if (
+      !Number.isFinite(price) ||
+      !Number.isFinite(quantity)
+    ) {
+      continue;
+    }
+
+    if (
+      quantity === 0
+    ) {
+
+      state.asks.delete(
+        String(price)
+      );
+
+    } else {
+
+      state.asks.set(
+        String(price),
+        quantity
+      );
+    }
+  }
+
+  state.lastUpdateId =
+    Number(event.u);
+
+  updateCurrentPrice();
+}
+
+
+/* ============================================================
+   DEPTH WEBSOCKET
+   ============================================================ */
+
+function connectDepthWs() {
+
+  if (
+    state.depthWs &&
+    (
+      state.depthWs.readyState ===
+      WebSocket.OPEN ||
+      state.depthWs.readyState ===
+      WebSocket.CONNECTING
+    )
+  ) {
+
+    return;
+  }
+
+  const ws =
     new WebSocket(
       DEPTH_WS
     );
 
+  state.depthWs =
+    ws;
 
-  depthSocket.on(
-    "open",
-    () => {
+  ws.on("open", () => {
 
-      console.log(
-        "[DEPTH] connected"
-      );
+    state.depthConnected =
+      true;
 
+    console.log(
+      "Futures depth websocket connected"
+    );
 
-      state.depthConnected =
-        true;
+    /*
+       Start buffering immediately.
 
+       Snapshot synchronization will be requested
+       after the stream is alive.
+    */
 
-      state.depthInitialized =
-        false;
+    requestSnapshot(
+      true
+    );
+  });
 
+  ws.on("message", raw => {
 
-      state.depthPendingEvents =
-        [];
+    try {
 
+      const event =
+        JSON.parse(
+          raw.toString()
+        );
 
-      requestDepthSnapshot();
+      if (
+        !event ||
+        event.e !== "depthUpdate"
+      ) {
+        return;
+      }
 
-    }
-  );
+      /*
+         ALWAYS buffer until synchronized.
 
+         This is the key difference from the previous
+         implementation.
+      */
 
-  depthSocket.on(
-    "message",
-    raw => {
+      if (
+        !state.initialized ||
+        state.waitingForBridge ||
+        state.snapshotPending
+      ) {
 
-      try {
-
-        const data =
-          JSON.parse(
-            raw.toString()
-          );
-
-
-        if (
-          !data ||
-          !data.e
-        ) {
-
-          return;
-
-        }
-
-
-        const event = {
-
-          U:
-            Number(data.U),
-
-          u:
-            Number(data.u),
-
-          b:
-            data.b || [],
-
-          a:
-            data.a || []
-
-        };
-
-
-        if (
-          !state.depthInitialized
-        ) {
-
-          state.depthPendingEvents.push(
-            event
-          );
-
-
-          if (
-            state.depthPendingEvents.length >
-            5000
-          ) {
-
-            state.depthPendingEvents =
-              state.depthPendingEvents.slice(
-                -2500
-              );
-
-          }
-
-          return;
-
-        }
-
-
-        applyDepthEvent(
+        state.pendingDepthEvents.push(
           event
         );
 
-      } catch (error) {
+        if (
+          state.pendingDepthEvents.length >
+          SETTINGS.maxPendingDepthEvents
+        ) {
 
-        state.lastError =
-          `Depth parse: ${error.message}`;
+          state.pendingDepthEvents =
+            state.pendingDepthEvents.slice(
+              -SETTINGS.maxPendingDepthEvents
+            );
+        }
 
+        if (
+          !state.snapshotInFlight
+        ) {
+
+          requestSnapshot();
+        }
+
+        return;
       }
 
-    }
-  );
-
-
-  depthSocket.on(
-    "close",
-    () => {
-
-      console.log(
-        "[DEPTH] disconnected"
+      applyDepthEvent(
+        event
       );
 
-
-      state.depthConnected =
-        false;
-
-      state.depthInitialized =
-        false;
-
-
-      if (
-        depthReconnectTimer
-      ) {
-
-        clearTimeout(
-          depthReconnectTimer
-        );
-
-      }
-
-
-      depthReconnectTimer =
-        setTimeout(
-          connectDepthSocket,
-          3000
-        );
-
-    }
-  );
-
-
-  depthSocket.on(
-    "error",
-    error => {
+    } catch (error) {
 
       state.lastError =
-        `Depth WS: ${error.message}`;
-
-      console.error(
-        "[DEPTH]",
-        error.message
-      );
-
+        `Depth parse: ${error.message}`;
     }
-  );
+  });
 
-}
+  ws.on("error", error => {
 
+    state.lastError =
+      `Depth WS: ${error.message}`;
 
-/* ============================================================
-   INTELLIGENCE STATE
-============================================================ */
+    console.error(
+      "Depth websocket error:",
+      error.message
+    );
+  });
 
-function intelligenceState(
-  majorBSL,
-  majorSSL
-) {
+  ws.on("close", () => {
 
-  if (
-    !majorBSL.length &&
-    !majorSSL.length
-  ) {
+    state.depthConnected =
+      false;
 
-    return "NO MAJOR STRUCTURAL LIQUIDITY";
+    state.initialized =
+      false;
 
-  }
+    state.waitingForBridge =
+      true;
 
+    state.snapshotPending =
+      true;
 
-  if (
-    majorBSL.length &&
-    majorSSL.length
-  ) {
+    state.snapshotInFlight =
+      false;
 
-    return "BETWEEN MAJOR LIQUIDITY";
-
-  }
-
-
-  if (
-    majorBSL.length
-  ) {
-
-    return "BELOW MAJOR BUY-SIDE LIQUIDITY";
-
-  }
-
-
-  return "ABOVE MAJOR SELL-SIDE LIQUIDITY";
-
-}
-
-
-/* ============================================================
-   FORMAT STRUCTURAL LEVEL
-============================================================ */
-
-function formatStructuralLevel(
-  level
-) {
-
-  if (!level) {
-    return null;
-  }
-
-
-  const distancePct =
-    state.currentPrice
-      ? (
-          (
-            level.price -
-            state.currentPrice
-          ) /
-          state.currentPrice
-        ) *
-        100
-      : null;
-
-
-  return {
-
-    side:
-      level.side,
-
-    price:
-      round(
-        level.price,
-        2
-      ),
-
-    priceLow:
-      round(
-        level.priceLow,
-        2
-      ),
-
-    priceHigh:
-      round(
-        level.priceHigh,
-        2
-      ),
-
-    score:
-      round(
-        level.score,
-        2
-      ),
-
-    scoreBase:
-      round(
-        level.scoreBase,
-        2
-      ),
-
-    strength:
-      level.strength,
-
-    timeframes:
-      level.timeframes,
-
-    equalCount:
-      level.equalCount,
-
-    reactions:
-      level.reactions,
-
-    restingUsd:
-      round(
-        level.restingUsd,
-        2
-      ),
-
-    restingConfirmed:
-      level.restingConfirmed,
-
-    restingLevels:
-      level.restingLevels,
-
-    distancePct:
-      round(
-        distancePct,
-        3
-      ),
-
-    timeframeWeight:
-      timeframeWeight(
-        level
-      )
-
-  };
-
-}
-
-
-/* ============================================================
-   STRUCTURE STATUS
-============================================================ */
-
-function getStructureStatus() {
-
-  return {
-
-    activeLevels:
-      structure.levels.length,
-
-    activeMajorBSL:
-      structural("BSL").length,
-
-    activeMajorSSL:
-      structural("SSL").length,
-
-    lastRebuildAt:
-      structure.lastRebuildAt,
-
-    lastGoodAt:
-      structure.lastGoodAt,
-
-    lastRebuildAccepted:
-      structure.lastRebuildAccepted,
-
-    lastRebuildReason:
-      structure.lastRebuildReason,
-
-    rebuildCount:
-      structure.rebuildCount,
-
-    rejectedRebuilds:
-      structure.rejectedRebuilds,
-
-    lastCandidateLevels:
-      structure.lastCandidateLevels,
-
-    lastCandidateMajor:
-      structure.lastCandidateMajor,
-
-    retainedPrevious:
-      structure.retainedPrevious,
-
-    status:
-      structure.status
-
-  };
-
-}
-
-
-/* ============================================================
-   INTELLIGENCE
-============================================================ */
-
-function getIntelligence() {
-
-  const majorBSL =
-    structural("BSL");
-
-
-  const majorSSL =
-    structural("SSL");
-
-
-  const nearBSL =
-    nearStructural("BSL");
-
-
-  const nearSSL =
-    nearStructural("SSL");
-
-
-  const nextBSL =
-    majorBSL
-      .sort(
-        (a, b) =>
-          a.price -
-          b.price
-      );
-
-
-  const nextSSL =
-    majorSSL
-      .sort(
-        (a, b) =>
-          b.price -
-          a.price
-      );
-
-
-  const book =
-    getBook();
-
-
-  const enrichedBids =
-    enrichBookClusters(
-      book.bids
+    console.log(
+      "Depth websocket closed"
     );
 
+    setTimeout(
+      connectDepthWs,
+      SETTINGS.depthReconnectMs
+    );
+  });
+}
 
-  const enrichedAsks =
-    enrichBookClusters(
-      book.asks
+
+/* ============================================================
+   SNAPSHOT WEBSOCKET
+   ============================================================ */
+
+function connectSnapshotWs() {
+
+  if (
+    state.snapshotWs &&
+    (
+      state.snapshotWs.readyState ===
+      WebSocket.OPEN ||
+      state.snapshotWs.readyState ===
+      WebSocket.CONNECTING
+    )
+  ) {
+
+    return;
+  }
+
+  const ws =
+    new WebSocket(
+      FUTURES_API_WS
     );
 
+  state.snapshotWs =
+    ws;
 
-  const nearestBSL =
-    majorBSL
-      .filter(
-        level =>
-          level.price >
-          state.currentPrice
-      )
-      .sort(
-        (a, b) =>
-          a.price -
-          b.price
-      )[0] ||
-    null;
+  ws.on("open", () => {
 
+    state.snapshotConnected =
+      true;
 
-  const nearestSSL =
-    majorSSL
-      .filter(
-        level =>
-          level.price <
-          state.currentPrice
-      )
-      .sort(
-        (a, b) =>
-          b.price -
-          a.price
-      )[0] ||
-    null;
+    console.log(
+      "Futures snapshot websocket connected"
+    );
 
+    /*
+       If depth is already running, request snapshot.
+    */
 
-  return {
+    if (
+      state.depthConnected &&
+      !state.initialized
+    ) {
 
-    state:
-      intelligenceState(
-        majorBSL,
-        majorSSL
-      ),
+      requestSnapshot(
+        true
+      );
+    }
+  });
 
-    structureStatus:
-      getStructureStatus(),
+  ws.on("message", raw => {
 
+    try {
 
-    nearestBSL:
-      formatStructuralLevel(
-        nearestBSL
-      ),
+      const message =
+        JSON.parse(
+          raw.toString()
+        );
 
-    nearestSSL:
-      formatStructuralLevel(
-        nearestSSL
-      ),
+      if (
+        message.error
+      ) {
 
+        if (
+          message.error.code ===
+          -1003
+        ) {
 
-    nextBSL:
-      nextBSL
-        .slice(
-          0,
-          5
-        )
-        .map(
-          formatStructuralLevel
-        ),
+          state.snapshot429s++;
+        }
 
-    nextSSL:
-      nextSSL
-        .slice(
-          0,
-          5
-        )
-        .map(
-          formatStructuralLevel
-        ),
+        state.lastError =
+          `Snapshot API: ${
+            message.error.msg ||
+            JSON.stringify(
+              message.error
+            )
+          }`;
 
+        state.snapshotInFlight =
+          false;
 
-    nearBSL:
-      nearBSL
-        .slice(
-          0,
-          5
-        )
-        .map(
-          formatStructuralLevel
-        ),
+        return;
+      }
 
-    nearSSL:
-      nearSSL
-        .slice(
-          0,
-          5
-        )
-        .map(
-          formatStructuralLevel
-        ),
+      if (
+        message.result
+      ) {
 
+        processSnapshot(
+          message.result
+        );
+      }
 
-    orderBook: {
+    } catch (error) {
 
-      bids:
-        enrichedBids,
+      state.lastError =
+        `Snapshot parse: ${error.message}`;
+    }
+  });
 
-      asks:
-        enrichedAsks
+  ws.on("error", error => {
 
-    },
+    state.lastError =
+      `Snapshot WS: ${error.message}`;
 
+    console.error(
+      "Snapshot websocket error:",
+      error.message
+    );
+  });
 
-    persistentLiquidity:
-      getPersistentLiquidity(),
+  ws.on("close", () => {
 
+    state.snapshotConnected =
+      false;
 
-    liquidityEvents:
-      liquidityEvents
-        .slice(
-          0,
-          20
-        ),
+    state.snapshotInFlight =
+      false;
 
-    recentSweeps:
-      sweepEvents
-        .slice(
-          0,
-          20
-        )
+    console.log(
+      "Snapshot websocket closed"
+    );
 
-  };
-
+    setTimeout(
+      connectSnapshotWs,
+      SETTINGS.snapshotReconnectMs
+    );
+  });
 }
 
 
 /* ============================================================
    HEALTH
-============================================================ */
+   ============================================================ */
 
-app.get(
-  "/health",
-  (req, res) => {
+function healthResponse() {
 
-    res.json({
+  updateCurrentPrice();
 
-      ok: true,
+  return {
 
-      symbol: SYMBOL,
+    ok: true,
+
+    symbol: SYMBOL,
+
+    status:
+      state.initialized
+        ? "live"
+        : "syncing",
+
+    websocketConnected:
+      state.depthConnected,
+
+    depthConnected:
+      state.depthConnected,
+
+    snapshotConnected:
+      state.snapshotConnected,
+
+    klineConnected:
+      state.klineConnected,
+
+    initialized:
+      state.initialized,
+
+    waitingForBridge:
+      state.waitingForBridge,
+
+    snapshotPending:
+      state.snapshotPending,
+
+    currentPrice:
+      state.currentPrice,
+
+    priceSource:
+      state.priceSource,
+
+    bidLevels:
+      state.bids.size,
+
+    askLevels:
+      state.asks.size,
+
+    lastUpdateId:
+      state.lastUpdateId,
+
+    pendingEvents:
+      state.pendingDepthEvents.length,
+
+    snapshotRequests:
+      state.snapshotRequests,
+
+    snapshot429s:
+      state.snapshot429s,
+
+    bridgeAttempts:
+      state.bridgeAttempts,
+
+    bridgeFound:
+      state.bridgeFound,
+
+    resyncs:
+      state.resyncs,
+
+    sequenceGaps:
+      state.sequenceGaps,
+
+    structure: {
+
+      activeLevels:
+        state.structure.levels.length,
+
+      activeMajorBSL:
+        getMajorLevels("BSL").length,
+
+      activeMajorSSL:
+        getMajorLevels("SSL").length,
+
+      lastRebuildAt:
+        state.structure.lastRebuildAt,
+
+      lastGoodAt:
+        state.structure.lastGoodAt,
+
+      lastRebuildAccepted:
+        state.structure.lastRebuildAccepted,
+
+      lastRebuildReason:
+        state.structure.lastRebuildReason,
+
+      rebuildCount:
+        state.structure.rebuildCount,
+
+      rejectedRebuilds:
+        state.structure.rejectedRebuilds,
+
+      lastCandidateLevels:
+        state.structure.lastCandidateLevels,
+
+      lastCandidateMajor:
+        state.structure.lastCandidateMajor,
+
+      retainedPrevious:
+        state.structure.retainedPrevious,
 
       status:
-        state.depthInitialized
-          ? "live"
-          : state.depthConnected
-            ? "syncing"
-            : "disconnected",
+        state.structure.status
+    },
 
-      websocketConnected:
-        state.depthConnected,
+    updatedAt:
+      state.updatedAt,
 
-      depthConnected:
-        state.depthConnected,
-
-      snapshotConnected:
-        true,
-
-      initialized:
-        state.depthInitialized,
-
-      waitingForBridge:
-        state.depthConnected &&
-        !state.depthInitialized,
-
-      snapshotPending:
-        state.depthSnapshotPending,
-
-      currentPrice:
-        state.currentPrice,
-
-      priceSource:
-        state.priceSource,
-
-      bidLevels:
-        state.bids.size,
-
-      askLevels:
-        state.asks.size,
-
-      lastUpdateId:
-        state.depthLastUpdateId,
-
-      pendingEvents:
-        state.depthPendingEvents.length,
-
-      snapshotRequests:
-        state.depthSnapshotRequests,
-
-      snapshot429s:
-        state.depthSnapshot429s,
-
-      bridgeAttempts:
-        state.depthBridgeAttempts,
-
-      bridgeFound:
-        state.depthBridgeFound,
-
-      resyncs:
-        state.depthResyncs,
-
-      sequenceGaps:
-        state.depthSequenceGaps,
-
-      structure:
-        getStructureStatus(),
-
-      updatedAt:
-        new Date().toISOString(),
-
-      lastError:
-        state.lastError
-
-    });
-
-  }
-);
+    lastError:
+      state.lastError
+  };
+}
 
 
 /* ============================================================
    BOOK ENDPOINT
-============================================================ */
+   ============================================================ */
 
 app.get(
   "/book",
   (req, res) => {
 
-    const book =
-      getBook();
+    updateCurrentPrice();
 
+    const bids =
+      getBookRows("bid")
+        .sort(
+          (a, b) =>
+            b.price - a.price
+        )
+        .slice(0, 100);
+
+    const asks =
+      getBookRows("ask")
+        .sort(
+          (a, b) =>
+            a.price - b.price
+        )
+        .slice(0, 100);
 
     res.json({
 
@@ -5427,39 +4583,35 @@ app.get(
       currentPrice:
         state.currentPrice,
 
-      priceSource:
-        state.priceSource,
+      initialized:
+        state.initialized,
 
-      bids:
-        enrichBookClusters(
-          book.bids
-        ),
+      lastUpdateId:
+        state.lastUpdateId,
 
-      asks:
-        enrichBookClusters(
-          book.asks
-        ),
+      bids,
+
+      asks,
 
       updatedAt:
         new Date().toISOString()
-
     });
-
   }
 );
 
 
 /* ============================================================
    LIQUIDITY ENDPOINT
-============================================================ */
+   ============================================================ */
 
 app.get(
   "/liquidity",
   (req, res) => {
 
-    const book =
-      getBook();
+    updateCurrentPrice();
 
+    const orderBook =
+      buildOrderBookIntelligence();
 
     res.json({
 
@@ -5470,35 +4622,33 @@ app.get(
       currentPrice:
         state.currentPrice,
 
-      buyLiquidity:
-        enrichBookClusters(
-          book.bids
-        ),
+      orderBook,
 
-      sellLiquidity:
-        enrichBookClusters(
-          book.asks
-        ),
+      persistentLiquidity: {
 
-      persistentLiquidity:
-        getPersistentLiquidity(),
+        bids:
+          state.persistence.bids,
+
+        asks:
+          state.persistence.asks
+      },
 
       updatedAt:
         new Date().toISOString()
-
     });
-
   }
 );
 
 
 /* ============================================================
    STRUCTURE ENDPOINT
-============================================================ */
+   ============================================================ */
 
 app.get(
   "/structure",
   (req, res) => {
+
+    updateCurrentPrice();
 
     res.json({
 
@@ -5509,71 +4659,135 @@ app.get(
       currentPrice:
         state.currentPrice,
 
-      structureStatus:
-        getStructureStatus(),
+      majorLevels:
+        state.structure.majorLevels,
 
-      buySideLiquidity:
-        structural("BSL")
-          .map(
-            formatStructuralLevel
-          ),
+      nearLevels:
+        state.structure.nearLevels,
 
-      sellSideLiquidity:
-        structural("SSL")
-          .map(
-            formatStructuralLevel
-          ),
+      allLevels:
+        state.structure.levels,
 
-      majorResistance:
-        structural("BSL")
-          .filter(
-            level =>
-              level.price >
-              state.currentPrice
-          )
-          .map(
-            formatStructuralLevel
-          ),
+      structureStatus: {
 
-      majorSupport:
-        structural("SSL")
-          .filter(
-            level =>
-              level.price <
-              state.currentPrice
-          )
-          .map(
-            formatStructuralLevel
-          ),
+        activeLevels:
+          state.structure.levels.length,
 
-      nearBSL:
-        nearStructural("BSL")
-          .map(
-            formatStructuralLevel
-          ),
+        activeMajorBSL:
+          getMajorLevels("BSL").length,
 
-      nearSSL:
-        nearStructural("SSL")
-          .map(
-            formatStructuralLevel
-          ),
+        activeMajorSSL:
+          getMajorLevels("SSL").length,
+
+        lastRebuildAt:
+          state.structure.lastRebuildAt,
+
+        lastGoodAt:
+          state.structure.lastGoodAt,
+
+        lastRebuildAccepted:
+          state.structure.lastRebuildAccepted,
+
+        lastRebuildReason:
+          state.structure.lastRebuildReason,
+
+        rebuildCount:
+          state.structure.rebuildCount,
+
+        rejectedRebuilds:
+          state.structure.rejectedRebuilds,
+
+        lastCandidateLevels:
+          state.structure.lastCandidateLevels,
+
+        lastCandidateMajor:
+          state.structure.lastCandidateMajor,
+
+        retainedPrevious:
+          state.structure.retainedPrevious,
+
+        status:
+          state.structure.status
+      },
 
       updatedAt:
         new Date().toISOString()
-
     });
-
   }
 );
 
 
 /* ============================================================
    INTELLIGENCE ENDPOINT
-============================================================ */
+   ============================================================ */
 
 app.get(
   "/intelligence",
   (req, res) => {
+
+    updateCurrentPrice();
+
+    const currentPrice =
+      state.currentPrice;
+
+    const majorBSL =
+      getMajorLevels("BSL");
+
+    const majorSSL =
+      getMajorLevels("SSL");
+
+    const nearBSL =
+      getNearLevels("BSL");
+
+    const nearSSL =
+      getNearLevels("SSL");
+
+    const nearestBSL =
+      majorBSL[0] ||
+      null;
+
+    const nearestSSL =
+      majorSSL[0] ||
+      null;
+
+    const orderBook =
+      buildOrderBookIntelligence();
+
+    let marketState =
+      "NO MAJOR STRUCTURAL LIQUIDITY";
+
+    if (
+      nearestBSL &&
+      nearestSSL
+    ) {
+
+      if (
+        currentPrice <
+        nearestBSL.price &&
+        currentPrice >
+        nearestSSL.price
+      ) {
+
+        marketState =
+          "BETWEEN MAJOR LIQUIDITY";
+
+      } else if (
+        currentPrice >=
+        nearestBSL.price
+      ) {
+
+        marketState =
+          "AT / ABOVE MAJOR BSL";
+
+      } else if (
+        currentPrice <=
+        nearestSSL.price
+      ) {
+
+        marketState =
+          "AT / BELOW MAJOR SSL";
+      }
+    }
 
     res.json({
 
@@ -5581,27 +4795,148 @@ app.get(
 
       symbol: SYMBOL,
 
-      currentPrice:
-        state.currentPrice,
+      currentPrice,
 
       priceSource:
         state.priceSource,
 
-      intelligence:
-        getIntelligence(),
+      intelligence: {
+
+        state:
+          marketState,
+
+        structureStatus: {
+
+          activeLevels:
+            state.structure.levels.length,
+
+          activeMajorBSL:
+            majorBSL.length,
+
+          activeMajorSSL:
+            majorSSL.length,
+
+          lastRebuildAt:
+            state.structure.lastRebuildAt,
+
+          lastGoodAt:
+            state.structure.lastGoodAt,
+
+          lastRebuildAccepted:
+            state.structure.lastRebuildAccepted,
+
+          lastRebuildReason:
+            state.structure.lastRebuildReason,
+
+          rebuildCount:
+            state.structure.rebuildCount,
+
+          rejectedRebuilds:
+            state.structure.rejectedRebuilds,
+
+          lastCandidateLevels:
+            state.structure.lastCandidateLevels,
+
+          lastCandidateMajor:
+            state.structure.lastCandidateMajor,
+
+          retainedPrevious:
+            state.structure.retainedPrevious,
+
+          status:
+            state.structure.status
+        },
+
+        nearestBSL:
+          nearestBSL
+            ? addDistance(
+                nearestBSL
+              )
+            : null,
+
+        nearestSSL:
+          nearestSSL
+            ? addDistance(
+                nearestSSL
+              )
+            : null,
+
+        nextBSL:
+          majorBSL
+            .slice(1, 6)
+            .map(addDistance),
+
+        nextSSL:
+          majorSSL
+            .slice(1, 6)
+            .map(addDistance),
+
+        nearBSL:
+          nearBSL
+            .slice(0, 8)
+            .map(addDistance),
+
+        nearSSL:
+          nearSSL
+            .slice(0, 8)
+            .map(addDistance),
+
+        orderBook,
+
+        persistentLiquidity: {
+
+          bids:
+            state.persistence.bids,
+
+          asks:
+            state.persistence.asks
+        },
+
+        liquidityEvents:
+          state.liquidityEvents.slice(
+            0,
+            50
+          ),
+
+        recentSweeps:
+          state.recentSweeps.slice(
+            0,
+            20
+          )
+      },
 
       updatedAt:
         new Date().toISOString()
-
     });
-
   }
 );
 
 
 /* ============================================================
+   DISTANCE FORMATTER
+   ============================================================ */
+
+function addDistance(level) {
+
+  return {
+
+    ...level,
+
+    distancePct:
+      round(
+        distancePct(
+          level.price,
+          state.currentPrice
+        ),
+        3
+      )
+  };
+}
+
+
+/* ============================================================
    EVENTS ENDPOINT
-============================================================ */
+   ============================================================ */
 
 app.get(
   "/events",
@@ -5617,34 +4952,30 @@ app.get(
         state.currentPrice,
 
       recentSweeps:
-        sweepEvents
-          .slice(
-            0,
-            20
-          ),
+        state.recentSweeps,
 
       liquidityEvents:
-        liquidityEvents
-          .slice(
-            0,
-            30
-          ),
+        state.liquidityEvents,
 
-      persistentLiquidity:
-        getPersistentLiquidity(),
+      persistentLiquidity: {
+
+        bids:
+          state.persistence.bids,
+
+        asks:
+          state.persistence.asks
+      },
 
       updatedAt:
         new Date().toISOString()
-
     });
-
   }
 );
 
 
 /* ============================================================
    ROOT
-============================================================ */
+   ============================================================ */
 
 app.get(
   "/",
@@ -5655,13 +4986,10 @@ app.get(
       ok: true,
 
       service:
-        "Binance BTCUSDT Major Liquidity Relay",
+        "BTCUSDT Major Liquidity Relay",
 
       version:
         "10.0",
-
-      symbol:
-        SYMBOL,
 
       endpoints: [
 
@@ -5676,18 +5004,15 @@ app.get(
         "/intelligence",
 
         "/events"
-
       ]
-
     });
-
   }
 );
 
 
 /* ============================================================
-   MAINTENANCE LOOP
-============================================================ */
+   PERIODIC PERSISTENCE
+   ============================================================ */
 
 setInterval(
   () => {
@@ -5695,37 +5020,21 @@ setInterval(
     try {
 
       if (
-        state.depthInitialized
+        state.initialized
       ) {
 
-        updatePriceFromBook();
-
         updatePersistence();
-
       }
-
-
-      /* ------------------------------------------------------
-         Re-evaluate structure periodically.
-
-         This also allows major status to update when price
-         moves significantly without waiting for a new candle.
-      ------------------------------------------------------ */
-
-      rebuildStructure(
-        "maintenance"
-      );
 
     } catch (error) {
 
       state.lastError =
-        `Maintenance: ${error.message}`;
+        `Persistence: ${error.message}`;
 
       console.error(
-        "[MAINTENANCE]",
+        "Persistence error:",
         error.message
       );
-
     }
 
   },
@@ -5734,97 +5043,144 @@ setInterval(
 
 
 /* ============================================================
-   START
-============================================================ */
+   PERIODIC PRICE UPDATE
+   ============================================================ */
 
-async function start() {
+setInterval(
+  () => {
 
-  console.log(
-    "================================================"
-  );
+    try {
 
-  console.log(
-    "BTCUSDT MAJOR LIQUIDITY RELAY v10.0"
-  );
+      updateCurrentPrice();
 
-  console.log(
-    "================================================"
-  );
+      /*
+         Recalculate structural resting liquidity
+         periodically because the book changes.
+      */
 
+      if (
+        state.structure.levels.length
+      ) {
 
-  try {
+        for (
+          const level of
+          state.structure.levels
+        ) {
 
-    await loadHistory();
+          getRestingLiquidity(
+            level
+          );
+        }
 
-  } catch (error) {
+        for (
+          const level of
+          state.structure.majorLevels
+        ) {
 
-    state.lastError =
-      `Startup history: ${error.message}`;
+          getRestingLiquidity(
+            level
+          );
+        }
+      }
 
-    console.error(
-      "[STARTUP HISTORY]",
-      error.message
-    );
+    } catch (error) {
 
-  }
-
-
-  connectDepthSocket();
-
-  connectKlineSocket();
-
-
-  app.listen(
-    PORT,
-    () => {
-
-      console.log(
-        `[HTTP] listening on ${PORT}`
-      );
-
+      state.lastError =
+        `Maintenance: ${error.message}`;
     }
-  );
 
-}
-
-
-start();
-
-
-/* ============================================================
-   PROCESS SAFETY
-============================================================ */
-
-process.on(
-  "uncaughtException",
-  error => {
-
-    state.lastError =
-      `uncaughtException: ${error.message}`;
-
-    console.error(
-      "[UNCAUGHT]",
-      error
-    );
-
-  }
+  },
+  5000
 );
 
 
-process.on(
-  "unhandledRejection",
-  error => {
+/* ============================================================
+   STARTUP
+   ============================================================ */
 
-    state.lastError =
-      `unhandledRejection: ${
-        error?.message ||
-        String(error)
-      }`;
+async function startup() {
 
-    console.error(
-      "[UNHANDLED]",
-      error
+  console.log(
+    "=============================================="
+  );
+
+  console.log(
+    "BTCUSDT LIQUIDITY RELAY V10"
+  );
+
+  console.log(
+    "Starting..."
+  );
+
+  console.log(
+    "=============================================="
+  );
+
+  /*
+     Connect websockets first so live data begins
+     arriving while historical candles load.
+  */
+
+  connectDepthWs();
+
+  connectSnapshotWs();
+
+  connectKlineWs();
+
+  /*
+     Load historical structure.
+  */
+
+  await loadAllHistoricalCandles();
+
+  /*
+     Rebuild once more after initial price becomes
+     available from the live order book.
+  */
+
+  setTimeout(
+    () => {
+
+      try {
+
+        updateCurrentPrice();
+
+        rebuildStructure();
+
+      } catch (error) {
+
+        state.lastError =
+          `Initial rebuild: ${error.message}`;
+      }
+
+    },
+    5000
+  );
+}
+
+
+/* ============================================================
+   SERVER
+   ============================================================ */
+
+app.listen(
+  PORT,
+  () => {
+
+    console.log(
+      `HTTP server listening on port ${PORT}`
     );
 
+    startup()
+      .catch(error => {
+
+        state.lastError =
+          `Startup: ${error.message}`;
+
+        console.error(
+          "Startup error:",
+          error
+        );
+      });
   }
 );
