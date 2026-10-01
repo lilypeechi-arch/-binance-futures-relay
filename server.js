@@ -61,57 +61,54 @@ const STRUCTURE = {
 };
 
 /* ============================================================
-   LIQUIDITY SETTINGS
+   GENERAL SETTINGS
 ============================================================ */
 
 const SETTINGS = {
+
+  /* Raw order book */
   rawMinUsd: 50000,
 
+  /* Structural level resting liquidity */
   restingRadiusUsd: 35,
-
   restingConfirmUsd: 250000,
 
+  /* Structure merging */
   mergeUsd: 35,
-
   zonePct: 0.0015,
-
   reactionPct: 0.003,
 
+  /* Structure */
   minScore: 40,
-
   maxLevels: 8,
 
+  /* Order-book clustering */
   orderGapUsd: 35,
-
   orderMinUsd: 500000,
+  minClusterLevels: 3,
 
-  sweepMs: 15 * 60 * 1000,
+  /* Persistence */
+  persistencePollMs: 5000,
+  persistenceConfirmMs: 60000,
+  persistenceMaxAgeMs: 10 * 60 * 1000,
+  persistenceTolerancePct: 0.0005,
+
+  /* Events */
+  eventMax: 100,
+
+  /* Sweeps */
+  sweepLookbackMs: 24 * 60 * 60 * 1000,
 
   /*
-     MAJOR LEVEL FILTER
-     ----------------------------------------------------------
-     Levels closer than this are NOT treated as major.
-     They remain available as nearBSL / nearSSL.
+     Minimum penetration beyond the structural zone.
+     0.00015 = 0.015%
   */
+  sweepMinPenetrationPct: 0.00015,
 
+  /* Major liquidity filtering */
   majorMinDistancePct: 0.50,
-
-  /*
-     A 15m-only level cannot normally become a major level.
-  */
-
   majorMinimumTimeframeWeight: 2,
-
-  /*
-     1H-only major levels need additional strength.
-  */
-
   major1hMinScore: 90,
-
-  /*
-     4H/1D levels can qualify with the normal minimum score.
-  */
-
   majorHigherTfMinScore: 40
 };
 
@@ -139,20 +136,25 @@ const structure = {
   levels: []
 };
 
-/* ============================================================
-   STATE
-============================================================ */
+/*
+   Persistence objects are retained across snapshots.
+
+   bids = resting bid clusters
+   asks = resting ask clusters
+*/
+const persistence = {
+  bids: [],
+  asks: []
+};
 
 const state = {
-  currentPrice: null,
 
+  currentPrice: null,
   priceSource: null,
 
   depthConnected: false,
-
   snapshotConnected: false,
-
-  klinesConnected: false,
+  klineConnected: false,
 
   bookInitialized: false,
 
@@ -161,152 +163,228 @@ const state = {
   pendingEvents: [],
 
   gapDetected: false,
-
   gapRecovery: false,
-
   gapCount: 0,
 
-  lastGapLocal: null,
+  lastGapExpected: null,
+  lastGapReceived: null,
 
-  lastGapIncoming: null,
-
-  snapshotId: null,
-
-  snapshotRequests: 0,
-
-  snapshot429s: 0,
-
-  snapshotLastStatus: null,
-
-  snapshotLastError: null,
-
-  lastSnapshotResponse: null,
+  lastDepthMessage: null,
+  lastKlineMessage: null,
 
   updatedAt: null,
 
-  lastDepthMessage: null,
+  snapshot: {
+    pending: false,
+    lastRequestAt: 0,
+    lastSnapshotId: 0,
 
-  lastKlineMessage: null,
+    bridgeAttempts: 0,
+    bridgeFound: 0,
 
+    snapshotRequests: 0,
+    snapshot429s: 0,
+
+    lastError: null
+  },
+
+  /*
+     True structural sweep events
+  */
   sweeps: [],
 
-  candleStats: Object.fromEntries(
-    Object.keys(STRUCTURE).map(tf => [
-      tf,
-      {
-        requests: 0,
-        success: 0,
-        errors: 0
-      }
-    ])
-  )
+  /*
+     Liquidity events:
+     - CONFLUENCE
+     - PERSISTENT LIQUIDITY
+     - LIQUIDITY REMOVED
+     - SWEEP
+  */
+  liquidityEvents: [],
+
+  candleStats: {
+    '15m': {
+      loaded: 0,
+      lastOpenTime: null
+    },
+
+    '1h': {
+      loaded: 0,
+      lastOpenTime: null
+    },
+
+    '4h': {
+      loaded: 0,
+      lastOpenTime: null
+    },
+
+    '1d': {
+      loaded: 0,
+      lastOpenTime: null
+    }
+  }
 };
 
 /* ============================================================
    HELPERS
 ============================================================ */
 
-function round(value, decimals = 2) {
-  return Number(
-    Number(value).toFixed(decimals)
+function now() {
+  return Date.now();
+}
+
+function round(n, d = 2) {
+  return Number(Number(n).toFixed(d));
+}
+
+function pctDistance(price, current) {
+
+  if (!current) {
+    return null;
+  }
+
+  return round(
+    ((price - current) / current) * 100,
+    3
   );
 }
 
-function pct(price, current) {
-  if (!current) return null;
+function intervalMs(tf) {
 
   return (
-    ((price - current) / current) *
-    100
+    {
+      '15m': 15,
+      '1h': 60,
+      '4h': 240,
+      '1d': 1440
+    }[tf] || 15
+  ) * 60 * 1000;
+}
+
+/* ============================================================
+   PRICE
+============================================================ */
+
+function updatePrice(price, source) {
+
+  const p = Number(price);
+
+  if (!Number.isFinite(p) || p <= 0) {
+    return;
+  }
+
+  state.currentPrice = p;
+  state.priceSource = source;
+  state.updatedAt = new Date().toISOString();
+}
+
+function updatePriceFromBook() {
+
+  if (!book.bids.size || !book.asks.size) {
+    return;
+  }
+
+  const bids = [...book.bids.keys()]
+    .sort((a, b) => b - a);
+
+  const asks = [...book.asks.keys()]
+    .sort((a, b) => a - b);
+
+  if (!bids.length || !asks.length) {
+    return;
+  }
+
+  const bestBid = bids[0];
+  const bestAsk = asks[0];
+
+  updatePrice(
+    (bestBid + bestAsk) / 2,
+    'futures_orderbook_mid'
   );
 }
 
-function iso() {
-  return new Date().toISOString();
-}
-
 /* ============================================================
-   HTTP JSON
+   CANDLES
 ============================================================ */
 
-async function getJson(url) {
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent':
-        'Binance-Major-Liquidity-Relay/1.0'
-    }
-  });
+function candleFromKline(k) {
 
-  const text =
-    await response.text();
-
-  let data;
-
-  try {
-    data = JSON.parse(text);
-  } catch (_) {
-    throw new Error(
-      `HTTP ${response.status}: non-JSON response`
-    );
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `HTTP ${response.status}: ${JSON.stringify(
-        data
-      ).slice(0, 500)}`
-    );
-  }
-
-  return data;
-}
-
-/* ============================================================
-   CANDLE
-============================================================ */
-
-function arrayToCandle(row) {
   return {
-    openTime: Number(row[0]),
-    open: Number(row[1]),
-    high: Number(row[2]),
-    low: Number(row[3]),
-    close: Number(row[4]),
-    volume: Number(row[5]),
-    closeTime: Number(row[6])
+    openTime: Number(k.t),
+    closeTime: Number(k.T),
+
+    open: Number(k.o),
+    high: Number(k.h),
+    low: Number(k.l),
+    close: Number(k.c),
+
+    volume: Number(k.v)
   };
 }
 
 /* ============================================================
-   LOAD HISTORICAL CANDLES
+   HISTORICAL SPOT DATA
 ============================================================ */
 
+async function fetchSpotKlines(interval, limit) {
+
+  const url =
+    `${SPOT_API}/api/v3/klines` +
+    `?symbol=${SYMBOL}` +
+    `&interval=${interval}` +
+    `&limit=${limit}`;
+
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    throw new Error(
+      `Spot klines ${interval}: HTTP ${res.status}`
+    );
+  }
+
+  const rows = await res.json();
+
+  return rows.map(r => ({
+    openTime: Number(r[0]),
+    closeTime: Number(r[6]),
+
+    open: Number(r[1]),
+    high: Number(r[2]),
+    low: Number(r[3]),
+    close: Number(r[4]),
+
+    volume: Number(r[5])
+  }));
+}
+
 async function loadHistory() {
-  for (
-    const [tf, cfg] of Object.entries(
-      STRUCTURE
-    )
-  ) {
-    state.candleStats[tf].requests += 1;
+
+  for (const [tf, cfg] of Object.entries(STRUCTURE)) {
 
     try {
-      const url =
-        `${SPOT_API}/api/v3/klines` +
-        `?symbol=${SYMBOL}` +
-        `&interval=${cfg.interval}` +
-        `&limit=${cfg.candles}`;
-
-      const data =
-        await getJson(url);
 
       candles[tf] =
-        Array.isArray(data)
-          ? data.map(arrayToCandle)
-          : [];
+        await fetchSpotKlines(
+          cfg.interval,
+          cfg.candles
+        );
 
-      state.candleStats[tf].success += 1;
-    } catch (error) {
-      state.candleStats[tf].errors += 1;
+      state.candleStats[tf].loaded =
+        candles[tf].length;
+
+      state.candleStats[tf].lastOpenTime =
+        candles[tf].at(-1)?.openTime || null;
+
+      console.log(
+        `Loaded ${tf}: ${candles[tf].length} candles`
+      );
+
+    } catch (err) {
+
+      console.error(
+        `History ${tf} failed:`,
+        err.message
+      );
     }
   }
 
@@ -317,30 +395,24 @@ async function loadHistory() {
    PIVOTS
 ============================================================ */
 
-function pivotHigh(
-  data,
-  index,
-  left,
-  right
-) {
-  if (
-    index < left ||
-    index + right >= data.length
-  ) {
-    return false;
-  }
+function isPivotHigh(arr, i, left, right) {
 
-  const price =
-    data[index].high;
+  const p = arr[i].high;
 
   for (
-    let i = index - left;
-    i <= index + right;
-    i++
+    let j = i - left;
+    j <= i + right;
+    j++
   ) {
+
+    if (j === i) {
+      continue;
+    }
+
     if (
-      i !== index &&
-      data[i].high >= price
+      j < 0 ||
+      j >= arr.length ||
+      arr[j].high >= p
     ) {
       return false;
     }
@@ -349,30 +421,24 @@ function pivotHigh(
   return true;
 }
 
-function pivotLow(
-  data,
-  index,
-  left,
-  right
-) {
-  if (
-    index < left ||
-    index + right >= data.length
-  ) {
-    return false;
-  }
+function isPivotLow(arr, i, left, right) {
 
-  const price =
-    data[index].low;
+  const p = arr[i].low;
 
   for (
-    let i = index - left;
-    i <= index + right;
-    i++
+    let j = i - left;
+    j <= i + right;
+    j++
   ) {
+
+    if (j === i) {
+      continue;
+    }
+
     if (
-      i !== index &&
-      data[i].low <= price
+      j < 0 ||
+      j >= arr.length ||
+      arr[j].low <= p
     ) {
       return false;
     }
@@ -386,64 +452,61 @@ function pivotLow(
 ============================================================ */
 
 function reactionCount(
-  data,
-  price,
+  arr,
+  index,
   side,
-  tolerance
+  price
 ) {
+
   let count = 0;
 
+  const start =
+    Math.max(0, index - 8);
+
+  let lastReaction = -Infinity;
+
   for (
-    let i = 1;
-    i < data.length;
+    let i = start;
+    i < Math.min(arr.length, index + 9);
     i++
   ) {
-    const candle = data[i];
 
-    const near =
+    if (i === index) {
+      continue;
+    }
+
+    const c = arr[i];
+
+    const tolerance =
+      price * SETTINGS.reactionPct;
+
+    const touched =
       side === 'BSL'
-        ? Math.abs(
-            candle.high - price
-          ) / price <= tolerance
-        : Math.abs(
-            candle.low - price
-          ) / price <= tolerance;
+        ? c.high >= price - tolerance
+        : c.low <= price + tolerance;
 
-    if (!near) continue;
+    if (!touched) {
+      continue;
+    }
 
-    const previous =
-      data.slice(
-        Math.max(0, i - 8),
-        i
-      );
-
-    if (!previous.length) continue;
-
-    const base =
+    const reaction =
       side === 'BSL'
-        ? Math.max(
-            ...previous.map(
-              x => x.high
-            )
+        ? (
+            c.close < c.open &&
+            c.close < price
           )
-        : Math.min(
-            ...previous.map(
-              x => x.low
-            )
+        : (
+            c.close > c.open &&
+            c.close > price
           );
 
-    const move =
-      side === 'BSL'
-        ? (base - candle.close) /
-          price
-        : (candle.close - base) /
-          price;
-
     if (
-      move >=
-      SETTINGS.reactionPct
+      reaction &&
+      i - lastReaction >= 2
     ) {
-      count += 1;
+
+      count++;
+      lastReaction = i;
     }
   }
 
@@ -454,50 +517,81 @@ function reactionCount(
    TIMEFRAME STRUCTURE
 ============================================================ */
 
-function timeframePoints(tf) {
-  const cfg =
-    STRUCTURE[tf];
-
-  const data =
-    candles[tf];
+function timeframeStructure(
+  tf,
+  arr,
+  cfg
+) {
 
   const highs = [];
   const lows = [];
 
+  if (!arr.length) {
+    return {
+      highs,
+      lows
+    };
+  }
+
   for (
     let i = cfg.left;
-    i <
-      data.length -
-        cfg.right;
+    i < arr.length - cfg.right;
     i++
   ) {
+
     if (
-      pivotHigh(
-        data,
+      isPivotHigh(
+        arr,
         i,
         cfg.left,
         cfg.right
       )
     ) {
+
       highs.push({
-        price: data[i].high,
-        time: data[i].openTime,
-        tf
+        side: 'BSL',
+        price: arr[i].high,
+        time: arr[i].openTime,
+        index: i,
+
+        timeframe: tf,
+        weight: cfg.weight,
+
+        reactions:
+          reactionCount(
+            arr,
+            i,
+            'BSL',
+            arr[i].high
+          )
       });
     }
 
     if (
-      pivotLow(
-        data,
+      isPivotLow(
+        arr,
         i,
         cfg.left,
         cfg.right
       )
     ) {
+
       lows.push({
-        price: data[i].low,
-        time: data[i].openTime,
-        tf
+        side: 'SSL',
+        price: arr[i].low,
+        time: arr[i].openTime,
+        index: i,
+
+        timeframe: tf,
+        weight: cfg.weight,
+
+        reactions:
+          reactionCount(
+            arr,
+            i,
+            'SSL',
+            arr[i].low
+          )
       });
     }
   }
@@ -509,621 +603,209 @@ function timeframePoints(tf) {
 }
 
 /* ============================================================
-   EQUAL LEVELS
+   STRUCTURE CLUSTERING
 ============================================================ */
 
-function equalLevels(
-  points,
-  tolerance,
-  side
-) {
-  const output = [];
+function buildLevel(group) {
 
-  for (
-    let i = 0;
-    i < points.length;
-    i++
-  ) {
-    const cluster = [
-      points[i]
-    ];
-
-    for (
-      let j = i + 1;
-      j < points.length;
-      j++
-    ) {
-      const average =
-        cluster.reduce(
-          (sum, item) =>
-            sum + item.price,
-          0
-        ) /
-        cluster.length;
-
-      if (
-        Math.abs(
-          points[j].price -
-            average
-        ) /
-          average <=
-        tolerance
-      ) {
-        cluster.push(
-          points[j]
-        );
-      }
-    }
-
-    if (
-      cluster.length >= 2
-    ) {
-      output.push({
-        side,
-
-        price:
-          cluster.reduce(
-            (sum, item) =>
-              sum + item.price,
-            0
-          ) /
-          cluster.length,
-
-        count:
-          cluster.length,
-
-        timeframes: [
-          ...new Set(
-            cluster.map(
-              item => item.tf
-            )
-          )
-        ]
-      });
-    }
-  }
-
-  return output;
-}
-
-/* ============================================================
-   MERGE STRUCTURAL LEVELS
-============================================================ */
-
-function mergePoints(
-  points,
-  side
-) {
-  const sorted =
-    [...points].sort(
-      (a, b) =>
-        a.price - b.price
-    );
-
-  const groups = [];
-
-  for (const point of sorted) {
-    const last =
-      groups[
-        groups.length - 1
-      ];
-
-    if (
-      last &&
-      Math.abs(
-        point.price -
-          last.priceHigh
-      ) <=
-        Math.max(
-          SETTINGS.mergeUsd,
-          last.price *
-            SETTINGS.zonePct
-        )
-    ) {
-      last.points.push(
-        point
-      );
-
-      last.price =
-        last.points.reduce(
-          (sum, x) =>
-            sum + x.price,
-          0
-        ) /
-        last.points.length;
-
-      last.priceLow =
-        Math.min(
-          last.priceLow,
-          point.price
-        );
-
-      last.priceHigh =
-        Math.max(
-          last.priceHigh,
-          point.price
-        );
-    } else {
-      groups.push({
-        price: point.price,
-
-        priceLow:
-          point.price,
-
-        priceHigh:
-          point.price,
-
-        points: [point]
-      });
-    }
-  }
-
-  return groups.map(
-    group => {
-      const timeframes = [
-        ...new Set(
-          group.points.map(
-            x => x.tf
-          )
-        )
-      ];
-
-      const equalCount =
-        Math.max(
-          ...group.points.map(
-            x =>
-              x.equalCount ||
-              1
-          )
-        );
-
-      const reactions =
-        Math.max(
-          ...group.points.map(
-            x =>
-              x.reactions ||
-              0
-          )
-        );
-
-      const timeframeScore =
-        timeframes.reduce(
-          (sum, tf) =>
-            sum +
-            STRUCTURE[tf]
-              .weight,
-          0
-        );
-
-      const score =
-        Math.round(
-          timeframeScore * 10 +
-          Math.min(
-            equalCount,
-            30
-          ) *
-            5 +
-          Math.min(
-            reactions,
-            40
-          ) *
-            2
-        );
-
-      return {
-        side,
-
-        price:
-          group.price,
-
-        priceLow:
-          group.priceLow,
-
-        priceHigh:
-          group.priceHigh,
-
-        score,
-
-        timeframes,
-
-        equalCount,
-
-        reactions,
-
-        restingUsd: 0,
-
-        restingLevels: []
-      };
-    }
-  );
-}
-
-/* ============================================================
-   REBUILD STRUCTURE
-============================================================ */
-
-function rebuildStructure() {
-  const highs = [];
-  const lows = [];
-
-  const equalHighs = [];
-  const equalLows = [];
-
-  for (
-    const tf of Object.keys(
-      STRUCTURE
-    )
-  ) {
-    const points =
-      timeframePoints(tf);
-
-    highs.push(
-      ...points.highs
-    );
-
-    lows.push(
-      ...points.lows
-    );
-
-    equalHighs.push(
-      ...equalLevels(
-        points.highs,
-        STRUCTURE[tf].eq,
-        'BSL'
+  const tfs = [
+    ...new Set(
+      group.points.map(
+        p => p.timeframe
       )
-    );
-
-    equalLows.push(
-      ...equalLevels(
-        points.lows,
-        STRUCTURE[tf].eq,
-        'SSL'
-      )
-    );
-  }
-
-  const highMetrics =
-    highs.map(point => ({
-      ...point,
-
-      equalCount:
-        Math.max(
-          1,
-          ...equalHighs
-            .filter(
-              x =>
-                Math.abs(
-                  x.price -
-                    point.price
-                ) /
-                  point.price <=
-                0.003
-            )
-            .map(
-              x => x.count
-            )
-        ),
-
-      reactions:
-        reactionCount(
-          candles[point.tf],
-          point.price,
-          'BSL',
-          STRUCTURE[
-            point.tf
-          ].eq
-        )
-    }));
-
-  const lowMetrics =
-    lows.map(point => ({
-      ...point,
-
-      equalCount:
-        Math.max(
-          1,
-          ...equalLows
-            .filter(
-              x =>
-                Math.abs(
-                  x.price -
-                    point.price
-                ) /
-                  point.price <=
-                0.003
-            )
-            .map(
-              x => x.count
-            )
-        ),
-
-      reactions:
-        reactionCount(
-          candles[point.tf],
-          point.price,
-          'SSL',
-          STRUCTURE[
-            point.tf
-          ].eq
-        )
-    }));
-
-  structure.swingHighs =
-    highMetrics;
-
-  structure.swingLows =
-    lowMetrics;
-
-  structure.equalHighs =
-    equalHighs;
-
-  structure.equalLows =
-    equalLows;
-
-  structure.levels = [
-    ...mergePoints(
-      highMetrics,
-      'BSL'
-    ),
-
-    ...mergePoints(
-      lowMetrics,
-      'SSL'
     )
   ];
 
-  applyResting();
-}
+  const weights =
+    tfs.reduce(
+      (s, tf) =>
+        s +
+        (STRUCTURE[tf]?.weight || 0),
+      0
+    );
 
-/* ============================================================
-   ORDER BOOK ROWS
-============================================================ */
+  const equalCount =
+    group.points.length;
 
-function bookRows(side) {
-  const map =
-    side === 'BSL'
-      ? book.asks
-      : book.bids;
+  const reactions =
+    group.points.reduce(
+      (s, p) =>
+        s + p.reactions,
+      0
+    );
 
-  const rows = [];
+  const prices =
+    group.points.map(
+      p => p.price
+    );
 
-  for (
-    const [
-      price,
-      quantity
-    ] of map.entries()
-  ) {
-    const usd =
-      Number(price) *
-      Number(quantity);
+  const zoneLow =
+    Math.min(...prices) *
+    (1 - SETTINGS.zonePct);
 
-    if (
-      usd >=
-      SETTINGS.rawMinUsd
-    ) {
-      rows.push({
-        price: Number(price),
+  const zoneHigh =
+    Math.max(...prices) *
+    (1 + SETTINGS.zonePct);
 
-        quantity:
-          Number(quantity),
+  let score =
+    weights * 10 +
+    Math.min(equalCount, 30) * 5 +
+    Math.min(reactions, 40) * 2;
 
-        usd
-      });
-    }
-  }
+  const level = {
 
-  rows.sort(
-    (a, b) =>
-      side === 'BSL'
-        ? a.price - b.price
-        : b.price - a.price
-  );
+    side: group.side,
 
-  return rows;
-}
+    price:
+      group.points.reduce(
+        (s, x) => s + x.price,
+        0
+      ) /
+      group.points.length,
 
-/* ============================================================
-   RESTING LIQUIDITY
-============================================================ */
+    priceLow: zoneLow,
+    priceHigh: zoneHigh,
 
-function restingNear(
-  price,
-  side
-) {
-  const map =
-    side === 'BSL'
-      ? book.asks
-      : book.bids;
+    score,
 
-  let total = 0;
+    scoreBase: score,
 
-  const levels = [];
+    strength: 'LOW',
 
-  for (
-    const [
-      priceKey,
-      quantity
-    ] of map.entries()
-  ) {
-    const p =
-      Number(priceKey);
+    timeframes: tfs,
 
-    if (
-      Math.abs(
-        p - price
-      ) <=
-      SETTINGS.restingRadiusUsd
-    ) {
-      const usd =
-        p *
-        Number(quantity);
+    equalCount,
 
-      if (
-        usd >=
-        SETTINGS.rawMinUsd
-      ) {
-        total += usd;
+    reactions,
 
-        levels.push({
-          price: p,
+    restingUsd: 0,
 
-          quantity:
-            Number(quantity),
+    restingConfirmed: false,
 
-          usd
-        });
-      }
-    }
-  }
+    restingLevels: [],
 
-  levels.sort(
-    (a, b) =>
-      b.usd - a.usd
-  );
+    distancePct: null,
 
-  return {
-    total,
-
-    levels:
-      levels.slice(0, 10)
+    timeframeWeight: weights
   };
-}
 
-/* ============================================================
-   APPLY ORDER BOOK CONFIRMATION
-============================================================ */
-
-function applyResting() {
-  for (
-    const level of
-      structure.levels
-  ) {
-    const resting =
-      restingNear(
-        level.price,
-        level.side
-      );
-
-    level.restingUsd =
-      resting.total;
-
-    level.restingLevels =
-      resting.levels;
-
-    level.distancePct =
-      state.currentPrice
-        ? pct(
-            level.price,
-            state.currentPrice
-          )
-        : null;
-
-    if (
-      resting.total >=
-      SETTINGS.restingConfirmUsd
-    ) {
-      level.score += Math.min(
-        25,
-        Math.floor(
-          resting.total /
-            250000
-        ) * 5
-      );
-    }
-  }
-}
-
-/* ============================================================
-   STRENGTH
-============================================================ */
-
-function strength(level) {
   if (
-    level.score >= 125 ||
+    score >= 125 ||
     (
-      level.timeframes.length >=
-        3 &&
-      level.equalCount >= 4
+      tfs.length >= 3 &&
+      equalCount >= 4
     )
   ) {
-    return 'HIGH';
-  }
 
-  if (
-    level.score >= 90 ||
-    level.timeframes.length >=
-      2 ||
-    level.equalCount >= 3
+    level.strength = 'HIGH';
+
+  } else if (
+    score >= 90 ||
+    tfs.length >= 2 ||
+    equalCount >= 3
   ) {
-    return 'MEDIUM';
+
+    level.strength = 'MEDIUM';
   }
 
-  return 'LOW';
+  return level;
+}
+
+function mergeAcrossTimeframes(
+  allPoints,
+  side
+) {
+
+  const groups = [];
+
+  const sorted =
+    [...allPoints]
+      .sort(
+        (a, b) =>
+          a.price - b.price
+      );
+
+  for (const p of sorted) {
+
+    let best = null;
+
+    for (const g of groups) {
+
+      const avg =
+        g.points.reduce(
+          (s, x) =>
+            s + x.price,
+          0
+        ) /
+        g.points.length;
+
+      const tolerance =
+        Math.max(
+          avg * 0.0025,
+          SETTINGS.mergeUsd
+        );
+
+      if (
+        Math.abs(
+          p.price - avg
+        ) <= tolerance
+      ) {
+
+        best = g;
+        break;
+      }
+    }
+
+    if (!best) {
+
+      groups.push({
+        points: [p]
+      });
+
+    } else {
+
+      best.points.push(p);
+    }
+  }
+
+  return groups
+    .map(buildLevel)
+    .sort(
+      (a, b) =>
+        b.score - a.score
+    )
+    .slice(
+      0,
+      SETTINGS.maxLevels
+    );
 }
 
 /* ============================================================
-   MAJOR LEVEL LOGIC
-   THIS IS THE IMPORTANT CHANGE
+   MAJOR LEVEL FILTER
 ============================================================ */
 
-/*
-   Calculate the combined structural weight.
-
-   15m = 1
-   1h  = 2
-   4h  = 3
-   1d  = 4
-*/
-
 function timeframeWeight(level) {
+
   return level.timeframes.reduce(
-    (sum, tf) =>
-      sum +
-      (
-        STRUCTURE[tf]?.weight ||
-        0
-      ),
+    (s, tf) =>
+      s +
+      (STRUCTURE[tf]?.weight || 0),
     0
   );
 }
 
-/*
-   A level is "major" only when:
-
-   1. It is at least 0.50% away from
-      current price.
-
-   2. It has meaningful timeframe
-      structure.
-
-   3. 15m-only levels are excluded.
-
-   4. A 1H-only level needs stronger
-      score.
-
-   5. 4H/1D levels can qualify using
-      the normal structural score.
-*/
-
 function isMajorLevel(level) {
-  const current =
-    state.currentPrice;
 
-  if (!current) {
+  if (!state.currentPrice) {
     return false;
   }
 
   const distance =
     Math.abs(
-      pct(
-        level.price,
-        current
-      )
-    );
-
-  /*
-     Too close to current price.
-  */
+      (level.price -
+        state.currentPrice) /
+        state.currentPrice
+    ) * 100;
 
   if (
     distance <
@@ -1131,26 +813,6 @@ function isMajorLevel(level) {
   ) {
     return false;
   }
-
-  /*
-     15m-only is near liquidity,
-     not major liquidity.
-  */
-
-  const has1h =
-    level.timeframes.includes(
-      '1h'
-    );
-
-  const has4h =
-    level.timeframes.includes(
-      '4h'
-    );
-
-  const has1d =
-    level.timeframes.includes(
-      '1d'
-    );
 
   const weight =
     timeframeWeight(level);
@@ -1162,102 +824,1397 @@ function isMajorLevel(level) {
     return false;
   }
 
-  /*
-     1H-only levels need stronger
-     structural evidence.
-  */
+  const hasHigher =
+    level.timeframes.some(
+      tf =>
+        tf === '4h' ||
+        tf === '1d'
+    );
 
-  if (
-    has1h &&
-    !has4h &&
-    !has1d &&
-    level.score <
-      SETTINGS.major1hMinScore
-  ) {
-    return false;
-  }
+  const has1h =
+    level.timeframes.includes('1h');
 
-  /*
-     Higher timeframe levels qualify
-     with normal structural score.
-  */
+  if (hasHigher) {
 
-  if (
-    (has4h || has1d) &&
-    level.score >=
+    return (
+      level.score >=
       SETTINGS.majorHigherTfMinScore
-  ) {
-    return true;
+    );
   }
 
-  /*
-     Multi-timeframe 1H + 15m.
-  */
+  if (has1h) {
 
-  if (
-    has1h &&
-    level.score >=
+    return (
+      level.score >=
       SETTINGS.major1hMinScore
-  ) {
-    return true;
+    );
   }
 
   return false;
 }
 
-/*
-   Nearby liquidity deliberately keeps
-   levels that are useful tactically but
-   are too close to be called major.
-*/
-
 function isNearLevel(level) {
-  const current =
-    state.currentPrice;
 
-  if (!current) {
+  if (!state.currentPrice) {
     return false;
   }
 
-  const distance =
-    Math.abs(
-      pct(
-        level.price,
-        current
-      )
-    );
-
   return (
-    distance <
+    Math.abs(
+      (level.price -
+        state.currentPrice) /
+        state.currentPrice
+    ) * 100
+    <
     SETTINGS.majorMinDistancePct
   );
 }
 
 /* ============================================================
-   DECORATE
+   STRUCTURE REBUILD
 ============================================================ */
 
-function decorate(level) {
+function rebuildStructure() {
+
+  const allHighs = [];
+  const allLows = [];
+
+  structure.swingHighs = [];
+  structure.swingLows = [];
+
+  for (
+    const [tf, cfg]
+    of Object.entries(STRUCTURE)
+  ) {
+
+    const s =
+      timeframeStructure(
+        tf,
+        candles[tf],
+        cfg
+      );
+
+    structure.swingHighs.push(
+      ...s.highs
+    );
+
+    structure.swingLows.push(
+      ...s.lows
+    );
+
+    allHighs.push(
+      ...s.highs
+    );
+
+    allLows.push(
+      ...s.lows
+    );
+  }
+
+  structure.equalHighs =
+    allHighs.filter(
+      p => p.reactions >= 1
+    );
+
+  structure.equalLows =
+    allLows.filter(
+      p => p.reactions >= 1
+    );
+
+  const highs =
+    mergeAcrossTimeframes(
+      allHighs,
+      'BSL'
+    );
+
+  const lows =
+    mergeAcrossTimeframes(
+      allLows,
+      'SSL'
+    );
+
+  structure.levels = [
+    ...highs,
+    ...lows
+  ];
+
+  applyResting();
+}
+
+/* ============================================================
+   RAW BOOK ROWS
+============================================================ */
+
+function bookRows(side) {
+
+  const map =
+    side === 'bid'
+      ? book.bids
+      : book.asks;
+
+  return [
+    ...map.entries()
+  ]
+
+    .map(
+      ([price, qty]) => ({
+        price,
+        quantity: qty,
+        usd: price * qty
+      })
+    )
+
+    .filter(
+      x =>
+        x.usd >=
+        SETTINGS.rawMinUsd
+    )
+
+    .sort(
+      (a, b) =>
+        side === 'bid'
+          ? b.price - a.price
+          : a.price - b.price
+    );
+}
+
+/* ============================================================
+   STRUCTURAL RESTING LIQUIDITY
+============================================================ */
+
+function restingNear(
+  price,
+  side
+) {
+
+  const rows =
+    bookRows(
+      side === 'BSL'
+        ? 'ask'
+        : 'bid'
+    );
+
+  const levels =
+    rows.filter(
+      x =>
+        Math.abs(
+          x.price - price
+        ) <=
+        SETTINGS.restingRadiusUsd
+    );
+
   return {
-    side: level.side,
 
-    price: round(
-      level.price
-    ),
+    usd:
+      levels.reduce(
+        (s, x) =>
+          s + x.usd,
+        0
+      ),
 
-    priceLow: round(
-      level.priceLow
-    ),
+    levels
+  };
+}
 
-    priceHigh: round(
-      level.priceHigh
-    ),
+function applyResting() {
+
+  for (
+    const level of structure.levels
+  ) {
+
+    const r =
+      restingNear(
+        level.price,
+        level.side
+      );
+
+    level.restingUsd =
+      round(r.usd, 2);
+
+    level.restingLevels =
+      r.levels
+        .slice(0, 20)
+        .map(
+          x => ({
+            price:
+              round(x.price, 2),
+
+            quantity:
+              round(x.quantity, 6),
+
+            usd:
+              round(x.usd, 2)
+          })
+        );
+
+    level.restingConfirmed =
+      r.usd >=
+      SETTINGS.restingConfirmUsd;
+
+    level.scoreBase =
+      level.scoreBase ??
+      level.score;
+
+    /*
+       Recalculate from structural
+       score instead of repeatedly
+       stacking bonuses.
+    */
+
+    const bonus =
+      Math.min(
+        25,
+        Math.floor(
+          r.usd /
+          SETTINGS.restingConfirmUsd
+        ) * 10
+      );
+
+    level.score =
+      level.scoreBase +
+      bonus;
+
+    if (
+      level.score >= 125 ||
+      (
+        level.timeframes.length >= 3 &&
+        level.equalCount >= 4
+      )
+    ) {
+
+      level.strength = 'HIGH';
+
+    } else if (
+      level.score >= 90 ||
+      level.timeframes.length >= 2 ||
+      level.equalCount >= 3
+    ) {
+
+      level.strength = 'MEDIUM';
+
+    } else {
+
+      level.strength = 'LOW';
+    }
+
+    level.distancePct =
+      pctDistance(
+        level.price,
+        state.currentPrice
+      );
+  }
+}
+
+/* ============================================================
+   ORDER BOOK CLUSTERS
+============================================================ */
+
+function bookClusters(side) {
+
+  const rows =
+    bookRows(side);
+
+  if (!rows.length) {
+    return [];
+  }
+
+  const sorted =
+    [...rows].sort(
+      (a, b) =>
+        a.price - b.price
+    );
+
+  const clusters = [];
+
+  let current = [];
+
+  for (const row of sorted) {
+
+    if (
+      !current.length ||
+      row.price -
+        current.at(-1).price
+        <= SETTINGS.orderGapUsd
+    ) {
+
+      current.push(row);
+
+    } else {
+
+      clusters.push(current);
+      current = [row];
+    }
+  }
+
+  if (current.length) {
+    clusters.push(current);
+  }
+
+  return clusters
+
+    /*
+       IMPORTANT:
+       A persistence candidate must
+       contain at least 3 neighboring
+       levels.
+    */
+    .filter(
+      c =>
+        c.length >=
+        SETTINGS.minClusterLevels
+    )
+
+    .map(c => ({
+
+      side,
+
+      priceLow:
+        c[0].price,
+
+      priceHigh:
+        c.at(-1).price,
+
+      midpoint:
+        c.reduce(
+          (s, x) =>
+            s + x.price,
+          0
+        ) /
+        c.length,
+
+      usd:
+        c.reduce(
+          (s, x) =>
+            s + x.usd,
+          0
+        ),
+
+      levels:
+        c.length,
+
+      strongestPrice:
+        c.reduce(
+          (a, b) =>
+            a.usd >= b.usd
+              ? a
+              : b
+        ).price
+    }))
+
+    .filter(
+      c =>
+        c.usd >=
+        SETTINGS.orderMinUsd
+    )
+
+    .sort(
+      (a, b) =>
+        b.usd - a.usd
+    );
+}
+
+/* ============================================================
+   PERSISTENCE MATCHING
+============================================================ */
+
+function clusterStillNear(
+  current,
+  previous
+) {
+
+  const tolerance =
+    Math.max(
+      SETTINGS.orderGapUsd * 2,
+
+      (current.midpoint || 0) *
+        SETTINGS.persistenceTolerancePct
+    );
+
+  const midpointClose =
+    Math.abs(
+      current.midpoint -
+      previous.midpoint
+    ) <= tolerance;
+
+  const zonesOverlap =
+    current.priceLow <=
+      previous.priceHigh &&
+    current.priceHigh >=
+      previous.priceLow;
+
+  return (
+    midpointClose ||
+    zonesOverlap
+  );
+}
+
+/* ============================================================
+   PERSISTENCE STATE
+============================================================ */
+
+function persistenceState(
+  previous,
+  currentUsd
+) {
+
+  if (!previous) {
+    return 'NEW';
+  }
+
+  /*
+     Compare current liquidity
+     to the previous observation.
+  */
+
+  const previousUsd =
+    previous.currentUsd || 0;
+
+  if (
+    currentUsd >
+    previousUsd * 1.15
+  ) {
+
+    return 'STRENGTHENING';
+  }
+
+  if (
+    currentUsd <
+    previousUsd * 0.70
+  ) {
+
+    return 'WEAKENING';
+  }
+
+  return 'HOLDING';
+}
+
+/* ============================================================
+   STRUCTURAL RELATIONSHIP
+============================================================ */
+
+function structuralNearBookCluster(p) {
+
+  const structuralSide =
+    p.side === 'ask'
+      ? 'BSL'
+      : 'SSL';
+
+  const candidates =
+    structure.levels.filter(
+      l =>
+        l.side ===
+        structuralSide
+    );
+
+  let best = null;
+  let bestDistance = Infinity;
+
+  for (
+    const level of candidates
+  ) {
+
+    /*
+       Distance from order-book
+       cluster to structural zone.
+    */
+
+    const distance =
+      Math.min(
+
+        Math.abs(
+          p.midpoint -
+          level.priceLow
+        ),
+
+        Math.abs(
+          p.midpoint -
+          level.priceHigh
+        ),
+
+        Math.abs(
+          p.midpoint -
+          level.price
+        )
+      );
+
+    const maxDistance =
+      Math.max(
+        SETTINGS.orderGapUsd * 3,
+        level.price * 0.003
+      );
+
+    if (
+      distance <= maxDistance &&
+      distance < bestDistance
+    ) {
+
+      best = level;
+      bestDistance = distance;
+    }
+  }
+
+  return best;
+}
+
+/* ============================================================
+   LIQUIDITY EVENT
+============================================================ */
+
+function correlateLiquidityEvent(
+  persistenceItem,
+  type
+) {
+
+  const level =
+    structuralNearBookCluster(
+      persistenceItem
+    );
+
+  /*
+     Only persistent/confluence
+     events need a structural level.
+
+     Removed liquidity is still
+     useful even when it is not
+     directly on a major level.
+  */
+
+  if (
+    !level &&
+    type !== 'REMOVED'
+  ) {
+
+    return;
+  }
+
+  const key =
+    `${type}|${persistenceItem.id}|${level?.side || persistenceItem.side}`;
+
+  const duplicate =
+    state.liquidityEvents.find(
+      e =>
+        e.key === key &&
+        now() - e.time < 60000
+    );
+
+  if (duplicate) {
+    return;
+  }
+
+  let message =
+    'PERSISTENT LIQUIDITY';
+
+  if (type === 'REMOVED') {
+    message =
+      'LIQUIDITY REMOVED';
+  } else if (level) {
+    message =
+      'CONFLUENCE';
+  }
+
+  const event = {
+
+    key,
+
+    type,
+
+    time: now(),
+
+    side:
+      persistenceItem.side === 'ask'
+        ? 'BSL'
+        : 'SSL',
+
+    bookPriceLow:
+      round(
+        persistenceItem.priceLow,
+        2
+      ),
+
+    bookPriceHigh:
+      round(
+        persistenceItem.priceHigh,
+        2
+      ),
+
+    currentUsd:
+      round(
+        persistenceItem.currentUsd,
+        2
+      ),
+
+    maxUsd:
+      round(
+        persistenceItem.maxUsd,
+        2
+      ),
+
+    durationMs:
+      persistenceItem.durationMs,
+
+    structuralLevel:
+      level
+        ? round(level.price, 2)
+        : null,
+
+    structuralZoneLow:
+      level
+        ? round(level.priceLow, 2)
+        : null,
+
+    structuralZoneHigh:
+      level
+        ? round(level.priceHigh, 2)
+        : null,
+
+    timeframes:
+      level
+        ? level.timeframes
+        : [],
+
+    message
+  };
+
+  state.liquidityEvents.unshift(
+    event
+  );
+
+  state.liquidityEvents =
+    state.liquidityEvents.slice(
+      0,
+      SETTINGS.eventMax
+    );
+}
+
+/* ============================================================
+   PERSISTENCE UPDATE
+============================================================ */
+
+function updatePersistence() {
+
+  const timestamp = now();
+
+  for (
+    const side of ['bids', 'asks']
+  ) {
+
+    const bookSide =
+      side === 'bids'
+        ? 'bid'
+        : 'ask';
+
+    const currentClusters =
+      bookClusters(bookSide);
+
+    const existing =
+      persistence[side];
+
+    const used =
+      new Set();
+
+    /*
+       Match current clusters
+       against previous clusters.
+    */
+
+    for (
+      const cluster
+      of currentClusters
+    ) {
+
+      let matchIndex = -1;
+      let bestDistance = Infinity;
+
+      for (
+        let i = 0;
+        i < existing.length;
+        i++
+      ) {
+
+        if (
+          used.has(i)
+        ) {
+          continue;
+        }
+
+        if (
+          existing[i].removed
+        ) {
+          continue;
+        }
+
+        if (
+          !clusterStillNear(
+            cluster,
+            existing[i]
+          )
+        ) {
+          continue;
+        }
+
+        const distance =
+          Math.abs(
+            cluster.midpoint -
+            existing[i].midpoint
+          );
+
+        if (
+          distance <
+          bestDistance
+        ) {
+
+          bestDistance =
+            distance;
+
+          matchIndex = i;
+        }
+      }
+
+      /*
+         Existing persistent cluster
+      */
+
+      if (matchIndex >= 0) {
+
+        const item =
+          existing[matchIndex];
+
+        used.add(matchIndex);
+
+        const previousUsd =
+          item.currentUsd;
+
+        item.lastSeen =
+          timestamp;
+
+        item.currentUsd =
+          cluster.usd;
+
+        item.maxUsd =
+          Math.max(
+            item.maxUsd,
+            cluster.usd
+          );
+
+        item.observations++;
+
+        item.priceLow =
+          cluster.priceLow;
+
+        item.priceHigh =
+          cluster.priceHigh;
+
+        item.midpoint =
+          cluster.midpoint;
+
+        item.levels =
+          cluster.levels;
+
+        item.strongestPrice =
+          cluster.strongestPrice;
+
+        item.durationMs =
+          timestamp -
+          item.firstSeen;
+
+        item.previousUsd =
+          previousUsd;
+
+        item.changeUsd =
+          cluster.usd -
+          previousUsd;
+
+        item.status =
+          persistenceState(
+            item,
+            cluster.usd
+          );
+
+        /*
+           Once it has survived
+           long enough, classify
+           as persistent.
+        */
+
+        if (
+          item.durationMs >=
+          SETTINGS.persistenceConfirmMs
+        ) {
+
+          if (
+            item.status === 'NEW'
+          ) {
+
+            item.status =
+              'HOLDING';
+          }
+        }
+
+      } else {
+
+        /*
+           New cluster
+        */
+
+        const item = {
+
+          id:
+            `${side}-${Math.round(cluster.midpoint)}-${timestamp}`,
+
+          side: bookSide,
+
+          priceLow:
+            cluster.priceLow,
+
+          priceHigh:
+            cluster.priceHigh,
+
+          midpoint:
+            cluster.midpoint,
+
+          strongestPrice:
+            cluster.strongestPrice,
+
+          levels:
+            cluster.levels,
+
+          firstSeen:
+            timestamp,
+
+          lastSeen:
+            timestamp,
+
+          durationMs: 0,
+
+          currentUsd:
+            cluster.usd,
+
+          maxUsd:
+            cluster.usd,
+
+          previousUsd: 0,
+
+          changeUsd: 0,
+
+          observations: 1,
+
+          status: 'NEW',
+
+          removed: false
+        };
+
+        existing.push(item);
+      }
+    }
+
+    /*
+       Detect clusters that disappeared.
+    */
+
+    for (
+      let i = existing.length - 1;
+      i >= 0;
+      i--
+    ) {
+
+      const item =
+        existing[i];
+
+      if (
+        item.removed
+      ) {
+        continue;
+      }
+
+      const age =
+        timestamp -
+        item.lastSeen;
+
+      /*
+         One complete polling cycle
+         without seeing the cluster
+         = removed.
+      */
+
+      if (
+        age >
+        SETTINGS.persistencePollMs * 1.5
+      ) {
+
+        item.removed = true;
+
+        item.status =
+          'REMOVED';
+
+        item.currentUsd = 0;
+
+        item.durationMs =
+          item.lastSeen -
+          item.firstSeen;
+
+        correlateLiquidityEvent(
+          item,
+          'REMOVED'
+        );
+      }
+
+      /*
+         Keep history temporarily,
+         then discard old records.
+      */
+
+      if (
+        timestamp -
+          item.lastSeen >
+        SETTINGS.persistenceMaxAgeMs
+      ) {
+
+        existing.splice(i, 1);
+      }
+    }
+
+    persistence[side] =
+      existing;
+  }
+
+  /*
+     Generate persistent/confluence
+     events after confirmation.
+  */
+
+  for (
+    const side
+    of ['bids', 'asks']
+  ) {
+
+    for (
+      const item
+      of persistence[side]
+    ) {
+
+      if (item.removed) {
+        continue;
+      }
+
+      if (
+        item.durationMs >=
+        SETTINGS.persistenceConfirmMs
+      ) {
+
+        if (
+          item.status ===
+            'HOLDING'
+        ) {
+
+          correlateLiquidityEvent(
+            item,
+            'PERSISTENT'
+          );
+
+        } else if (
+          item.status ===
+            'STRENGTHENING'
+        ) {
+
+          correlateLiquidityEvent(
+            item,
+            'STRENGTHENING'
+          );
+
+        } else if (
+          item.status ===
+            'WEAKENING'
+        ) {
+
+          correlateLiquidityEvent(
+            item,
+            'WEAKENING'
+          );
+        }
+      }
+    }
+  }
+}
+
+/* ============================================================
+   TRUE SWEEP DETECTION
+============================================================ */
+
+function sweepExists(
+  side,
+  level,
+  candleTime
+) {
+
+  return state.sweeps.some(
+    s =>
+      s.side === side &&
+      s.level ===
+        round(level.price, 2) &&
+      s.candleTime ===
+        candleTime
+  );
+}
+
+function detectCandleSweeps(
+  timeframe,
+  candle
+) {
+
+  if (
+    !candle ||
+    !Number.isFinite(candle.high) ||
+    !Number.isFinite(candle.low) ||
+    !Number.isFinite(candle.close)
+  ) {
+
+    return;
+  }
+
+  /*
+     Only major structural liquidity
+     participates in true sweeps.
+  */
+
+  const levels =
+    structure.levels.filter(
+      isMajorLevel
+    );
+
+  for (
+    const level of levels
+  ) {
+
+    /*
+       Penetration amount.
+    */
+
+    const penetration =
+      level.price *
+      SETTINGS.sweepMinPenetrationPct;
+
+    /*
+       =========================================
+       BSL SWEEP
+       =========================================
+
+       Price trades ABOVE the entire
+       structural zone.
+
+       Then candle closes BACK BELOW
+       the zone.
+
+       This is a true wick/reclaim
+       definition rather than merely
+       crossing the level.
+    */
+
+    if (
+      level.side === 'BSL'
+    ) {
+
+      const tradedAbove =
+        candle.high >=
+        level.priceHigh +
+          penetration;
+
+      const reclaimed =
+        candle.close <
+        level.priceHigh;
+
+      if (
+        tradedAbove &&
+        reclaimed &&
+        !sweepExists(
+          'BSL',
+          level,
+          candle.openTime
+        )
+      ) {
+
+        recordSweep(
+          'BSL',
+          level,
+          candle.high,
+          timeframe,
+          candle.openTime,
+          true
+        );
+      }
+    }
+
+    /*
+       =========================================
+       SSL SWEEP
+       =========================================
+
+       Price trades BELOW the entire
+       structural zone.
+
+       Then candle closes BACK ABOVE
+       the zone.
+    */
+
+    if (
+      level.side === 'SSL'
+    ) {
+
+      const tradedBelow =
+        candle.low <=
+        level.priceLow -
+          penetration;
+
+      const reclaimed =
+        candle.close >
+        level.priceLow;
+
+      if (
+        tradedBelow &&
+        reclaimed &&
+        !sweepExists(
+          'SSL',
+          level,
+          candle.openTime
+        )
+      ) {
+
+        recordSweep(
+          'SSL',
+          level,
+          candle.low,
+          timeframe,
+          candle.openTime,
+          true
+        );
+      }
+    }
+  }
+}
+
+/* ============================================================
+   RECORD SWEEP
+============================================================ */
+
+function recordSweep(
+  side,
+  level,
+  sweepPrice,
+  timeframe,
+  candleTime,
+  reclaimed
+) {
+
+  const event = {
+
+    side,
+
+    level:
+      round(
+        level.price,
+        2
+      ),
+
+    zoneLow:
+      round(
+        level.priceLow,
+        2
+      ),
+
+    zoneHigh:
+      round(
+        level.priceHigh,
+        2
+      ),
+
+    sweepPrice:
+      round(
+        sweepPrice,
+        2
+      ),
+
+    timeframe,
+
+    candleTime,
+
+    status:
+      'SWEPT',
+
+    reclaimed:
+      !!reclaimed,
+
+    detectedAt:
+      now(),
+
+    timeframes:
+      level.timeframes
+  };
+
+  state.sweeps.unshift(
+    event
+  );
+
+  /*
+     Retain only recent sweeps.
+  */
+
+  state.sweeps =
+    state.sweeps
+      .filter(
+        s =>
+          now() -
+            s.detectedAt <=
+          SETTINGS.sweepLookbackMs
+      )
+      .slice(
+        0,
+        50
+      );
+
+  /*
+     Add event.
+  */
+
+  state.liquidityEvents.unshift({
+
+    key:
+      `SWEEP|${side}|${level.price}|${candleTime}`,
+
+    type:
+      'SWEEP',
+
+    time:
+      now(),
+
+    side,
+
+    structuralLevel:
+      round(
+        level.price,
+        2
+      ),
+
+    zoneLow:
+      round(
+        level.priceLow,
+        2
+      ),
+
+    zoneHigh:
+      round(
+        level.priceHigh,
+        2
+      ),
+
+    sweepPrice:
+      round(
+        sweepPrice,
+        2
+      ),
+
+    timeframe,
+
+    candleTime,
+
+    message:
+      `${side} SWEPT / RECLAIMED`
+  });
+
+  state.liquidityEvents =
+    state.liquidityEvents.slice(
+      0,
+      SETTINGS.eventMax
+    );
+}
+
+/* ============================================================
+   PUBLIC STRUCTURE
+============================================================ */
+
+function structural(side) {
+
+  applyResting();
+
+  return structure.levels
+
+    .filter(
+      level =>
+        level.side === side &&
+        isMajorLevel(level)
+    )
+
+    .sort(
+      (a, b) =>
+        Math.abs(
+          a.price -
+          state.currentPrice
+        ) -
+        Math.abs(
+          b.price -
+          state.currentPrice
+        )
+    );
+}
+
+function nearStructural(side) {
+
+  return structure.levels
+
+    .filter(
+      level =>
+        level.side === side &&
+        isNearLevel(level)
+    )
+
+    .sort(
+      (a, b) =>
+        Math.abs(
+          a.price -
+          state.currentPrice
+        ) -
+        Math.abs(
+          b.price -
+          state.currentPrice
+        )
+    );
+}
+
+/* ============================================================
+   PUBLIC LEVEL
+============================================================ */
+
+function publicLevel(level) {
+
+  return {
+
+    side:
+      level.side,
+
+    price:
+      round(
+        level.price,
+        2
+      ),
+
+    priceLow:
+      round(
+        level.priceLow,
+        2
+      ),
+
+    priceHigh:
+      round(
+        level.priceHigh,
+        2
+      ),
 
     score:
-      level.score,
+      round(
+        level.score,
+        2
+      ),
 
     strength:
-      strength(level),
+      level.strength,
 
     timeframes:
       level.timeframes,
@@ -1270,396 +2227,163 @@ function decorate(level) {
 
     restingUsd:
       round(
-        level.restingUsd
+        level.restingUsd,
+        2
       ),
 
     restingConfirmed:
-      level.restingUsd >=
-      SETTINGS.restingConfirmUsd,
+      level.restingConfirmed,
 
     restingLevels:
       level.restingLevels,
 
     distancePct:
-      state.currentPrice
-        ? round(
-            pct(
-              level.price,
-              state.currentPrice
-            ),
-            3
-          )
-        : null,
+      level.distancePct,
 
     timeframeWeight:
-      timeframeWeight(level)
+      level.timeframeWeight
   };
 }
 
 /* ============================================================
-   STRUCTURAL LEVELS
+   PUBLIC PERSISTENCE
 ============================================================ */
 
-/*
-   structural(side)
+function publicPersistence(side) {
 
-   IMPORTANT:
-   This now means MAJOR structural
-   liquidity only.
-*/
+  return persistence[side]
 
-function structural(side) {
-  return structure.levels
     .filter(
-      level =>
-        level.side === side &&
-        level.score >=
-          SETTINGS.minScore &&
-        isMajorLevel(level)
+      item =>
+        item.currentUsd >=
+          SETTINGS.orderMinUsd ||
+        item.removed
     )
-    .map(decorate);
-}
 
-/*
-   nearStructural(side)
-
-   These are intentionally separated
-   from major liquidity.
-*/
-
-function nearStructural(side) {
-  return structure.levels
-    .filter(
-      level =>
-        level.side === side &&
-        level.score >=
-          SETTINGS.minScore &&
-        isNearLevel(level)
+    .sort(
+      (a, b) =>
+        b.currentUsd -
+        a.currentUsd
     )
-    .map(decorate);
-}
 
-/* ============================================================
-   ORDER BOOK CLUSTERS
-============================================================ */
+    .slice(
+      0,
+      20
+    )
 
-function bookClusters() {
-  function cluster(
-    rows,
-    side
-  ) {
-    const output = [];
+    .map(item => {
 
-    for (
-      const row of rows
-    ) {
-      const last =
-        output[
-          output.length - 1
-        ];
+      const structuralLevel =
+        structuralNearBookCluster(
+          item
+        );
 
-      if (
-        last &&
-        Math.abs(
-          row.price -
-            last.priceHigh
-        ) <=
-        SETTINGS.orderGapUsd
-      ) {
-        last.priceLow =
-          Math.min(
-            last.priceLow,
-            row.price
-          );
+      return {
 
-        last.priceHigh =
-          Math.max(
-            last.priceHigh,
-            row.price
-          );
+        side:
+          item.side,
 
-        last.usd +=
-          row.usd;
+        priceLow:
+          round(
+            item.priceLow,
+            2
+          ),
 
-        last.levels += 1;
-      } else {
-        output.push({
-          side,
-
-          priceLow:
-            row.price,
-
-          priceHigh:
-            row.price,
-
-          midpoint:
-            row.price,
-
-          usd:
-            row.usd,
-
-          levels: 1
-        });
-      }
-    }
-
-    return output
-      .filter(
-        x =>
-          x.usd >=
-          SETTINGS.orderMinUsd
-      )
-      .map(x => ({
-        ...x,
+        priceHigh:
+          round(
+            item.priceHigh,
+            2
+          ),
 
         midpoint:
           round(
-            (
-              x.priceLow +
-              x.priceHigh
-            ) / 2
+            item.midpoint,
+            2
+          ),
+
+        strongestPrice:
+          round(
+            item.strongestPrice,
+            2
           ),
 
         usd:
           round(
-            x.usd
-          )
-      }));
-  }
+            item.currentUsd,
+            2
+          ),
 
-  return {
-    bids: cluster(
-      bookRows('SSL'),
-      'bid'
-    ),
+        maxUsd:
+          round(
+            item.maxUsd,
+            2
+          ),
 
-    asks: cluster(
-      bookRows('BSL'),
-      'ask'
-    )
-  };
-}
+        previousUsd:
+          round(
+            item.previousUsd || 0,
+            2
+          ),
 
-/* ============================================================
-   LIVE PRICE
-============================================================ */
+        changeUsd:
+          round(
+            item.changeUsd || 0,
+            2
+          ),
 
-function updatePrice(
-  price,
-  source
-) {
-  const p =
-    Number(price);
+        levels:
+          item.levels,
 
-  if (
-    !Number.isFinite(p) ||
-    p <= 0
-  ) {
-    return;
-  }
+        firstSeen:
+          new Date(
+            item.firstSeen
+          ).toISOString(),
 
-  const previous =
-    state.currentPrice;
+        lastSeen:
+          new Date(
+            item.lastSeen
+          ).toISOString(),
 
-  state.currentPrice =
-    p;
+        durationMs:
+          item.durationMs,
 
-  state.priceSource =
-    source ||
-    state.priceSource;
+        durationSec:
+          round(
+            item.durationMs /
+              1000,
+            0
+          ),
 
-  if (previous) {
-    detectSweep(
-      previous,
-      p
-    );
-  }
+        observations:
+          item.observations,
 
-  applyResting();
+        status:
+          item.status,
 
-  state.updatedAt =
-    iso();
-}
+        removed:
+          item.removed,
 
-/* ============================================================
-   LIVE PRICE FROM ORDER BOOK
-============================================================ */
+        persistent:
+          item.durationMs >=
+          SETTINGS.persistenceConfirmMs,
 
-function updatePriceFromBook() {
-  if (
-    !book.bids.size &&
-    !book.asks.size
-  ) {
-    return;
-  }
+        structuralConfluence:
+          !!structuralLevel,
 
-  let bestBid =
-    -Infinity;
+        structuralLevel:
+          structuralLevel
+            ? round(
+                structuralLevel.price,
+                2
+              )
+            : null,
 
-  let bestAsk =
-    Infinity;
-
-  for (
-    const price of
-      book.bids.keys()
-  ) {
-    if (
-      Number(price) >
-      bestBid
-    ) {
-      bestBid =
-        Number(price);
-    }
-  }
-
-  for (
-    const price of
-      book.asks.keys()
-  ) {
-    if (
-      Number(price) <
-      bestAsk
-    ) {
-      bestAsk =
-        Number(price);
-    }
-  }
-
-  let price =
-    null;
-
-  if (
-    Number.isFinite(
-      bestBid
-    ) &&
-    Number.isFinite(
-      bestAsk
-    )
-  ) {
-    price =
-      (
-        bestBid +
-        bestAsk
-      ) / 2;
-  } else if (
-    Number.isFinite(
-      bestBid
-    )
-  ) {
-    price =
-      bestBid;
-  } else if (
-    Number.isFinite(
-      bestAsk
-    )
-  ) {
-    price =
-      bestAsk;
-  }
-
-  if (price) {
-    updatePrice(
-      price,
-      'futures_orderbook_mid'
-    );
-  }
-}
-
-/* ============================================================
-   SWEEP DETECTION
-============================================================ */
-
-function recordSweep(
-  side,
-  level,
-  price
-) {
-  const last =
-    state.sweeps[
-      state.sweeps.length - 1
-    ];
-
-  if (
-    last &&
-    last.side === side &&
-    Math.abs(
-      last.level - level
-    ) < 20 &&
-    Date.now() -
-      new Date(
-        last.time
-      ).getTime() <
-      SETTINGS.sweepMs
-  ) {
-    return;
-  }
-
-  state.sweeps.push({
-    side,
-
-    level:
-      round(level),
-
-    price:
-      round(price),
-
-    time:
-      iso()
-  });
-
-  if (
-    state.sweeps.length >
-    30
-  ) {
-    state.sweeps.shift();
-  }
-}
-
-function detectSweep(
-  previous,
-  current
-) {
-  /*
-     Keep sweep detection based on
-     ALL structural levels, including
-     nearby levels.
-
-     This is intentionally separate
-     from the MAJOR display filter.
-  */
-
-  for (
-    const level of
-      structure.levels
-  ) {
-    if (
-      level.side === 'BSL' &&
-      previous <
-        level.price &&
-      current >=
-        level.price
-    ) {
-      recordSweep(
-        'BSL',
-        level.price,
-        current
-      );
-    }
-
-    if (
-      level.side === 'SSL' &&
-      previous >
-        level.price &&
-      current <=
-        level.price
-    ) {
-      recordSweep(
-        'SSL',
-        level.price,
-        current
-      );
-    }
-  }
+        structuralTimeframes:
+          structuralLevel
+            ? structuralLevel.timeframes
+            : []
+      };
+    });
 }
 
 /* ============================================================
@@ -1667,42 +2391,20 @@ function detectSweep(
 ============================================================ */
 
 function intelligence() {
+
   applyResting();
 
-  const current =
-    state.currentPrice;
+  if (!state.currentPrice) {
 
-  if (!current) {
     return {
       state:
-        'WAITING FOR LIVE PRICE',
-
-      nearestBSL:
-        null,
-
-      nearestSSL:
-        null,
-
-      nextBSL: [],
-
-      nextSSL: [],
-
-      nearBSL: [],
-
-      nearSSL: [],
-
-      orderBook:
-        bookClusters(),
-
-      recentSweeps:
-        state.sweeps
-          .slice(-10)
-          .reverse()
+        'WAITING FOR LIVE PRICE'
     };
   }
 
   /*
-     MAJOR LEVELS ONLY
+     Major structural liquidity
+     above and below price.
   */
 
   const bsl =
@@ -1710,11 +2412,7 @@ function intelligence() {
       .filter(
         level =>
           level.price >
-          current
-      )
-      .sort(
-        (a, b) =>
-          a.price - b.price
+          state.currentPrice
       );
 
   const ssl =
@@ -1722,85 +2420,202 @@ function intelligence() {
       .filter(
         level =>
           level.price <
-          current
-      )
-      .sort(
-        (a, b) =>
-          b.price - a.price
+          state.currentPrice
       );
 
   /*
-     NEAR LIQUIDITY
+     Tactical nearby levels.
   */
 
-  const nearBSL =
+  const nearBsl =
     nearStructural('BSL')
       .filter(
         level =>
           level.price >
-          current
-      )
-      .sort(
-        (a, b) =>
-          a.price - b.price
-      )
-      .slice(0, 5);
+          state.currentPrice
+      );
 
-  const nearSSL =
+  const nearSsl =
     nearStructural('SSL')
       .filter(
         level =>
           level.price <
-          current
-      )
-      .sort(
-        (a, b) =>
-          b.price - a.price
-      )
-      .slice(0, 5);
+          state.currentPrice
+      );
+
+  let status =
+    'NO MAJOR STRUCTURAL LIQUIDITY';
+
+  if (
+    bsl.length &&
+    ssl.length
+  ) {
+
+    status =
+      'BETWEEN MAJOR LIQUIDITY';
+
+  } else if (bsl.length) {
+
+    status =
+      'MAJOR UPSIDE LIQUIDITY ONLY';
+
+  } else if (ssl.length) {
+
+    status =
+      'MAJOR DOWNSIDE LIQUIDITY ONLY';
+  }
 
   return {
-    state:
-      bsl[0] && ssl[0]
-        ? 'BETWEEN MAJOR LIQUIDITY'
-        : bsl[0]
-        ? 'MAJOR UPSIDE LIQUIDITY ONLY'
-        : ssl[0]
-        ? 'MAJOR DOWNSIDE LIQUIDITY ONLY'
-        : 'NO MAJOR STRUCTURAL LIQUIDITY',
 
-    /*
-       These are now MAJOR levels.
-    */
+    state: status,
 
     nearestBSL:
-      bsl[0] || null,
+      bsl[0]
+        ? publicLevel(bsl[0])
+        : null,
 
     nearestSSL:
-      ssl[0] || null,
+      ssl[0]
+        ? publicLevel(ssl[0])
+        : null,
 
     nextBSL:
-      bsl.slice(0, 5),
+      bsl
+        .slice(0, 5)
+        .map(publicLevel),
 
     nextSSL:
-      ssl.slice(0, 5),
+      ssl
+        .slice(0, 5)
+        .map(publicLevel),
+
+    nearBSL:
+      nearBsl
+        .slice(0, 5)
+        .map(publicLevel),
+
+    nearSSL:
+      nearSsl
+        .slice(0, 5)
+        .map(publicLevel),
 
     /*
-       Tactical nearby levels remain
-       visible separately.
+       CURRENT order-book clusters.
+       These are NOT automatically
+       structural levels.
     */
 
-    nearBSL,
+    orderBook: {
 
-    nearSSL,
+      bids:
+        bookClusters('bid')
+          .slice(0, 10)
+          .map(
+            cluster => ({
 
-    orderBook:
-      bookClusters(),
+              side:
+                cluster.side,
+
+              priceLow:
+                round(
+                  cluster.priceLow,
+                  2
+                ),
+
+              priceHigh:
+                round(
+                  cluster.priceHigh,
+                  2
+                ),
+
+              midpoint:
+                round(
+                  cluster.midpoint,
+                  2
+                ),
+
+              usd:
+                round(
+                  cluster.usd,
+                  2
+                ),
+
+              levels:
+                cluster.levels
+            })
+          ),
+
+      asks:
+        bookClusters('ask')
+          .slice(0, 10)
+          .map(
+            cluster => ({
+
+              side:
+                cluster.side,
+
+              priceLow:
+                round(
+                  cluster.priceLow,
+                  2
+                ),
+
+              priceHigh:
+                round(
+                  cluster.priceHigh,
+                  2
+                ),
+
+              midpoint:
+                round(
+                  cluster.midpoint,
+                  2
+                ),
+
+              usd:
+                round(
+                  cluster.usd,
+                  2
+                ),
+
+              levels:
+                cluster.levels
+            })
+          )
+    },
+
+    /*
+       PERSISTENT liquidity.
+    */
+
+    persistentLiquidity: {
+
+      bids:
+        publicPersistence(
+          'bids'
+        ),
+
+      asks:
+        publicPersistence(
+          'asks'
+        )
+    },
+
+    /*
+       Liquidity events.
+    */
+
+    liquidityEvents:
+      state.liquidityEvents
+        .slice(0, 20),
+
+    /*
+       True sweep events.
+    */
 
     recentSweeps:
       state.sweeps
-        .slice(-10)
-        .reverse()
+        .slice(0, 20)
   };
 }
 
@@ -1809,546 +2624,648 @@ function intelligence() {
 ============================================================ */
 
 function publicStructure() {
-  /*
-     MAIN MAP = MAJOR LEVELS ONLY
-  */
+
+  applyResting();
 
   const bsl =
-    structural('BSL')
-      .sort(
-        (a, b) =>
-          Math.abs(
-            a.price -
-              (
-                state.currentPrice ||
-                0
-              )
-          ) -
-          Math.abs(
-            b.price -
-              (
-                state.currentPrice ||
-                0
-              )
-          )
-      )
-      .slice(
-        0,
-        SETTINGS.maxLevels
-      );
+    structural('BSL');
 
   const ssl =
-    structural('SSL')
-      .sort(
-        (a, b) =>
-          Math.abs(
-            a.price -
-              (
-                state.currentPrice ||
-                0
-              )
-          ) -
-          Math.abs(
-            b.price -
-              (
-                state.currentPrice ||
-                0
-              )
-          )
-      )
-      .slice(
-        0,
-        SETTINGS.maxLevels
-      );
-
-  const resistance =
-    bsl
-      .filter(
-        level =>
-          state.currentPrice
-            ? level.price >
-              state.currentPrice
-            : true
-      )
-      .sort(
-        (a, b) =>
-          a.price - b.price
-      )
-      .slice(0, 3);
-
-  const support =
-    ssl
-      .filter(
-        level =>
-          state.currentPrice
-            ? level.price <
-              state.currentPrice
-            : true
-      )
-      .sort(
-        (a, b) =>
-          b.price - a.price
-      )
-      .slice(0, 3);
-
-  /*
-     NEAR LEVELS
-  */
-
-  const nearBSL =
-    nearStructural('BSL')
-      .filter(
-        level =>
-          state.currentPrice
-            ? level.price >
-              state.currentPrice
-            : true
-      )
-      .sort(
-        (a, b) =>
-          a.price - b.price
-      )
-      .slice(0, 5);
-
-  const nearSSL =
-    nearStructural('SSL')
-      .filter(
-        level =>
-          state.currentPrice
-            ? level.price <
-              state.currentPrice
-            : true
-      )
-      .sort(
-        (a, b) =>
-          b.price - a.price
-      )
-      .slice(0, 5);
+    structural('SSL');
 
   return {
-    /*
-       Main structural map
-    */
 
     buySideLiquidity:
-      bsl,
+      bsl.map(publicLevel),
 
     sellSideLiquidity:
-      ssl,
+      ssl.map(publicLevel),
 
     majorResistance:
-      resistance,
+      bsl
+        .slice(0, 5)
+        .map(publicLevel),
 
     majorSupport:
-      support,
+      ssl
+        .slice(0, 5)
+        .map(publicLevel),
 
     nearestBSL:
-      resistance.slice(
-        0,
-        1
-      ),
+      bsl[0]
+        ? publicLevel(bsl[0])
+        : null,
 
     nearestSSL:
-      support.slice(
-        0,
-        1
-      ),
+      ssl[0]
+        ? publicLevel(ssl[0])
+        : null,
 
-    /*
-       Secondary nearby liquidity
-    */
+    nearBSL:
+      nearStructural('BSL')
+        .map(publicLevel),
 
-    nearBSL,
-
-    nearSSL
+    nearSSL:
+      nearStructural('SSL')
+        .map(publicLevel)
   };
 }
 
 /* ============================================================
-   RAW LIQUIDITY
+   PUBLIC STATS
 ============================================================ */
 
-function rawLiquidity() {
+function publicStats() {
+
   return {
-    largeBids:
-      bookRows('SSL')
-        .sort(
-          (a, b) =>
-            b.usd - a.usd
-        )
-        .slice(0, 25),
 
-    largeAsks:
-      bookRows('BSL')
-        .sort(
-          (a, b) =>
-            b.usd - a.usd
-        )
-        .slice(0, 25)
+    candles:
+      state.candleStats,
+
+    structure: {
+
+      swingHighs:
+        structure.swingHighs.length,
+
+      swingLows:
+        structure.swingLows.length,
+
+      levels:
+        structure.levels.length,
+
+      majorBSL:
+        structural('BSL').length,
+
+      majorSSL:
+        structural('SSL').length
+    },
+
+    orderBook: {
+
+      bids:
+        book.bids.size,
+
+      asks:
+        book.asks.size,
+
+      persistentBids:
+        persistence.bids.length,
+
+      persistentAsks:
+        persistence.asks.length
+    }
   };
 }
 
 /* ============================================================
-   APPLY DEPTH EVENT
+   SNAPSHOT BOOK
 ============================================================ */
 
-function applyDepth(message) {
+function snapshotBookApply(
+  payload
+) {
+
+  book.bids.clear();
+  book.asks.clear();
+
   for (
-    const [
-      price,
-      quantity
-    ] of message.b || []
+    const [priceString, qtyString]
+    of payload.bids || []
   ) {
-    const p =
-      Number(price);
 
-    const q =
-      Number(quantity);
+    const price =
+      Number(priceString);
 
-    if (q === 0) {
-      book.bids.delete(p);
-    } else {
+    const qty =
+      Number(qtyString);
+
+    if (qty > 0) {
+
       book.bids.set(
-        p,
-        q
+        price,
+        qty
       );
     }
   }
 
   for (
-    const [
-      price,
-      quantity
-    ] of message.a || []
+    const [priceString, qtyString]
+    of payload.asks || []
   ) {
-    const p =
-      Number(price);
 
-    const q =
-      Number(quantity);
+    const price =
+      Number(priceString);
 
-    if (q === 0) {
-      book.asks.delete(p);
-    } else {
+    const qty =
+      Number(qtyString);
+
+    if (qty > 0) {
+
       book.asks.set(
-        p,
-        q
+        price,
+        qty
       );
     }
   }
 
   state.lastUpdateId =
     Number(
-      message.u ||
-        state.lastUpdateId
+      payload.lastUpdateId || 0
     );
 
-  state.lastDepthMessage =
-    iso();
+  state.bookInitialized =
+    true;
+
+  state.gapDetected =
+    false;
+
+  state.gapRecovery =
+    false;
+
+  state.snapshot.pending =
+    false;
+
+  state.snapshot.lastSnapshotId =
+    state.lastUpdateId;
 
   updatePriceFromBook();
 }
 
 /* ============================================================
-   SNAPSHOT
+   DEPTH EVENTS
 ============================================================ */
 
-let snapshotBusy =
-  false;
+function applyDepthEvent(e) {
 
-let lastSnapshotAt =
-  0;
+  const U =
+    Number(e.U);
 
-function requestSnapshot() {
+  const u =
+    Number(e.u);
+
+  /*
+     Buffer until snapshot exists.
+  */
+
   if (
-    snapshotBusy ||
-    Date.now() -
-      lastSnapshotAt <
-      65000
+    !state.bookInitialized
   ) {
+
+    state.pendingEvents.push(e);
+
+    if (
+      state.pendingEvents.length >
+      20000
+    ) {
+
+      state.pendingEvents.shift();
+    }
+
     return;
   }
 
-  snapshotBusy =
-    true;
+  /*
+     Old event.
+  */
 
-  lastSnapshotAt =
-    Date.now();
+  if (
+    u <=
+    state.lastUpdateId
+  ) {
 
-  state.snapshotRequests +=
-    1;
-
-  let ws;
-
-  try {
-    ws =
-      new WebSocket(
-        SNAPSHOT_WS
-      );
-
-    const id =
-      `depth-${Date.now()}`;
-
-    const timer =
-      setTimeout(() => {
-        try {
-          ws.close();
-        } catch (_) {}
-      }, 15000);
-
-    ws.on(
-      'open',
-      () => {
-        state.snapshotConnected =
-          true;
-
-        ws.send(
-          JSON.stringify({
-            id,
-
-            method:
-              'depth',
-
-            params: {
-              symbol:
-                SYMBOL,
-
-              limit: 1000
-            }
-          })
-        );
-      }
-    );
-
-    ws.on(
-      'message',
-      raw => {
-        try {
-          const data =
-            JSON.parse(
-              raw.toString()
-            );
-
-          if (
-            data.id !== id
-          ) {
-            return;
-          }
-
-          if (
-            data.status &&
-            data.status !== 200
-          ) {
-            state.snapshotLastStatus =
-              data.status;
-
-            state.snapshotLastError =
-              JSON.stringify(
-                data.error ||
-                  data
-              );
-
-            return;
-          }
-
-          if (
-            !data.result
-          ) {
-            return;
-          }
-
-          clearTimeout(
-            timer
-          );
-
-          book.bids.clear();
-          book.asks.clear();
-
-          for (
-            const [
-              price,
-              quantity
-            ] of
-              data.result
-                .bids || []
-          ) {
-            if (
-              Number(quantity) >
-              0
-            ) {
-              book.bids.set(
-                Number(price),
-                Number(quantity)
-              );
-            }
-          }
-
-          for (
-            const [
-              price,
-              quantity
-            ] of
-              data.result
-                .asks || []
-          ) {
-            if (
-              Number(quantity) >
-              0
-            ) {
-              book.asks.set(
-                Number(price),
-                Number(quantity)
-              );
-            }
-          }
-
-          state.lastUpdateId =
-            Number(
-              data.result
-                .lastUpdateId
-            );
-
-          state.snapshotId =
-            state.lastUpdateId;
-
-          state.bookInitialized =
-            true;
-
-          state.gapRecovery =
-            false;
-
-          state.gapDetected =
-            false;
-
-          state.snapshotLastStatus =
-            200;
-
-          state.snapshotLastError =
-            null;
-
-          state.lastSnapshotResponse =
-            iso();
-
-          const pending =
-            [
-              ...state.pendingEvents
-            ].sort(
-              (a, b) =>
-                Number(a.U) -
-                Number(b.U)
-            );
-
-          state.pendingEvents =
-            [];
-
-          let bridged =
-            false;
-
-          for (
-            const event of
-              pending
-          ) {
-            const U =
-              Number(event.U);
-
-            const u =
-              Number(event.u);
-
-            if (
-              u <=
-              state.lastUpdateId
-            ) {
-              continue;
-            }
-
-            if (
-              U <=
-                state.lastUpdateId +
-                  1 &&
-              u >=
-                state.lastUpdateId +
-                  1
-            ) {
-              applyDepth(
-                event
-              );
-
-              bridged =
-                true;
-
-              continue;
-            }
-
-            if (
-              bridged &&
-              U <=
-                state.lastUpdateId +
-                  1
-            ) {
-              applyDepth(
-                event
-              );
-
-              continue;
-            }
-
-            if (
-              U >
-              state.lastUpdateId +
-                1
-            ) {
-              state.bookInitialized =
-                false;
-
-              state.gapRecovery =
-                true;
-
-              state.pendingEvents.push(
-                event
-              );
-
-              break;
-            }
-          }
-
-          updatePriceFromBook();
-
-          applyResting();
-
-          try {
-            ws.close();
-          } catch (_) {}
-        } catch (error) {
-          state.snapshotLastError =
-            error.message;
-        }
-      }
-    );
-
-    ws.on(
-      'error',
-      error => {
-        state.snapshotLastError =
-          error.message;
-      }
-    );
-
-    ws.on(
-      'close',
-      () => {
-        state.snapshotConnected =
-          false;
-      }
-    );
-  } catch (error) {
-    state.snapshotLastError =
-      error.message;
+    return;
   }
 
-  setTimeout(() => {
-    snapshotBusy =
+  /*
+     Sequence gap.
+  */
+
+  if (
+    U >
+    state.lastUpdateId + 1
+  ) {
+
+    state.gapDetected =
+      true;
+
+    state.gapRecovery =
+      true;
+
+    state.gapCount++;
+
+    state.lastGapExpected =
+      state.lastUpdateId + 1;
+
+    state.lastGapReceived =
+      U;
+
+    state.pendingEvents.push(e);
+
+    requestSnapshot(
+      'sequence_gap'
+    );
+
+    return;
+  }
+
+  /*
+     Apply bids.
+  */
+
+  for (
+    const [priceString, qtyString]
+    of e.b || []
+  ) {
+
+    const price =
+      Number(priceString);
+
+    const qty =
+      Number(qtyString);
+
+    if (qty === 0) {
+
+      book.bids.delete(price);
+
+    } else {
+
+      book.bids.set(
+        price,
+        qty
+      );
+    }
+  }
+
+  /*
+     Apply asks.
+  */
+
+  for (
+    const [priceString, qtyString]
+    of e.a || []
+  ) {
+
+    const price =
+      Number(priceString);
+
+    const qty =
+      Number(qtyString);
+
+    if (qty === 0) {
+
+      book.asks.delete(price);
+
+    } else {
+
+      book.asks.set(
+        price,
+        qty
+      );
+    }
+  }
+
+  state.lastUpdateId =
+    u;
+
+  updatePriceFromBook();
+}
+
+/* ============================================================
+   SNAPSHOT BRIDGE
+============================================================ */
+
+function bridgePendingEvents(
+  snapshotId
+) {
+
+  state.snapshot.bridgeAttempts++;
+
+  const pending =
+    state.pendingEvents
+      .sort(
+        (a, b) =>
+          Number(a.u) -
+          Number(b.u)
+      );
+
+  const index =
+    pending.findIndex(
+      event =>
+        Number(event.U) <=
+          snapshotId + 1 &&
+        Number(event.u) >=
+          snapshotId + 1
+    );
+
+  if (index < 0) {
+
+    state.snapshot.pending =
       false;
-  }, 1000);
+
+    state.gapRecovery =
+      true;
+
+    return false;
+  }
+
+  state.snapshot.bridgeFound++;
+
+  state.lastUpdateId =
+    snapshotId;
+
+  for (
+    let i = index;
+    i < pending.length;
+    i++
+  ) {
+
+    const event =
+      pending[i];
+
+    if (
+      Number(event.u) <=
+      state.lastUpdateId
+    ) {
+
+      continue;
+    }
+
+    if (
+      Number(event.U) >
+      state.lastUpdateId + 1
+    ) {
+
+      state.gapDetected =
+        true;
+
+      state.gapRecovery =
+        true;
+
+      state.lastGapExpected =
+        state.lastUpdateId + 1;
+
+      state.lastGapReceived =
+        Number(event.U);
+
+      return false;
+    }
+
+    for (
+      const [priceString, qtyString]
+      of event.b || []
+    ) {
+
+      const price =
+        Number(priceString);
+
+      const qty =
+        Number(qtyString);
+
+      if (qty === 0) {
+
+        book.bids.delete(
+          price
+        );
+
+      } else {
+
+        book.bids.set(
+          price,
+          qty
+        );
+      }
+    }
+
+    for (
+      const [priceString, qtyString]
+      of event.a || []
+    ) {
+
+      const price =
+        Number(priceString);
+
+      const qty =
+        Number(qtyString);
+
+      if (qty === 0) {
+
+        book.asks.delete(
+          price
+        );
+
+      } else {
+
+        book.asks.set(
+          price,
+          qty
+        );
+      }
+    }
+
+    state.lastUpdateId =
+      Number(event.u);
+  }
+
+  state.pendingEvents = [];
+
+  state.bookInitialized =
+    true;
+
+  state.gapRecovery =
+    false;
+
+  state.gapDetected =
+    false;
+
+  updatePriceFromBook();
+
+  return true;
+}
+
+/* ============================================================
+   SNAPSHOT REQUEST
+============================================================ */
+
+function requestSnapshot(
+  reason = 'startup'
+) {
+
+  if (
+    state.snapshot.pending
+  ) {
+
+    return;
+  }
+
+  if (
+    now() -
+      state.snapshot.lastRequestAt <
+    5000
+  ) {
+
+    return;
+  }
+
+  state.snapshot.pending =
+    true;
+
+  state.snapshot.lastRequestAt =
+    now();
+
+  state.snapshot.snapshotRequests++;
+
+  state.snapshot.lastError =
+    null;
+
+  const ws =
+    new WebSocket(
+      SNAPSHOT_WS
+    );
+
+  const timer =
+    setTimeout(
+      () => {
+
+        try {
+          ws.close();
+        } catch {}
+
+      },
+      8000
+    );
+
+  ws.on(
+    'open',
+    () => {
+
+      state.snapshotConnected =
+        true;
+
+      const id =
+        `depth-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 8)}`;
+
+      ws.send(
+        JSON.stringify({
+          id,
+
+          method: 'depth',
+
+          params: {
+            symbol: SYMBOL,
+            limit: 1000
+          }
+        })
+      );
+    }
+  );
+
+  ws.on(
+    'message',
+    data => {
+
+      try {
+
+        const msg =
+          JSON.parse(
+            data.toString()
+          );
+
+        if (
+          msg.status === 429
+        ) {
+
+          state.snapshot.snapshot429s++;
+        }
+
+        if (
+          msg.status &&
+          msg.status >= 400
+        ) {
+
+          throw new Error(
+            `Snapshot HTTP ${msg.status}`
+          );
+        }
+
+        if (
+          !msg.result ||
+          !msg.result.lastUpdateId
+        ) {
+
+          return;
+        }
+
+        clearTimeout(timer);
+
+        snapshotBookApply(
+          msg.result
+        );
+
+        const ok =
+          bridgePendingEvents(
+            Number(
+              msg.result.lastUpdateId
+            )
+          );
+
+        if (!ok) {
+
+          state.snapshot.lastError =
+            `Unable to bridge snapshot (${reason})`;
+        }
+
+        try {
+          ws.close();
+        } catch {}
+
+      } catch (err) {
+
+        state.snapshot.lastError =
+          err.message;
+
+        state.snapshot.pending =
+          false;
+      }
+    }
+  );
+
+  ws.on(
+    'error',
+    err => {
+
+      clearTimeout(timer);
+
+      state.snapshot.lastError =
+        err.message;
+
+      state.snapshot.pending =
+        false;
+    }
+  );
+
+  ws.on(
+    'close',
+    () => {
+
+      state.snapshotConnected =
+        false;
+
+      clearTimeout(timer);
+
+      if (
+        state.snapshot.pending &&
+        now() -
+          state.snapshot.lastRequestAt >
+          7000
+      ) {
+
+        state.snapshot.pending =
+          false;
+      }
+    }
+  );
 }
 
 /* ============================================================
@@ -2356,116 +3273,67 @@ function requestSnapshot() {
 ============================================================ */
 
 function connectDepth() {
+
   const ws =
     new WebSocket(
       DEPTH_WS
     );
 
-  state.depthConnected =
-    false;
-
   ws.on(
     'open',
     () => {
+
       state.depthConnected =
         true;
 
-      requestSnapshot();
+      state.lastDepthMessage =
+        now();
+
+      console.log(
+        'Depth websocket connected'
+      );
+
+      requestSnapshot(
+        'startup'
+      );
     }
   );
 
   ws.on(
     'message',
-    raw => {
+    data => {
+
+      state.lastDepthMessage =
+        now();
+
       try {
-        const message =
+
+        applyDepthEvent(
           JSON.parse(
-            raw.toString()
-          );
-
-        if (
-          message.e !==
-          'depthUpdate'
-        ) {
-          return;
-        }
-
-        const U =
-          Number(
-            message.U
-          );
-
-        const u =
-          Number(
-            message.u
-          );
-
-        if (
-          !state.bookInitialized
-        ) {
-          if (
-            state.pendingEvents
-              .length < 5000
-          ) {
-            state.pendingEvents.push(
-              message
-            );
-          }
-
-          return;
-        }
-
-        if (
-          u <=
-          state.lastUpdateId
-        ) {
-          return;
-        }
-
-        if (
-          U >
-          state.lastUpdateId +
-            1
-        ) {
-          state.gapDetected =
-            true;
-
-          state.gapRecovery =
-            true;
-
-          state.gapCount +=
-            1;
-
-          state.lastGapLocal =
-            state.lastUpdateId;
-
-          state.lastGapIncoming =
-            U;
-
-          state.bookInitialized =
-            false;
-
-          state.pendingEvents = [
-            message
-          ];
-
-          requestSnapshot();
-
-          return;
-        }
-
-        applyDepth(
-          message
+            data.toString()
+          )
         );
-      } catch (_) {}
+
+      } catch (err) {
+
+        console.error(
+          'Depth parse:',
+          err.message
+        );
+      }
     }
   );
 
   ws.on(
     'close',
     () => {
+
       state.depthConnected =
         false;
+
+      console.log(
+        'Depth websocket closed; reconnecting'
+      );
 
       setTimeout(
         connectDepth,
@@ -2476,8 +3344,76 @@ function connectDepth() {
 
   ws.on(
     'error',
-    () => {}
+    err => {
+
+      console.error(
+        'Depth websocket:',
+        err.message
+      );
+    }
   );
+}
+
+/* ============================================================
+   CANDLE UPDATE
+============================================================ */
+
+function upsertCandle(
+  tf,
+  candle,
+  closed
+) {
+
+  const arr =
+    candles[tf];
+
+  if (
+    !arr.length ||
+    arr.at(-1).openTime !==
+      candle.openTime
+  ) {
+
+    arr.push(candle);
+
+  } else {
+
+    arr[arr.length - 1] =
+      candle;
+  }
+
+  const max =
+    STRUCTURE[tf].candles;
+
+  if (
+    arr.length > max
+  ) {
+
+    arr.splice(
+      0,
+      arr.length - max
+    );
+  }
+
+  state.candleStats[tf].loaded =
+    arr.length;
+
+  state.candleStats[tf].lastOpenTime =
+    candle.openTime;
+
+  /*
+     Sweep detection is performed
+     only on CLOSED candles.
+  */
+
+  if (closed) {
+
+    detectCandleSweeps(
+      tf,
+      candle
+    );
+
+    rebuildStructure();
+  }
 }
 
 /* ============================================================
@@ -2485,33 +3421,41 @@ function connectDepth() {
 ============================================================ */
 
 function connectKlines() {
+
   const ws =
     new WebSocket(
       KLINE_WS
     );
 
-  state.klinesConnected =
-    false;
-
   ws.on(
     'open',
     () => {
-      state.klinesConnected =
+
+      state.klineConnected =
         true;
+
+      console.log(
+        'Kline websocket connected'
+      );
     }
   );
 
   ws.on(
     'message',
-    raw => {
+    data => {
+
+      state.lastKlineMessage =
+        now();
+
       try {
-        const wrapper =
+
+        const msg =
           JSON.parse(
-            raw.toString()
+            data.toString()
           );
 
         const k =
-          wrapper.data?.k;
+          msg.data?.k;
 
         if (!k) {
           return;
@@ -2520,84 +3464,56 @@ function connectKlines() {
         const tf =
           String(k.i);
 
-        if (
-          !candles[tf]
-        ) {
+        if (!candles[tf]) {
           return;
         }
 
-        const candle = {
-          openTime:
-            Number(k.t),
+        const candle =
+          candleFromKline(k);
 
-          open:
-            Number(k.o),
-
-          high:
-            Number(k.h),
-
-          low:
-            Number(k.l),
-
-          close:
-            Number(k.c),
-
-          volume:
-            Number(k.v),
-
-          closeTime:
-            Number(k.T)
-        };
-
-        const data =
-          candles[tf];
-
-        const index =
-          data.findIndex(
-            x =>
-              x.openTime ===
-              candle.openTime
-          );
-
-        if (
-          index >= 0
-        ) {
-          data[index] =
-            candle;
-        } else {
-          data.push(
-            candle
-          );
-
-          if (
-            data.length >
-            STRUCTURE[tf]
-              .candles
-          ) {
-            data.shift();
-          }
-        }
-
-        updatePrice(
-          candle.close,
-          'futures_kline'
+        upsertCandle(
+          tf,
+          candle,
+          !!k.x
         );
 
-        state.lastKlineMessage =
-          iso();
+        /*
+           Kline price is retained
+           as supplemental price data.
+           Order-book midpoint will
+           normally take priority.
+        */
 
-        if (k.x) {
-          rebuildStructure();
+        if (
+          !state.bookInitialized
+        ) {
+
+          updatePrice(
+            candle.close,
+            'futures_kline'
+          );
         }
-      } catch (_) {}
+
+      } catch (err) {
+
+        console.error(
+          'Kline parse:',
+          err.message
+        );
+      }
     }
   );
 
   ws.on(
     'close',
     () => {
-      state.klinesConnected =
+
+      state.klineConnected =
         false;
+
+      console.log(
+        'Kline websocket closed; reconnecting'
+      );
 
       setTimeout(
         connectKlines,
@@ -2608,439 +3524,448 @@ function connectKlines() {
 
   ws.on(
     'error',
-    () => {}
+    err => {
+
+      console.error(
+        'Kline websocket:',
+        err.message
+      );
+    }
   );
 }
 
 /* ============================================================
-   HEALTH
-============================================================ */
-
-function health() {
-  return {
-    ok: true,
-
-    service:
-      'Binance BTCUSDT Major Liquidity Relay',
-
-    symbol:
-      SYMBOL,
-
-    currentPrice:
-      state.currentPrice,
-
-    priceSource:
-      state.priceSource,
-
-    historicalStructureSource:
-      'Binance Spot',
-
-    liveStructureSource:
-      'Binance Futures WebSocket',
-
-    liquiditySource:
-      'Binance Futures Order Book',
-
-    majorMinDistancePct:
-      SETTINGS.majorMinDistancePct,
-
-    candleHistory:
-      Object.fromEntries(
-        Object.entries(
-          candles
-        ).map(
-          ([tf, data]) => [
-            tf,
-            data.length
-          ]
-        )
-      ),
-
-    candleSource:
-      Object.fromEntries(
-        Object.keys(
-          STRUCTURE
-        ).map(
-          tf => [
-            tf,
-            'binance_spot'
-          ]
-        )
-      ),
-
-    candleStats:
-      state.candleStats,
-
-    structure: {
-      swingHighs:
-        structure
-          .swingHighs.length,
-
-      swingLows:
-        structure
-          .swingLows.length,
-
-      equalHighs:
-        structure
-          .equalHighs.length,
-
-      equalLows:
-        structure
-          .equalLows.length,
-
-      majorBSL:
-        structural(
-          'BSL'
-        ).length,
-
-      majorSSL:
-        structural(
-          'SSL'
-        ).length,
-
-      nearBSL:
-        nearStructural(
-          'BSL'
-        ).length,
-
-      nearSSL:
-        nearStructural(
-          'SSL'
-        ).length,
-
-      updatedAt:
-        state.updatedAt
-    },
-
-    orderBook: {
-      initialized:
-        state.bookInitialized,
-
-      bids:
-        book.bids.size,
-
-      asks:
-        book.asks.size,
-
-      lastUpdateId:
-        state.lastUpdateId
-    },
-
-    connections: {
-      depth:
-        state.depthConnected,
-
-      snapshot:
-        state.snapshotConnected,
-
-      klines:
-        state.klinesConnected
-    },
-
-    sync: {
-      gapRecovery:
-        state.gapRecovery,
-
-      gapDetected:
-        state.gapDetected,
-
-      gapCount:
-        state.gapCount,
-
-      lastGapLocal:
-        state.lastGapLocal,
-
-      lastGapIncoming:
-        state.lastGapIncoming,
-
-      pendingEvents:
-        state.pendingEvents.length,
-
-      snapshotPending:
-        snapshotBusy,
-
-      snapshotId:
-        state.snapshotId,
-
-      snapshotRequests:
-        state.snapshotRequests,
-
-      snapshot429s:
-        state.snapshot429s,
-
-      lastSnapshotResponse:
-        state.lastSnapshotResponse,
-
-      snapshotLastStatus:
-        state.snapshotLastStatus,
-
-      snapshotLastError:
-        state.snapshotLastError
-    },
-
-    updatedAt:
-      state.updatedAt
-  };
-}
-
-/* ============================================================
-   API
+   ROOT
 ============================================================ */
 
 app.get(
   '/',
   (req, res) => {
-    res.json(
-      health()
-    );
-  }
-);
 
-app.get(
-  '/health',
-  (req, res) => {
-    res.json(
-      health()
-    );
-  }
-);
-
-app.get(
-  '/intelligence',
-  (req, res) => {
     res.json({
+
       ok: true,
+
+      service:
+        'Binance Futures Major Liquidity Relay',
 
       symbol:
         SYMBOL,
 
-      currentPrice:
-        state.currentPrice,
-
-      priceSource:
-        state.priceSource,
-
-      intelligence:
-        intelligence(),
-
-      updatedAt:
-        state.updatedAt
-    });
-  }
-);
-
-app.get(
-  '/structure',
-  (req, res) => {
-    res.json({
-      ok: true,
-
-      symbol:
-        SYMBOL,
-
-      currentPrice:
-        state.currentPrice,
-
-      priceSource:
-        state.priceSource,
-
-      marketStructure:
-        publicStructure(),
-
-      intelligence:
-        intelligence(),
-
-      structureStats: {
-        candleSource:
-          Object.fromEntries(
-            Object.keys(
-              STRUCTURE
-            ).map(
-              tf => [
-                tf,
-                'binance_spot'
-              ]
-            )
-          ),
-
-        candleHistory:
-          Object.fromEntries(
-            Object.entries(
-              candles
-            ).map(
-              ([tf, data]) => [
-                tf,
-                data.length
-              ]
-            )
-          ),
-
-        swingHighs:
-          structure
-            .swingHighs.length,
-
-        swingLows:
-          structure
-            .swingLows.length,
-
-        equalHighs:
-          structure
-            .equalHighs.length,
-
-        equalLows:
-          structure
-            .equalLows.length
-      },
-
-      updatedAt:
-        state.updatedAt
-    });
-  }
-);
-
-app.get(
-  '/liquidity',
-  (req, res) => {
-    res.json({
-      ok: true,
-
-      symbol:
-        SYMBOL,
-
-      currentPrice:
-        state.currentPrice,
-
-      priceSource:
-        state.priceSource,
-
-      marketStructure:
-        publicStructure(),
-
-      intelligence:
-        intelligence(),
-
-      rawRestingLiquidity:
-        rawLiquidity(),
-
-      structureStats: {
-        candleSource:
-          Object.fromEntries(
-            Object.keys(
-              STRUCTURE
-            ).map(
-              tf => [
-                tf,
-                'binance_spot'
-              ]
-            )
-          ),
-
-        candleHistory:
-          Object.fromEntries(
-            Object.entries(
-              candles
-            ).map(
-              ([tf, data]) => [
-                tf,
-                data.length
-              ]
-            )
-          ),
-
-        swingHighs:
-          structure
-            .swingHighs.length,
-
-        swingLows:
-          structure
-            .swingLows.length,
-
-        equalHighs:
-          structure
-            .equalHighs.length,
-
-        equalLows:
-          structure
-            .equalLows.length
-      },
-
-      updatedAt:
-        state.updatedAt
-    });
-  }
-);
-
-app.get(
-  '/book',
-  (req, res) => {
-    res.json({
-      ok: true,
-
-      symbol:
-        SYMBOL,
-
-      currentPrice:
-        state.currentPrice,
-
-      priceSource:
-        state.priceSource,
-
-      initialized:
-        state.bookInitialized,
-
-      lastUpdateId:
-        state.lastUpdateId,
-
-      bids:
-        [
-          ...book.bids.entries()
-        ].slice(0, 1000),
-
-      asks:
-        [
-          ...book.asks.entries()
-        ].slice(0, 1000)
+      endpoints: [
+        '/health',
+        '/intelligence',
+        '/structure',
+        '/liquidity',
+        '/book',
+        '/events'
+      ]
     });
   }
 );
 
 /* ============================================================
-   MAINTENANCE
+   HEALTH
+============================================================ */
+
+app.get(
+  '/health',
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      status:
+        state.bookInitialized
+          ? 'live'
+          : (
+              state.snapshot.pending
+                ? 'syncing'
+                : 'waiting'
+            ),
+
+      initialized:
+        state.bookInitialized,
+
+      websocketConnected:
+        state.depthConnected,
+
+      depthConnected:
+        state.depthConnected,
+
+      snapshotConnected:
+        state.snapshotConnected,
+
+      klineConnected:
+        state.klineConnected,
+
+      snapshotPending:
+        state.snapshot.pending,
+
+      waitingForBridge:
+        !state.bookInitialized &&
+        state.pendingEvents.length > 0,
+
+      currentPrice:
+        state.currentPrice,
+
+      priceSource:
+        state.priceSource,
+
+      bidLevels:
+        book.bids.size,
+
+      askLevels:
+        book.asks.size,
+
+      pendingEvents:
+        state.pendingEvents.length,
+
+      lastUpdateId:
+        state.lastUpdateId,
+
+      gapDetected:
+        state.gapDetected,
+
+      gapRecovery:
+        state.gapRecovery,
+
+      gapCount:
+        state.gapCount,
+
+      lastGapExpected:
+        state.lastGapExpected,
+
+      lastGapReceived:
+        state.lastGapReceived,
+
+      snapshot:
+        state.snapshot,
+
+      persistence: {
+
+        bids:
+          persistence.bids.length,
+
+        asks:
+          persistence.asks.length,
+
+        confirmMs:
+          SETTINGS.persistenceConfirmMs,
+
+        confirmSec:
+          SETTINGS.persistenceConfirmMs /
+          1000
+      },
+
+      sweeps:
+        state.sweeps.length,
+
+      liquidityEvents:
+        state.liquidityEvents.length,
+
+      updatedAt:
+        state.updatedAt
+    });
+  }
+);
+
+/* ============================================================
+   INTELLIGENCE
+============================================================ */
+
+app.get(
+  '/intelligence',
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice:
+        state.currentPrice,
+
+      priceSource:
+        state.priceSource,
+
+      intelligence:
+        intelligence(),
+
+      updatedAt:
+        state.updatedAt
+    });
+  }
+);
+
+/* ============================================================
+   STRUCTURE
+============================================================ */
+
+app.get(
+  '/structure',
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice:
+        state.currentPrice,
+
+      marketStructure:
+        publicStructure(),
+
+      intelligence:
+        intelligence(),
+
+      stats:
+        publicStats(),
+
+      updatedAt:
+        state.updatedAt
+    });
+  }
+);
+
+/* ============================================================
+   LIQUIDITY
+============================================================ */
+
+app.get(
+  '/liquidity',
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice:
+        state.currentPrice,
+
+      marketStructure:
+        publicStructure(),
+
+      intelligence:
+        intelligence(),
+
+      rawRestingLiquidity: {
+
+        largeBids:
+          bookRows('bid')
+            .slice(0, 50)
+            .map(
+              x => ({
+
+                price:
+                  round(
+                    x.price,
+                    2
+                  ),
+
+                quantity:
+                  round(
+                    x.quantity,
+                    6
+                  ),
+
+                usd:
+                  round(
+                    x.usd,
+                    2
+                  )
+              })
+            ),
+
+        largeAsks:
+          bookRows('ask')
+            .slice(0, 50)
+            .map(
+              x => ({
+
+                price:
+                  round(
+                    x.price,
+                    2
+                  ),
+
+                quantity:
+                  round(
+                    x.quantity,
+                    6
+                  ),
+
+                usd:
+                  round(
+                    x.usd,
+                    2
+                  )
+              })
+            )
+      },
+
+      stats:
+        publicStats(),
+
+      updatedAt:
+        state.updatedAt
+    });
+  }
+);
+
+/* ============================================================
+   RAW BOOK
+============================================================ */
+
+app.get(
+  '/book',
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice:
+        state.currentPrice,
+
+      bids:
+        bookRows('bid')
+          .slice(0, 1000),
+
+      asks:
+        bookRows('ask')
+          .slice(0, 1000),
+
+      updatedAt:
+        state.updatedAt
+    });
+  }
+);
+
+/* ============================================================
+   EVENTS
+============================================================ */
+
+app.get(
+  '/events',
+  (req, res) => {
+
+    res.json({
+
+      ok: true,
+
+      symbol:
+        SYMBOL,
+
+      currentPrice:
+        state.currentPrice,
+
+      recentSweeps:
+        state.sweeps
+          .slice(0, 50),
+
+      liquidityEvents:
+        state.liquidityEvents
+          .slice(0, 50),
+
+      persistentLiquidity: {
+
+        bids:
+          publicPersistence(
+            'bids'
+          ),
+
+        asks:
+          publicPersistence(
+            'asks'
+          )
+      },
+
+      updatedAt:
+        state.updatedAt
+    });
+  }
+);
+
+/* ============================================================
+   PERSISTENCE / MAINTENANCE LOOP
 ============================================================ */
 
 setInterval(
   () => {
+
+    /*
+       Recover order book if needed.
+    */
+
     if (
-      !state.bookInitialized &&
-      state.depthConnected
+      state.depthConnected &&
+      (
+        !state.bookInitialized ||
+        state.gapRecovery
+      )
     ) {
-      requestSnapshot();
+
+      requestSnapshot(
+        state.gapRecovery
+          ? 'recovery'
+          : 'maintenance'
+      );
     }
+
+    /*
+       Update live price and
+       persistence tracker.
+    */
 
     if (
       state.bookInitialized
     ) {
+
       updatePriceFromBook();
 
       applyResting();
+
+      updatePersistence();
     }
+
   },
-  5000
+  SETTINGS.persistencePollMs
 );
+
+/* ============================================================
+   STRUCTURE MAINTENANCE
+============================================================ */
 
 setInterval(
   () => {
-    const ready =
-      Object.values(
-        candles
-      ).every(
-        data =>
-          data.length > 0
-      );
 
-    if (ready) {
+    if (
+      Object.values(candles)
+        .every(
+          arr =>
+            arr.length
+        )
+    ) {
+
       rebuildStructure();
     }
+
   },
   60000
 );
@@ -3050,6 +3975,7 @@ setInterval(
 ============================================================ */
 
 (async () => {
+
   await loadHistory();
 
   connectDepth();
@@ -3059,16 +3985,19 @@ setInterval(
   app.listen(
     PORT,
     () => {
+
       console.log(
         `Binance Futures Major Liquidity Relay listening on ${PORT}`
       );
     }
   );
+
 })().catch(
-  error => {
+  err => {
+
     console.error(
-      'STARTUP ERROR',
-      error
+      'Startup failed:',
+      err
     );
 
     process.exit(1);
